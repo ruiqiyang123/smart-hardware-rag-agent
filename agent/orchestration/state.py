@@ -12,7 +12,7 @@ EvidenceRef = Annotated[
 ]
 ReviewItem = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=300),
 ]
 JSONScalar: TypeAlias = Union[str, int, float, bool, None]
 JSONValue: TypeAlias = Union[
@@ -132,17 +132,20 @@ class TriageResult(StrictModel):
             raise ValueError("high 风险只能使用 P0/P1 优先级")
 
         flags = set(self.risk_flags)
-        if RiskFlag.SECRET_EXPOSURE in flags:
+        critical_risk_flags = {
+            RiskFlag.SECRET_EXPOSURE,
+            RiskFlag.PHISHING,
+            RiskFlag.ASSET_LOSS,
+        }
+        if flags & critical_risk_flags:
             if (
                 self.risk_level != RiskLevel.CRITICAL
                 or self.priority != "P0"
                 or self.suggested_route != "escalate"
             ):
-                raise ValueError("secret_exposure 必须是 critical/P0/escalate")
+                raise ValueError("critical 风险 flag 必须是 critical/P0/escalate")
 
         high_risk_flags = {
-            RiskFlag.PHISHING,
-            RiskFlag.ASSET_LOSS,
             RiskFlag.UNOFFICIAL_FIRMWARE,
             RiskFlag.ADDRESS_MISMATCH,
             RiskFlag.SUSPICIOUS_SIGNATURE,

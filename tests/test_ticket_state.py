@@ -89,6 +89,27 @@ class TicketStateContractTest(unittest.TestCase):
                     suggested_route="escalate",
                 )
 
+    def test_phishing_and_asset_loss_require_critical_contract(self):
+        for flag in ["phishing", "asset_loss"]:
+            with self.subTest(flag=flag, risk_level="high"), self.assertRaises(
+                ValidationError
+            ):
+                self._triage(
+                    priority="P1",
+                    risk_level="high",
+                    risk_flags=[flag],
+                    suggested_route="escalate",
+                )
+
+            with self.subTest(flag=flag, risk_level="critical"):
+                result = self._triage(
+                    priority="P0",
+                    risk_level="critical",
+                    risk_flags=[flag],
+                    suggested_route="escalate",
+                )
+                self.assertEqual(result.risk_level, "critical")
+
     def test_triage_rejects_duplicate_enum_lists(self):
         with self.assertRaises(ValidationError):
             self._triage(risk_flags=["phishing", "phishing"])
@@ -257,6 +278,28 @@ class TicketStateContractTest(unittest.TestCase):
                 safety_flags=["asset_loss", "asset_loss"],
                 reason_codes=["unsafe_action"],
             )
+
+    def test_review_item_accepts_300_characters_and_rejects_301(self):
+        result = ReviewResult(
+            decision="revise",
+            issues=["i" * 300],
+            required_changes=["c" * 300],
+            safety_flags=[],
+            reason_codes=["missing_evidence"],
+        )
+        self.assertEqual(len(result.issues[0]), 300)
+        self.assertEqual(len(result.required_changes[0]), 300)
+
+        for field_name in ("issues", "required_changes"):
+            values = {
+                "issues": ["缺少证据"],
+                "required_changes": ["补充来源"],
+                "safety_flags": [],
+                "reason_codes": ["missing_evidence"],
+            }
+            values[field_name] = ["x" * 301]
+            with self.subTest(field_name=field_name), self.assertRaises(ValidationError):
+                ReviewResult(decision="revise", **values)
 
     def test_ticket_state_uses_explicit_serializable_state_types_and_add_reducer(self):
         annotations = get_type_hints(TicketState, include_extras=True)
