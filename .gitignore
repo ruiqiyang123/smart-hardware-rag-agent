@@ -48,6 +48,7 @@ logs/
 # Runtime generated data
 # =========================
 chroma_db/
+chroma_db_v*/
 md5.txt
 data/profiles.db
 

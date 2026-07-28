@@ -22,14 +22,25 @@ class DemoReadinessTest(unittest.TestCase):
     def test_runtime_dependencies_are_declared(self):
         requirements = read_text("requirements.txt")
 
-        self.assertIn("langchain==0.3.30", requirements)
-        self.assertIn("langgraph-prebuilt==0.6.5", requirements)
-        self.assertIn("langchain-openai==0.3.35", requirements)
+        self.assertIn("langchain==1.0.0", requirements)
+        self.assertIn("langchain-core==1.2.22", requirements)
+        self.assertIn("langchain-openai==1.0.0", requirements)
+        self.assertIn("langgraph==1.0.10", requirements)
+        self.assertIn("langgraph-prebuilt==1.0.8", requirements)
+        self.assertIn("langgraph-checkpoint==4.1.1", requirements)
+        self.assertIn("langgraph-checkpoint-sqlite==3.1.0", requirements)
         self.assertIn("socksio==1.0.0", requirements)
         self.assertIn("python-dotenv", requirements)
         self.assertIn("posthog<6.0.0", requirements)
 
-    def test_python39_compatible_type_annotations(self):
+    def test_chroma_major_version_uses_isolated_ignored_cache(self):
+        chroma_config = read_text("config/chroma.yml")
+        gitignore = read_text(".gitignore")
+
+        self.assertIn("persist_directory : chroma_db_v1", chroma_config)
+        self.assertIn("chroma_db_v*/", gitignore)
+
+    def test_type_annotations_remain_backwards_compatible(self):
         model_factory = read_text("model/factory.py")
 
         self.assertIn("Union[Embeddings, BaseChatModel]", model_factory)

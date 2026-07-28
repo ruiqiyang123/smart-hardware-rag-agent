@@ -1,23 +1,25 @@
 # ai-hardware-cs-agent
 # 安装：pip install -r requirements.txt
+# Python >=3.10（CI 使用 Python 3.11）
 
 # LangChain 核心
-langchain==0.3.30
-langchain-core==0.3.86
+langchain==1.0.0
+langchain-core==1.2.22
 langchain-community==0.3.31
-langchain-openai==0.3.35
+langchain-openai==1.0.0
 socksio==1.0.0
 
 # 向量数据库
-langchain-chroma==0.2.0
-chromadb==0.5.15
-langchain-text-splitters==0.3.11
+langchain-chroma==1.0.0
+chromadb==1.0.20
+langchain-text-splitters==1.0.0
 posthog<6.0.0
 
 # Agent 编排
-langgraph==0.6.11
-langgraph-prebuilt==0.6.5
-langgraph-checkpoint-sqlite==2.0.11
+langgraph==1.0.10
+langgraph-prebuilt==1.0.8
+langgraph-checkpoint==4.1.1
+langgraph-checkpoint-sqlite==3.1.0
 pydantic>=2.7.0,<3.0.0
 
 # 前端
