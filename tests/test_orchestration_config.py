@@ -1,11 +1,57 @@
+import copy
 import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 from utils.config_handler import load_orchestration_config, load_security_policy
 
 
-class OrchestrationConfigTest(unittest.TestCase):
+VALID_ORCHESTRATION = {
+    "timeouts": {
+        "agent_seconds": 20,
+        "readonly_tool_seconds": 8,
+        "graph_seconds": 120,
+    },
+    "retries": {"triage": 1, "diagnosis": 1, "readonly_tool": 1, "review": 0},
+    "recursion_limit": 16,
+    "command_lease_seconds": 130,
+    "required_fields": {
+        "firmware_repair": ["device_model", "error_state"],
+    },
+    "manual_gate_actions": ["device_reset"],
+}
+
+VALID_SECURITY_POLICY = {
+    "policy_version": "2026-07-28.v1",
+    "official_domains": ["support.ledger.com", "trezor.io"],
+    "critical_response_template_zh": "安全提示",
+}
+
+
+class ConfigTestCase(unittest.TestCase):
+    def write_yaml(self, data):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "config.yml"
+        path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+        return str(path)
+
+    def write_raw(self, content):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "config.yml"
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+
+
+class OrchestrationConfigTest(ConfigTestCase):
+    def load_changed(self, mutator):
+        data = copy.deepcopy(VALID_ORCHESTRATION)
+        mutator(data)
+        return load_orchestration_config(self.write_yaml(data))
+
     def test_loads_fixed_execution_limits(self):
         config = load_orchestration_config()
         self.assertEqual(config["timeouts"]["agent_seconds"], 20)
@@ -15,16 +61,156 @@ class OrchestrationConfigTest(unittest.TestCase):
         self.assertEqual(config["command_lease_seconds"], 130)
         self.assertEqual(config["retries"]["review"], 0)
 
-    def test_security_policy_rejects_empty_whitelist(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "security.yml"
-            path.write_text(
-                'policy_version: "test"\nofficial_domains: []\n'
-                'critical_response_template_zh: "安全提示"\n',
-                encoding="utf-8",
-            )
-            with self.assertRaises(ValueError):
-                load_security_policy(str(path))
+    def test_rejects_missing_file_and_malformed_yaml(self):
+        with self.assertRaises(FileNotFoundError):
+            load_orchestration_config("/definitely/missing/orchestration.yml")
+        with self.assertRaises(yaml.YAMLError):
+            load_orchestration_config(self.write_raw("timeouts: [unterminated"))
+
+    def test_rejects_non_mapping_root_and_nested_sections(self):
+        with self.assertRaises(TypeError):
+            load_orchestration_config(self.write_yaml([]))
+        for section, bad_value in (("timeouts", "20"), ("retries", [])):
+            with self.subTest(section=section), self.assertRaises(TypeError):
+                self.load_changed(lambda data, s=section, v=bad_value: data.__setitem__(s, v))
+
+    def test_rejects_missing_top_level_and_nested_keys(self):
+        top_level = (
+            "timeouts",
+            "retries",
+            "recursion_limit",
+            "command_lease_seconds",
+            "required_fields",
+            "manual_gate_actions",
+        )
+        for key in top_level:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.load_changed(lambda data, k=key: data.pop(k))
+        for section, key in (
+            ("timeouts", "agent_seconds"),
+            ("timeouts", "readonly_tool_seconds"),
+            ("timeouts", "graph_seconds"),
+            ("retries", "triage"),
+            ("retries", "diagnosis"),
+            ("retries", "readonly_tool"),
+            ("retries", "review"),
+        ):
+            with self.subTest(section=section, key=key), self.assertRaises(ValueError):
+                self.load_changed(lambda data, s=section, k=key: data[s].pop(k))
+
+    def test_rejects_bool_and_non_integer_limits(self):
+        mutations = (
+            lambda data: data["timeouts"].__setitem__("agent_seconds", True),
+            lambda data: data["timeouts"].__setitem__("graph_seconds", 1.5),
+            lambda data: data["retries"].__setitem__("triage", False),
+            lambda data: data["retries"].__setitem__("diagnosis", "1"),
+            lambda data: data.__setitem__("recursion_limit", True),
+            lambda data: data.__setitem__("command_lease_seconds", "130"),
+        )
+        for index, mutation in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(TypeError):
+                self.load_changed(mutation)
+
+    def test_rejects_non_positive_limits_and_negative_retries(self):
+        mutations = (
+            lambda data: data["timeouts"].__setitem__("agent_seconds", 0),
+            lambda data: data["timeouts"].__setitem__("readonly_tool_seconds", -1),
+            lambda data: data["timeouts"].__setitem__("graph_seconds", 0),
+            lambda data: data["retries"].__setitem__("triage", -1),
+            lambda data: data.__setitem__("recursion_limit", 0),
+            lambda data: data.__setitem__("command_lease_seconds", -1),
+        )
+        for index, mutation in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                self.load_changed(mutation)
+
+    def test_review_retry_must_be_zero(self):
+        with self.assertRaises(ValueError):
+            self.load_changed(lambda data: data["retries"].__setitem__("review", 1))
+
+    def test_command_lease_must_exceed_graph_timeout(self):
+        for lease in (119, 120):
+            with self.subTest(lease=lease), self.assertRaises(ValueError):
+                self.load_changed(lambda data, value=lease: data.__setitem__("command_lease_seconds", value))
+
+    def test_required_fields_must_be_non_empty_string_list_mapping(self):
+        bad_values = (
+            [],
+            {},
+            {1: ["device_model"]},
+            {"": ["device_model"]},
+            {"firmware_repair": "device_model"},
+            {"firmware_repair": []},
+            {"firmware_repair": [1]},
+            {"firmware_repair": [" "]},
+        )
+        for value in bad_values:
+            expected = TypeError if value == [] or value == {1: ["device_model"]} or value == {"firmware_repair": "device_model"} or value == {"firmware_repair": [1]} else ValueError
+            with self.subTest(value=value), self.assertRaises(expected):
+                self.load_changed(lambda data, v=value: data.__setitem__("required_fields", v))
+
+    def test_manual_gate_actions_must_be_non_empty_strings(self):
+        bad_values = ("device_reset", [], [1], [""], [" "])
+        for value in bad_values:
+            expected = TypeError if isinstance(value, str) or value == [1] else ValueError
+            with self.subTest(value=value), self.assertRaises(expected):
+                self.load_changed(lambda data, v=value: data.__setitem__("manual_gate_actions", v))
+
+
+class SecurityPolicyTest(ConfigTestCase):
+    def load_changed(self, mutator):
+        data = copy.deepcopy(VALID_SECURITY_POLICY)
+        mutator(data)
+        return load_security_policy(self.write_yaml(data))
+
+    def test_loads_canonical_official_domains(self):
+        policy = load_security_policy()
+        self.assertIn("support.ledger.com", policy["official_domains"])
+
+    def test_rejects_missing_file_and_malformed_yaml(self):
+        with self.assertRaises(FileNotFoundError):
+            load_security_policy("/definitely/missing/security.yml")
+        with self.assertRaises(yaml.YAMLError):
+            load_security_policy(self.write_raw("official_domains: [unterminated"))
+
+    def test_rejects_missing_required_fields(self):
+        for field in (
+            "policy_version",
+            "official_domains",
+            "critical_response_template_zh",
+        ):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.load_changed(lambda data, key=field: data.pop(key))
+
+    def test_policy_version_and_template_must_be_non_empty_strings(self):
+        for field in ("policy_version", "critical_response_template_zh"):
+            for value in (None, 1, "", " "):
+                expected = TypeError if not isinstance(value, str) else ValueError
+                with self.subTest(field=field, value=value), self.assertRaises(expected):
+                    self.load_changed(lambda data, f=field, v=value: data.__setitem__(f, v))
+
+    def test_official_domains_must_be_non_empty_string_list(self):
+        for value in ("ledger.com", 1, [], [1], [""], [" "]):
+            expected = TypeError if isinstance(value, (str, int)) or value == [1] else ValueError
+            with self.subTest(value=value), self.assertRaises(expected):
+                self.load_changed(lambda data, v=value: data.__setitem__("official_domains", v))
+
+    def test_rejects_non_canonical_hostnames(self):
+        invalid_domains = (
+            "https://ledger.com",
+            "ledger.com/help",
+            "ledger.com:443",
+            "Ledger.com",
+            " ledger.com",
+            "ledger.com ",
+            "ledger..com",
+            "-ledger.com",
+            "ledger-.com",
+            "localhost",
+        )
+        for domain in invalid_domains:
+            with self.subTest(domain=domain), self.assertRaises(ValueError):
+                self.load_changed(lambda data, value=domain: data.__setitem__("official_domains", [value]))
 
 
 if __name__ == "__main__":

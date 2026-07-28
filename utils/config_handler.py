@@ -1,3 +1,5 @@
+import re
+
 import yaml
 from utils.path_tool import get_abs_path
 
@@ -26,30 +28,131 @@ def _load_required_yaml(config_path: str) -> dict:
     with open(config_path, "r", encoding="utf-8") as file:
         data = yaml.safe_load(file)
     if not isinstance(data, dict):
-        raise ValueError(f"配置文件不是对象: {config_path}")
+        raise TypeError(f"配置文件不是对象: {config_path}")
     return data
+
+
+def _require_keys(data: dict, keys: set, source: str) -> None:
+    missing = sorted(keys.difference(data))
+    if missing:
+        raise ValueError(f"{source} 缺少字段: {', '.join(missing)}")
+
+
+def _require_dict(value, field: str) -> dict:
+    if not isinstance(value, dict):
+        raise TypeError(f"{field} 必须是对象")
+    return value
+
+
+def _require_integer(value, field: str, minimum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field} 必须是整数")
+    if value < minimum:
+        comparator = "正整数" if minimum == 1 else "非负整数"
+        raise ValueError(f"{field} 必须是{comparator}")
+    return value
+
+
+def _require_non_empty_string(value, field: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field} 必须是字符串")
+    if not value.strip():
+        raise ValueError(f"{field} 不能为空")
+    return value
 
 
 def load_orchestration_config(
     config_path: str = get_abs_path("config/orchestration.yml"),
 ) -> dict:
     data = _load_required_yaml(config_path)
-    required = {"timeouts", "retries", "recursion_limit", "command_lease_seconds"}
-    if not required.issubset(data):
-        raise ValueError("orchestration.yml 缺少执行边界")
+    _require_keys(
+        data,
+        {
+            "timeouts",
+            "retries",
+            "recursion_limit",
+            "command_lease_seconds",
+            "required_fields",
+            "manual_gate_actions",
+        },
+        "orchestration.yml",
+    )
+
+    timeouts = _require_dict(data["timeouts"], "timeouts")
+    timeout_keys = {"agent_seconds", "readonly_tool_seconds", "graph_seconds"}
+    _require_keys(timeouts, timeout_keys, "timeouts")
+    for key in timeout_keys:
+        _require_integer(timeouts[key], f"timeouts.{key}", minimum=1)
+
+    retries = _require_dict(data["retries"], "retries")
+    retry_keys = {"triage", "diagnosis", "readonly_tool", "review"}
+    _require_keys(retries, retry_keys, "retries")
+    for key in retry_keys:
+        _require_integer(retries[key], f"retries.{key}", minimum=0)
+    if retries["review"] != 0:
+        raise ValueError("retries.review 必须为 0")
+
+    _require_integer(data["recursion_limit"], "recursion_limit", minimum=1)
+    lease = _require_integer(
+        data["command_lease_seconds"], "command_lease_seconds", minimum=1
+    )
+    if lease <= timeouts["graph_seconds"]:
+        raise ValueError("command_lease_seconds 必须大于 timeouts.graph_seconds")
+
+    required_fields = _require_dict(data["required_fields"], "required_fields")
+    if not required_fields:
+        raise ValueError("required_fields 不能为空")
+    for intent, fields in required_fields.items():
+        _require_non_empty_string(intent, "required_fields 的键")
+        if not isinstance(fields, list):
+            raise TypeError(f"required_fields.{intent} 必须是字符串列表")
+        if not fields:
+            raise ValueError(f"required_fields.{intent} 不能为空")
+        for field in fields:
+            _require_non_empty_string(field, f"required_fields.{intent} 的字段")
+
+    manual_actions = data["manual_gate_actions"]
+    if not isinstance(manual_actions, list):
+        raise TypeError("manual_gate_actions 必须是字符串列表")
+    if not manual_actions:
+        raise ValueError("manual_gate_actions 不能为空")
+    for action in manual_actions:
+        _require_non_empty_string(action, "manual_gate_actions 的动作")
     return data
+
+
+_HOSTNAME_PATTERN = re.compile(
+    r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
+)
 
 
 def load_security_policy(
     config_path: str = get_abs_path("config/security_policy.yml"),
 ) -> dict:
     data = _load_required_yaml(config_path)
-    if not str(data.get("policy_version", "")).strip():
-        raise ValueError("security_policy.yml 缺少 policy_version")
-    if not data.get("official_domains"):
-        raise ValueError("security_policy.yml 的 official_domains 不能为空")
-    if not str(data.get("critical_response_template_zh", "")).strip():
-        raise ValueError("security_policy.yml 缺少 critical_response_template_zh")
+    _require_keys(
+        data,
+        {"policy_version", "official_domains", "critical_response_template_zh"},
+        "security_policy.yml",
+    )
+    _require_non_empty_string(data["policy_version"], "policy_version")
+    _require_non_empty_string(
+        data["critical_response_template_zh"], "critical_response_template_zh"
+    )
+
+    domains = data["official_domains"]
+    if not isinstance(domains, list):
+        raise TypeError("official_domains 必须是字符串列表")
+    if not domains:
+        raise ValueError("official_domains 不能为空")
+    for domain in domains:
+        if not isinstance(domain, str):
+            raise TypeError("official_domains 的每一项必须是字符串")
+        if not domain.strip():
+            raise ValueError("official_domains 不能包含空项")
+        if not _HOSTNAME_PATTERN.fullmatch(domain):
+            raise ValueError(f"official_domains 包含非规范 hostname: {domain}")
     return data
 
 
