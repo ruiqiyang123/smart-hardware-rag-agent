@@ -2,6 +2,8 @@ import os
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -34,11 +36,16 @@ class DemoReadinessTest(unittest.TestCase):
         self.assertIn("posthog<6.0.0", requirements)
 
     def test_chroma_major_version_uses_isolated_ignored_cache(self):
-        chroma_config = read_text("config/chroma.yml")
+        chroma_config = yaml.safe_load(read_text("config/chroma.yml"))
         gitignore = read_text(".gitignore")
 
-        self.assertIn("persist_directory : chroma_db_v1", chroma_config)
+        self.assertEqual(chroma_config["persist_directory"], "chroma_db_v1")
+        self.assertEqual(chroma_config["md5_hex_store"], "md5_v1.txt")
+        index_version = chroma_config["persist_directory"].rsplit("_v", 1)[1]
+        md5_version = chroma_config["md5_hex_store"].removeprefix("md5_v").removesuffix(".txt")
+        self.assertEqual(index_version, md5_version)
         self.assertIn("chroma_db_v*/", gitignore)
+        self.assertIn("md5_v*.txt", gitignore)
 
     def test_type_annotations_remain_backwards_compatible(self):
         model_factory = read_text("model/factory.py")

@@ -19,8 +19,15 @@ VALID_ORCHESTRATION = {
     "command_lease_seconds": 130,
     "required_fields": {
         "firmware_repair": ["device_model", "error_state"],
+        "warranty_service": ["serial_last4"],
+        "transaction_boundary": ["transaction_hash", "chain_name"],
     },
-    "manual_gate_actions": ["device_reset"],
+    "manual_gate_actions": [
+        "device_reset",
+        "bootloader_recovery",
+        "wallet_recovery",
+        "warranty_decision",
+    ],
 }
 
 VALID_SECURITY_POLICY = {
@@ -133,6 +140,21 @@ class OrchestrationConfigTest(ConfigTestCase):
             with self.subTest(lease=lease), self.assertRaises(ValueError):
                 self.load_changed(lambda data, value=lease: data.__setitem__("command_lease_seconds", value))
 
+    def test_rejects_positive_but_non_fixed_execution_limits(self):
+        mutations = (
+            lambda data: data["timeouts"].__setitem__("agent_seconds", 21),
+            lambda data: data["timeouts"].__setitem__("readonly_tool_seconds", 9),
+            lambda data: data["timeouts"].__setitem__("graph_seconds", 121),
+            lambda data: data["retries"].__setitem__("triage", 2),
+            lambda data: data["retries"].__setitem__("diagnosis", 2),
+            lambda data: data["retries"].__setitem__("readonly_tool", 2),
+            lambda data: data.__setitem__("recursion_limit", 17),
+            lambda data: data.__setitem__("command_lease_seconds", 131),
+        )
+        for index, mutation in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                self.load_changed(mutation)
+
     def test_required_fields_must_be_non_empty_string_list_mapping(self):
         bad_values = (
             [],
@@ -149,12 +171,43 @@ class OrchestrationConfigTest(ConfigTestCase):
             with self.subTest(value=value), self.assertRaises(expected):
                 self.load_changed(lambda data, v=value: data.__setitem__("required_fields", v))
 
+    def test_required_fields_rejects_each_missing_intent_and_field(self):
+        for intent in VALID_ORCHESTRATION["required_fields"]:
+            with self.subTest(intent=intent), self.assertRaises(ValueError):
+                self.load_changed(lambda data, key=intent: data["required_fields"].pop(key))
+
+        for intent, fields in VALID_ORCHESTRATION["required_fields"].items():
+            for field in fields:
+                with self.subTest(intent=intent, field=field), self.assertRaises(ValueError):
+                    self.load_changed(
+                        lambda data, key=intent, value=field: data["required_fields"][key].remove(value)
+                    )
+
+    def test_required_fields_rejects_extra_and_duplicate_entries(self):
+        mutations = (
+            lambda data: data["required_fields"].__setitem__("other", ["field"]),
+            lambda data: data["required_fields"]["firmware_repair"].append("extra"),
+            lambda data: data["required_fields"]["firmware_repair"].append("device_model"),
+        )
+        for index, mutation in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                self.load_changed(mutation)
+
     def test_manual_gate_actions_must_be_non_empty_strings(self):
         bad_values = ("device_reset", [], [1], [""], [" "])
         for value in bad_values:
             expected = TypeError if isinstance(value, str) or value == [1] else ValueError
             with self.subTest(value=value), self.assertRaises(expected):
                 self.load_changed(lambda data, v=value: data.__setitem__("manual_gate_actions", v))
+
+    def test_manual_gate_actions_rejects_each_missing_extra_and_duplicate(self):
+        for action in VALID_ORCHESTRATION["manual_gate_actions"]:
+            with self.subTest(action=action), self.assertRaises(ValueError):
+                self.load_changed(lambda data, value=action: data["manual_gate_actions"].remove(value))
+
+        for value in ("factory_reset", "device_reset"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.load_changed(lambda data, action=value: data["manual_gate_actions"].append(action))
 
 
 class SecurityPolicyTest(ConfigTestCase):

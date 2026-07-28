@@ -50,6 +50,7 @@ logs/
 chroma_db/
 chroma_db_v*/
 md5.txt
+md5_v*.txt
 data/profiles.db
 
 # Optional: if you later generate temp reports locally

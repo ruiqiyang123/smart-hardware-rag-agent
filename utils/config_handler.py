@@ -61,6 +61,30 @@ def _require_non_empty_string(value, field: str) -> str:
     return value
 
 
+_FIXED_TIMEOUTS = {
+    "agent_seconds": 20,
+    "readonly_tool_seconds": 8,
+    "graph_seconds": 120,
+}
+_FIXED_RETRIES = {
+    "triage": 1,
+    "diagnosis": 1,
+    "readonly_tool": 1,
+    "review": 0,
+}
+_FIXED_REQUIRED_FIELDS = {
+    "firmware_repair": ["device_model", "error_state"],
+    "warranty_service": ["serial_last4"],
+    "transaction_boundary": ["transaction_hash", "chain_name"],
+}
+_FIXED_MANUAL_GATE_ACTIONS = {
+    "device_reset",
+    "bootloader_recovery",
+    "wallet_recovery",
+    "warranty_decision",
+}
+
+
 def load_orchestration_config(
     config_path: str = get_abs_path("config/orchestration.yml"),
 ) -> dict:
@@ -79,25 +103,35 @@ def load_orchestration_config(
     )
 
     timeouts = _require_dict(data["timeouts"], "timeouts")
-    timeout_keys = {"agent_seconds", "readonly_tool_seconds", "graph_seconds"}
+    timeout_keys = set(_FIXED_TIMEOUTS)
     _require_keys(timeouts, timeout_keys, "timeouts")
     for key in timeout_keys:
         _require_integer(timeouts[key], f"timeouts.{key}", minimum=1)
+        if timeouts[key] != _FIXED_TIMEOUTS[key]:
+            raise ValueError(f"timeouts.{key} 必须为 {_FIXED_TIMEOUTS[key]}")
 
     retries = _require_dict(data["retries"], "retries")
-    retry_keys = {"triage", "diagnosis", "readonly_tool", "review"}
+    retry_keys = set(_FIXED_RETRIES)
     _require_keys(retries, retry_keys, "retries")
     for key in retry_keys:
         _require_integer(retries[key], f"retries.{key}", minimum=0)
+        if retries[key] != _FIXED_RETRIES[key]:
+            raise ValueError(f"retries.{key} 必须为 {_FIXED_RETRIES[key]}")
     if retries["review"] != 0:
         raise ValueError("retries.review 必须为 0")
 
-    _require_integer(data["recursion_limit"], "recursion_limit", minimum=1)
+    recursion_limit = _require_integer(
+        data["recursion_limit"], "recursion_limit", minimum=1
+    )
+    if recursion_limit != 16:
+        raise ValueError("recursion_limit 必须为 16")
     lease = _require_integer(
         data["command_lease_seconds"], "command_lease_seconds", minimum=1
     )
     if lease <= timeouts["graph_seconds"]:
         raise ValueError("command_lease_seconds 必须大于 timeouts.graph_seconds")
+    if lease != 130:
+        raise ValueError("command_lease_seconds 必须为 130")
 
     required_fields = _require_dict(data["required_fields"], "required_fields")
     if not required_fields:
@@ -110,6 +144,14 @@ def load_orchestration_config(
             raise ValueError(f"required_fields.{intent} 不能为空")
         for field in fields:
             _require_non_empty_string(field, f"required_fields.{intent} 的字段")
+    if set(required_fields) != set(_FIXED_REQUIRED_FIELDS):
+        raise ValueError("required_fields 必须包含且仅包含固定意图")
+    for intent, expected_fields in _FIXED_REQUIRED_FIELDS.items():
+        fields = required_fields[intent]
+        if len(fields) != len(set(fields)):
+            raise ValueError(f"required_fields.{intent} 不得包含重复字段")
+        if set(fields) != set(expected_fields):
+            raise ValueError(f"required_fields.{intent} 必须包含固定字段")
 
     manual_actions = data["manual_gate_actions"]
     if not isinstance(manual_actions, list):
@@ -118,6 +160,10 @@ def load_orchestration_config(
         raise ValueError("manual_gate_actions 不能为空")
     for action in manual_actions:
         _require_non_empty_string(action, "manual_gate_actions 的动作")
+    if len(manual_actions) != len(set(manual_actions)):
+        raise ValueError("manual_gate_actions 不得包含重复动作")
+    if set(manual_actions) != _FIXED_MANUAL_GATE_ACTIONS:
+        raise ValueError("manual_gate_actions 必须包含且仅包含固定动作")
     return data
 
 
