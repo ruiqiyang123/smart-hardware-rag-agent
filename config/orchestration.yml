@@ -1,0 +1,20 @@
+timeouts:
+  agent_seconds: 20
+  readonly_tool_seconds: 8
+  graph_seconds: 120
+retries:
+  triage: 1
+  diagnosis: 1
+  readonly_tool: 1
+  review: 0
+recursion_limit: 16
+command_lease_seconds: 130
+required_fields:
+  firmware_repair: [device_model, error_state]
+  warranty_service: [serial_last4]
+  transaction_boundary: [transaction_hash, chain_name]
+manual_gate_actions:
+  - device_reset
+  - bootloader_recovery
+  - wallet_recovery
+  - warranty_decision

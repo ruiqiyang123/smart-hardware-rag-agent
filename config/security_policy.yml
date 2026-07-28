@@ -1,0 +1,11 @@
+policy_version: "2026-07-28.v1"
+official_domains:
+  - support.ledger.com
+  - ledger.com
+  - www.ledger.com
+  - trezor.io
+critical_response_template_zh: >-
+  检测到疑似钱包秘密或资产安全风险。请立即停止继续分享；任何已经泄露的
+  助记词或私钥都应视为不再安全。请只通过设备厂商官方应用和官方帮助中心
+  创建新钱包并处理仍可控资产，不要接受远程控制，也不要再向任何人提供
+  助记词、私钥、PIN 或 Passphrase。KeyGuard 已将本工单脱敏并转交人工审核。
