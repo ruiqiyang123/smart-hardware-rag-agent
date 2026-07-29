@@ -13,7 +13,8 @@ from utils.session_context import current_user_id, current_location
 from agent.services.chain_status_service import fetch_chain_status
 from agent.services.usage_records import find_usage_record, load_usage_records
 
-rag = RagSummarizeService()
+rag = None
+_evidence_rag = None
 
 # 会话级用户上下文：替代原 random.choice(user_ids)
 # 在 Streamlit 前端通过 session_state 设置当前登录用户，见 app.py 侧边栏
@@ -33,6 +34,20 @@ def configure_rag_model(model):
     """
     global rag
     rag = RagSummarizeService(model=model)
+
+
+def _summary_rag() -> RagSummarizeService:
+    global rag
+    if rag is None:
+        rag = RagSummarizeService()
+    return rag
+
+
+def _structured_evidence_rag() -> RagSummarizeService:
+    global _evidence_rag
+    if _evidence_rag is None:
+        _evidence_rag = RagSummarizeService(evidence_only=True)
+    return _evidence_rag
 
 
 def resolve_location_or_ip(location: Optional[str] = None) -> str:
@@ -62,7 +77,13 @@ def resolve_location_or_ip(location: Optional[str] = None) -> str:
 
 @tool(description="从向量存储中检索硬件钱包相关的参考资料，返回包含答案与引用来源的结构化内容")
 def rag_summarize(query: str) -> str:
-    return rag.rag_summarize(query)
+    return _summary_rag().rag_summarize(query)
+
+
+@tool(description="只读检索硬件钱包售后知识证据，返回结构化证据列表；不会调用总结模型")
+def search_support_evidence(query: str) -> list[dict]:
+    """V2 knowledge search. It never invokes the RAG summary LLM."""
+    return _structured_evidence_rag().search_evidence(query)
 
 
 @tool(description="获取指定区块链网络的模拟状态信息（网络拥堵、手续费区间、预计确认时间），用于演示交易 pending 与硬件签名边界。返回纯字符串")

@@ -1,0 +1,66 @@
+[
+  {
+    "serial_last4": "A1B2",
+    "device_model": "KeyGuard Pro",
+    "purchase_date": "2026-02-10",
+    "warranty_until": "2027-02-10",
+    "warranty_status": "active",
+    "note": "模拟数据：蓝牙版演示设备"
+  },
+  {
+    "serial_last4": "C3D4",
+    "device_model": "KeyGuard Mini",
+    "purchase_date": "2024-03-01",
+    "warranty_until": "2025-03-01",
+    "warranty_status": "expired",
+    "note": "模拟数据：已过保设备"
+  },
+  {
+    "serial_last4": "E5F6",
+    "device_model": "KeyGuard Max",
+    "purchase_date": "2026-05-18",
+    "warranty_until": "2028-05-18",
+    "warranty_status": "active",
+    "note": "模拟数据：延长保修设备"
+  },
+  {
+    "serial_last4": "G7H8",
+    "device_model": "KeyGuard Pro",
+    "purchase_date": "2025-12-20",
+    "warranty_until": "2026-12-20",
+    "warranty_status": "active",
+    "note": "模拟数据：屏幕故障设备"
+  },
+  {
+    "serial_last4": "J9K0",
+    "device_model": "KeyGuard Mini",
+    "purchase_date": "2024-07-11",
+    "warranty_until": "2025-07-11",
+    "warranty_status": "expired",
+    "note": "模拟数据：接口磨损设备"
+  },
+  {
+    "serial_last4": "L1M2",
+    "device_model": "KeyGuard Max",
+    "purchase_date": "2026-06-02",
+    "warranty_until": "2028-06-02",
+    "warranty_status": "active",
+    "note": "模拟数据：固件恢复设备"
+  },
+  {
+    "serial_last4": "N3P4",
+    "device_model": "KeyGuard Pro",
+    "purchase_date": "",
+    "warranty_until": "",
+    "warranty_status": "missing_info",
+    "note": "模拟数据：缺少购买日期"
+  },
+  {
+    "serial_last4": "Q5R6",
+    "device_model": "KeyGuard Mini",
+    "purchase_date": "2026-01-09",
+    "warranty_until": "2027-01-09",
+    "warranty_status": "active",
+    "note": "模拟数据：按键故障设备"
+  }
+]
