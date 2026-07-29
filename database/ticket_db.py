@@ -8,7 +8,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from agent.security.secrets import contains_unredacted_secret, is_fully_redacted
+from agent.security.secrets import (
+    TransactionHash,
+    contains_unredacted_secret,
+    is_fully_redacted,
+)
 
 
 class CommandDisposition(str, Enum):
@@ -200,6 +204,7 @@ class TicketRepository:
         "manual_gate_reason",
     }
     _ADMIN_UPDATABLE_FIELDS = {"requires_human", "manual_gate_reason"}
+    _TRANSACTION_HASH_METADATA_PATHS = {("transaction_hash",)}
     _EVENT_FIELDS = {
         "step_index",
         "node_name",
@@ -291,27 +296,40 @@ class TicketRepository:
             raise ValueError("检测到未脱敏的敏感信息")
 
     @classmethod
-    def _assert_safe_metadata(cls, value: object, parent_key: str = "") -> None:
+    def _prepare_safe_metadata(
+        cls,
+        value: object,
+        path: Tuple[str, ...] = (),
+    ) -> object:
+        if isinstance(value, TransactionHash):
+            if path not in cls._TRANSACTION_HASH_METADATA_PATHS:
+                raise ValueError(
+                    "TransactionHash 只能用于受信任的 transaction_hash 字段"
+                )
+            return value.value
         if isinstance(value, str):
-            if parent_key.lower() in _SENSITIVE_METADATA_KEYS:
+            if path and path[-1].lower() in _SENSITIVE_METADATA_KEYS:
                 if not is_fully_redacted(value):
                     raise ValueError("检测到未脱敏的敏感信息")
             cls._assert_no_secret(value)
-            return
+            return value
         if isinstance(value, dict):
+            prepared = {}
             for key, nested in value.items():
                 if not isinstance(key, str):
                     raise ValueError("metadata 的 key 必须是字符串")
-                cls._assert_safe_metadata(nested, key)
-            return
+                prepared[key] = cls._prepare_safe_metadata(nested, path + (key,))
+            return prepared
         if isinstance(value, list):
-            for nested in value:
-                cls._assert_safe_metadata(nested, parent_key)
-            return
+            return [
+                cls._prepare_safe_metadata(nested, path + ("[]",))
+                for nested in value
+            ]
         if isinstance(value, float) and not math.isfinite(value):
             raise ValueError("metadata 只能包含有限 JSON 数值")
         if value is not None and not isinstance(value, (bool, int, float)):
             raise ValueError("metadata 只能包含 JSON 值")
+        return value
 
     @staticmethod
     def _enum_value(
@@ -394,7 +412,7 @@ class TicketRepository:
         metadata = event["metadata"]
         if not isinstance(metadata, dict):
             raise ValueError("metadata 必须是 dict")
-        cls._assert_safe_metadata(metadata)
+        metadata = cls._prepare_safe_metadata(metadata)
         return {
             "step_index": step_index,
             "node_name": node_name,

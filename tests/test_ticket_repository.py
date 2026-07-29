@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import threading
@@ -5,13 +6,18 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from agent.security.secrets import SanitizedText, contains_unredacted_secret
+from agent.security.secrets import (
+    SanitizedText,
+    TransactionHash,
+    contains_unredacted_secret,
+)
 from database.ticket_db import CommandDisposition, CommandType, TicketRepository
 
 
 MNEMONIC = (
     "abandon ability able about above absent absorb abstract absurd abuse access accident"
 )
+TRANSACTION_HASH = "0x" + "a" * 64
 
 
 class TicketRepositoryTest(unittest.TestCase):
@@ -502,6 +508,80 @@ class TicketRepositoryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "敏感信息"):
             self.repo.create_ticket(
                 "bip39-separated", "1001", bip39_with_common_separators, []
+            )
+
+    def test_bip39_detection_supports_all_standard_word_counts(self):
+        words = MNEMONIC.split()
+        for word_count in (12, 15, 18, 21, 24):
+            phrase = " ".join(words[index % len(words)] for index in range(word_count))
+            with self.subTest(word_count=word_count):
+                self.assertTrue(contains_unredacted_secret(phrase))
+                with self.assertRaisesRegex(ValueError, "敏感信息"):
+                    self.repo.create_ticket(
+                        f"bip39-{word_count}", "1001", phrase, []
+                    )
+
+    def test_explicit_transaction_hash_field_can_be_persisted(self):
+        ticket, command_id, decision = self._started("transaction-hash")
+        event_id = self.repo.append_event(
+            **self._event(
+                ticket,
+                command_id,
+                decision.lease_version,
+                metadata={"transaction_hash": TransactionHash(TRANSACTION_HASH)},
+            )
+        )
+        event = next(
+            item
+            for item in self.repo.list_events(ticket["ticket_id"])
+            if item["event_id"] == event_id
+        )
+        self.assertEqual(
+            json.loads(event["metadata_json"])["transaction_hash"], TRANSACTION_HASH
+        )
+
+    def test_transaction_hash_is_rejected_outside_typed_allowed_field(self):
+        ticket, command_id, decision = self._started("transaction-boundary")
+        invalid_metadata = [
+            {"transaction_hash": TRANSACTION_HASH},
+            {"nested": {"transaction_hash": TransactionHash(TRANSACTION_HASH)}},
+            {"nested": {"value": TRANSACTION_HASH}},
+            {"transaction_hash": {"value": TransactionHash(TRANSACTION_HASH)}},
+        ]
+        for metadata in invalid_metadata:
+            with self.subTest(metadata=metadata), self.assertRaises(ValueError):
+                self.repo.append_event(
+                    **self._event(
+                        ticket,
+                        command_id,
+                        decision.lease_version,
+                        metadata=metadata,
+                    )
+                )
+
+        with self.assertRaises(ValueError):
+            self.repo.append_event(
+                **self._event(
+                    ticket,
+                    command_id,
+                    decision.lease_version,
+                    summary=TRANSACTION_HASH,
+                )
+            )
+        terminal_event = {
+            key: value
+            for key, value in self._event(
+                ticket, command_id, decision.lease_version
+            ).items()
+            if key not in {"ticket_id", "command_id", "lease_version"}
+        }
+        with self.assertRaises(ValueError):
+            self.repo.commit_command_result(
+                ticket["ticket_id"],
+                command_id,
+                decision.lease_version,
+                {"status": "triaged", "draft_answer": TRANSACTION_HASH},
+                [terminal_event],
             )
 
     def test_append_event_is_idempotent_and_strictly_monotonic(self):

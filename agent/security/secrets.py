@@ -9,6 +9,7 @@ _WORD_PATTERN = re.compile(r"[A-Za-z]+", re.ASCII)
 _HEX_PRIVATE_KEY_PATTERN = re.compile(
     r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])"
 )
+_TRANSACTION_HASH_PATTERN = re.compile(r"(?:0[xX])?[0-9A-Fa-f]{64}")
 _WIF_PATTERN = re.compile(
     r"(?<![1-9A-HJ-NP-Za-km-z])[5KL][1-9A-HJ-NP-Za-km-z]{50,51}"
     r"(?![1-9A-HJ-NP-Za-km-z])"
@@ -53,13 +54,29 @@ class SanitizedText:
             raise ValueError("检测到未脱敏的敏感信息")
 
 
+@dataclass(frozen=True)
+class TransactionHash:
+    """Explicitly typed chain transaction hash for trusted persistence fields."""
+
+    value: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.value, str)
+            or _TRANSACTION_HASH_PATTERN.fullmatch(self.value) is None
+        ):
+            raise ValueError("transaction hash 必须是 64 位十六进制字符串")
+
+
 def _words(value: str) -> List[str]:
     return [match.group(0).lower() for match in _WORD_PATTERN.finditer(value)]
 
 
 def _is_bip39_phrase(value: str) -> bool:
     words = _words(value)
-    return len(words) in {12, 24} and all(word in _BIP39_WORDS for word in words)
+    return len(words) in {12, 15, 18, 21, 24} and all(
+        word in _BIP39_WORDS for word in words
+    )
 
 
 def is_fully_redacted(value: str) -> bool:
