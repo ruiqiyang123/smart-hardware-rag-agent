@@ -60,10 +60,11 @@ flowchart LR
     ES --> WB["工单工作台 / HITL"]
     WB -->|批准或编辑后发送| OK
     WB -->|追问| PU
-    CP[("LangGraph Checkpoint")] -.暂停与恢复.-> T
-    CP -.暂停与恢复.-> D
-    CP -.暂停与恢复.-> RV
+    CP[("LangGraph Checkpoint<br/>节点执行期间持续记录")] -.仅从暂停态恢复.-> PU
+    CP -.仅从暂停态恢复.-> ES
 ```
+
+Checkpoint 会在节点执行期间持续记录图状态，但**命令恢复入口只接受 `pending_user` 和 `escalated`** 两个暂停态，不能任意从 Triage、Diagnosis 或 Review 节点恢复。
 
 ### 七状态工单图
 
@@ -71,6 +72,7 @@ flowchart LR
 stateDiagram-v2
     [*] --> new
     new --> triaged: Triage 完成
+    new --> escalated: 入口风险门禁
     triaged --> pending_user: 缺少必要信息
     triaged --> escalated: 高风险或需人工
     triaged --> diagnosing: 信息足够
@@ -81,8 +83,10 @@ stateDiagram-v2
     reviewing --> escalated: Review 或 Policy Guard 阻断
     reviewing --> resolved: 审查通过
     pending_user --> triaged: 用户补充信息
+    pending_user --> escalated: 补充输入触发风险门禁
     escalated --> pending_user: 操作员追问
     escalated --> resolved: 操作员批准或编辑后发送
+    escalated --> escalated: 保持人工升级
     resolved --> [*]
 ```
 
@@ -114,7 +118,7 @@ Agent 负责理解和生成；Tool 负责返回事实。工具不替模型“思
 ## 安全、可靠性与 Human-in-the-loop
 
 - **Ingress Guard**：在内容写入工单或 checkpoint 之前识别助记词、私钥等秘密并脱敏；后续节点只看到清理后的文本。
-- **Policy Guard**：在答复离开系统前做确定性校验，阻断索要或复述秘密、证据不足以及越权动作。
+- **Policy Guard**：在答复离开系统前做最终确定性校验，阻断未脱敏秘密、不安全动作和不可信 URL。证据充分性由 Diagnosis / Review 验证链负责，不归到最终 Policy Guard。
 - **风险粘性**：工单一旦被判为高风险，后续轮次不能仅靠模型输出把风险静默降级。
 - **最多一次返工**：Review 可把诊断退回一次；再次失败转人工，避免无限循环。
 - **可恢复执行**：工单数据库保存业务状态，独立 checkpoint 数据库保存图执行位置；超时、有限重试和命令租约降低重复执行风险。
@@ -161,7 +165,9 @@ export KEYGUARD_ORCHESTRATION_EVAL_RUNNER=module:attribute
 python eval/run_orchestration_eval.py --tag keyguard-v2
 ```
 
-未配置 runner 时脚本会 **fail closed**：退出失败且保持**零输出**，不会伪造 `keyguard-v2.json`。因此仓库不预填未实测的 V2 分数；演示时应现场运行后再展示混淆矩阵和 bad case。
+配置 runner 后，结果 JSON 会保存 aggregate metrics 与 operational metrics，并在 `results` 中保留逐 case scores、`status_trace`、`citations` 等受限字段；可从未通过的 scores 选择 bad case 复盘。
+
+未配置 runner 时脚本会 **fail closed**：stderr 显示配置错误并以状态码 2 退出，但不生成评测结果文件，保持**零结果产物**。因此仓库不预填未实测的 V2 分数。
 
 ## 本地启动
 

@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
+from utils.env_bootstrap import bootstrap_environment
+
+bootstrap_environment()
+
 import streamlit as st
 
 from agent.orchestration.graph import build_configured_graph, sqlite_checkpointer

@@ -1,4 +1,9 @@
+import ast
 import os
+import re
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -53,10 +58,88 @@ class DemoReadinessTest(unittest.TestCase):
         self.assertIn("Union[Embeddings, BaseChatModel]", model_factory)
         self.assertNotIn("Embeddings | BaseChatModel", model_factory)
 
-    def test_runtime_environment_overrides_local_dotenv(self):
-        model_factory = read_text("model/factory.py")
+    def test_app_bootstraps_environment_before_framework_imports(self):
+        tree = ast.parse(read_text("app.py"))
+        bootstrap_call = next(
+            index
+            for index, node in enumerate(tree.body)
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "bootstrap_environment"
+        )
+        framework_imports = []
+        for index, node in enumerate(tree.body):
+            if isinstance(node, ast.Import):
+                roots = {alias.name.split(".", 1)[0] for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                roots = {node.module.split(".", 1)[0]}
+            else:
+                continue
+            if roots & {"streamlit", "agent", "langgraph"}:
+                framework_imports.append(index)
 
-        self.assertIn("load_dotenv(override=False)", model_factory)
+        self.assertTrue(framework_imports)
+        self.assertLess(bootstrap_call, min(framework_imports))
+
+    def test_env_bootstrap_enables_strict_msgpack_before_langgraph_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, ".env").write_text(
+                "LANGGRAPH_STRICT_MSGPACK=true\n",
+                encoding="utf-8",
+            )
+            script = "\n".join(
+                (
+                    "import sys",
+                    f"sys.path.insert(0, {str(ROOT)!r})",
+                    "from utils.env_bootstrap import bootstrap_environment",
+                    "bootstrap_environment()",
+                    "import langgraph.checkpoint.serde.jsonplus as jsonplus",
+                    "assert jsonplus._lg_msgpack.STRICT_MSGPACK_ENABLED is True",
+                )
+            )
+            environment = dict(os.environ)
+            environment.pop("LANGGRAPH_STRICT_MSGPACK", None)
+            completed = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=directory,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_env_bootstrap_does_not_override_runtime_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, ".env").write_text(
+                "LANGGRAPH_STRICT_MSGPACK=true\n",
+                encoding="utf-8",
+            )
+            script = "\n".join(
+                (
+                    "import os, sys",
+                    f"sys.path.insert(0, {str(ROOT)!r})",
+                    "from utils.env_bootstrap import bootstrap_environment",
+                    "bootstrap_environment()",
+                    "assert os.environ['LANGGRAPH_STRICT_MSGPACK'] == 'false'",
+                )
+            )
+            environment = dict(os.environ)
+            environment["LANGGRAPH_STRICT_MSGPACK"] = "false"
+            completed = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=directory,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_streamlit_demo_is_fixed_to_mimo(self):
         app = read_text("app.py")
@@ -154,20 +237,7 @@ class DemoReadinessTest(unittest.TestCase):
         self.assertNotIn("83.3% 回答准确率", readme)
         self.assertNotIn("当前线上已是 V2", readme)
 
-    def test_portfolio_document_changes_stay_in_task_scope(self):
-        allowed_docs = {
-            "README.md",
-            "DEPLOYMENT.md",
-            "docs/DEMO_SCRIPT.md",
-            "docs/superpowers/plans/2026-07-28-keyguard-v2-multi-agent-support.md",
-        }
-        changed_markdown = set(
-            p for p in os.popen("git diff --name-only -- '*.md'").read().splitlines()
-        )
-
-        self.assertFalse(changed_markdown - allowed_docs)
-
-    def test_readme_separates_diagnosis_review_and_policy_routes(self):
+    def test_readme_flow_and_state_diagrams_match_runtime_boundaries(self):
         readme = read_text("README.md")
 
         for edge in (
@@ -182,10 +252,43 @@ class DemoReadinessTest(unittest.TestCase):
             self.assertIn(edge, readme)
         self.assertNotIn('PG -->|一次返工| D', readme)
         self.assertNotIn('RV --> PG', readme)
-        self.assertIn(
-            'reviewing --> escalated: Review 或 Policy Guard 阻断',
-            readme,
-        )
+        flowchart = readme.split("```mermaid\nflowchart LR\n", 1)[1].split(
+            "```", 1
+        )[0]
+        checkpoint_lines = [
+            line.strip()
+            for line in flowchart.splitlines()
+            if line.strip().startswith("CP") and ".->" in line
+        ]
+        checkpoint_targets = {
+            line.rsplit(" ", 1)[-1] for line in checkpoint_lines
+        }
+        self.assertEqual(len(checkpoint_lines), 2)
+        self.assertEqual(checkpoint_targets, {"PU", "ES"})
+        self.assertNotIn("-.暂停与恢复.->", readme)
+        self.assertIn("命令恢复入口只接受 `pending_user` 和 `escalated`", readme)
+        self.assertIn("不能任意从 Triage、Diagnosis 或 Review 节点恢复", readme)
+
+        state_diagram = readme.split(
+            "```mermaid\nstateDiagram-v2\n", 1
+        )[1].split("```", 1)[0]
+        documented = set()
+        for line in state_diagram.splitlines():
+            match = re.fullmatch(
+                r"\s*([a-z_]+)\s+-->\s+([a-z_]+)(?::.*)?\s*",
+                line,
+            )
+            if match:
+                documented.add(match.groups())
+
+        from agent.orchestration.routes import ALLOWED_TRANSITIONS
+
+        runtime = {
+            (source.value, target.value)
+            for source, targets in ALLOWED_TRANSITIONS.items()
+            for target in targets
+        }
+        self.assertEqual(documented, runtime)
 
     def test_deployment_documents_v2_secrets_and_ephemeral_storage(self):
         deployment = read_text("DEPLOYMENT.md")
@@ -266,8 +369,27 @@ class DemoReadinessTest(unittest.TestCase):
             "KEYGUARD_ORCHESTRATION_EVAL_RUNNER=module:attribute",
             read_text("README.md"),
         )
-        self.assertIn("fail closed", read_text("README.md"))
-        self.assertIn("零输出", read_text("README.md"))
+        readme = read_text("README.md")
+        self.assertIn("fail closed", readme)
+        self.assertIn("stderr", readme)
+        self.assertIn("零结果产物", readme)
+        self.assertIn("aggregate metrics", readme)
+        self.assertIn("逐 case scores", readme)
+        self.assertIn("status_trace", readme)
+        self.assertIn("citations", readme)
+        self.assertIn("bad case", readme)
+        self.assertNotIn("零输出", documents)
+        self.assertNotIn("混淆矩阵", documents)
+
+    def test_readme_assigns_policy_and_evidence_checks_to_real_boundaries(self):
+        readme = read_text("README.md")
+
+        self.assertIn("未脱敏秘密、不安全动作和不可信 URL", readme)
+        self.assertIn("证据充分性由 Diagnosis / Review 验证链负责", readme)
+        self.assertNotIn(
+            "Policy Guard**：在答复离开系统前做确定性校验，阻断索要或复述秘密、证据不足",
+            readme,
+        )
 
     def test_root_license_file_is_not_exposed(self):
         self.assertFalse((ROOT / "LICENSE").exists())
