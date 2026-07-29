@@ -46,6 +46,7 @@ from utils.logger_handler import logger
 
 
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}", re.ASCII)
+_EXCEPTION_TYPE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}", re.ASCII)
 _STATE_FIELDS = frozenset(TicketState.__annotations__)
 _INITIAL_STATE_FIELDS = frozenset(
     {
@@ -149,6 +150,10 @@ class CommandFailedError(RuntimeError):
 
 class PersistenceFailureError(RuntimeError):
     """Durable command state could not be safely confirmed."""
+
+
+class _CheckpointPersistenceFailure(PersistenceFailureError):
+    """Private marker for failures inside checkpoint persistence boundaries."""
 
 
 @dataclass(frozen=True, init=False, slots=True)
@@ -752,17 +757,27 @@ class SupportOrchestrator:
             "recursion_limit": self.recursion_limit,
         }
 
-    def _checkpoint_values(self, ticket_id: str) -> dict:
+    def _checkpoint_snapshot(self, ticket_id: str):
         get_state = getattr(self.graph, "get_state", None)
         if not callable(get_state):
+            return None
+        return get_state(self._config(ticket_id))
+
+    @staticmethod
+    def _checkpoint_values_from_snapshot(snapshot: object) -> dict:
+        if snapshot is None:
             return {}
-        snapshot = get_state(self._config(ticket_id))
         values = getattr(snapshot, "values", None)
         if values is None:
             return {}
         if not isinstance(values, Mapping):
             raise TypeError("checkpoint state 非法")
         return copy.deepcopy(dict(values))
+
+    def _checkpoint_values(self, ticket_id: str) -> dict:
+        return self._checkpoint_values_from_snapshot(
+            self._checkpoint_snapshot(ticket_id)
+        )
 
     def get_state(self, ticket_id: str) -> dict:
         values = self._checkpoint_values(ticket_id)
@@ -823,32 +838,63 @@ class SupportOrchestrator:
         command_id: str,
         lease_version: int,
     ) -> dict:
-        ticket = self.repository.get_ticket(ticket_id)
-        if ticket is None:
-            raise ValueError(f"工单不存在: {ticket_id}")
-        ticket_status = _status(ticket.get("status"))
-        consistent = False
         try:
-            checkpoint = self._checkpoint_values(ticket_id)
-            if checkpoint:
-                checkpoint = self._validated_graph_output(checkpoint)
-                consistent = (
-                    checkpoint.get("ticket_id") == ticket_id
-                    and checkpoint.get("status") == ticket_status
-                    and ticket_status in {
-                        Status.PENDING_USER.value,
-                        Status.ESCALATED.value,
-                    }
-                )
+            ticket = self.repository.get_ticket(ticket_id)
+        except Exception as error:
+            self._log_failure(
+                ticket_id, "checkpoint_restore", "PERSISTENCE_FAILURE", error
+            )
+            raise _CheckpointPersistenceFailure(
+                ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
+            ) from None
+        if ticket is None:
+            raise _CheckpointPersistenceFailure(
+                ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
+            ) from None
+        ticket_status = _status(ticket.get("status"))
+        try:
+            snapshot = self._checkpoint_snapshot(ticket_id)
+        except Exception as error:
+            self._log_failure(
+                ticket_id, "checkpoint_restore", "PERSISTENCE_FAILURE", error
+            )
+            raise _CheckpointPersistenceFailure(
+                ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
+            ) from None
+        try:
+            checkpoint = self._checkpoint_values_from_snapshot(snapshot)
+            checkpoint = (
+                self._validated_graph_output(checkpoint) if checkpoint else {}
+            )
+            consistent = bool(checkpoint) and (
+                checkpoint.get("ticket_id") == ticket_id
+                and checkpoint.get("status") == ticket_status
+                and ticket_status
+                in {
+                    Status.PENDING_USER.value,
+                    Status.ESCALATED.value,
+                }
+            )
         except Exception:
             consistent = False
         if not consistent:
-            self.repository.fail_checkpoint_restore(
-                ticket_id=ticket_id,
-                command_id=command_id,
-                lease_version=lease_version,
-                expected_ticket_status=ticket_status,
-            )
+            try:
+                self.repository.fail_checkpoint_restore(
+                    ticket_id=ticket_id,
+                    command_id=command_id,
+                    lease_version=lease_version,
+                    expected_ticket_status=ticket_status,
+                )
+            except Exception as error:
+                self._log_failure(
+                    ticket_id,
+                    "checkpoint_restore",
+                    "PERSISTENCE_FAILURE",
+                    error,
+                )
+                raise _CheckpointPersistenceFailure(
+                    ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
+                ) from None
             raise CheckpointRestoreError("CHECKPOINT_MISMATCH") from None
         return self._invoke_graph(None, ticket_id, command_id, lease_version)
 
@@ -870,12 +916,22 @@ class SupportOrchestrator:
     ) -> None:
         """Log stable metadata without request input or exception details."""
 
+        try:
+            exception_type = getattr(type(error), "__name__", None)
+        except Exception:
+            exception_type = None
+        if (
+            not isinstance(exception_type, str)
+            or _EXCEPTION_TYPE_PATTERN.fullmatch(exception_type) is None
+            or contains_unredacted_secret(exception_type)
+        ):
+            exception_type = "Exception"
         logger.error(
             "[orchestration] error_code=%s ticket_id=%s node_name=%s exception_type=%s",
             error_code,
             ticket_id,
             node_name,
-            type(error).__name__,
+            exception_type,
         )
 
     def _execute(
@@ -905,6 +961,10 @@ class SupportOrchestrator:
                 )
             else:
                 raise ValueError("command disposition 不可执行")
+        except _CheckpointPersistenceFailure:
+            raise PersistenceFailureError(
+                ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
+            ) from None
         except TimeoutError as error:
             self._log_failure(
                 ticket_id, "runtime", "GRAPH_TIMEOUT", error
@@ -1063,9 +1123,19 @@ class SupportOrchestrator:
             )
             events.append(to_repository_event(terminal))
 
-        ticket = self.repository.get_ticket(ticket_id)
+        try:
+            ticket = self.repository.get_ticket(ticket_id)
+        except Exception as error:
+            self._log_failure(
+                ticket_id, "runtime", "PERSISTENCE_FAILURE", error
+            )
+            raise PersistenceFailureError(
+                ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
+            ) from None
         if ticket is None:
-            raise ValueError(f"工单不存在: {ticket_id}")
+            raise PersistenceFailureError(
+                ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
+            ) from None
         self._validate_runtime_event_chain(
             _status(ticket.get("status")), final_status, events
         )

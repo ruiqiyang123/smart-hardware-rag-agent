@@ -45,6 +45,7 @@ from utils.logger_handler import logger
 
 
 _ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}", re.ASCII)
+_EXCEPTION_TYPE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}", re.ASCII)
 _MISSING_FIELDS = frozenset(item.value for item in MissingField)
 _RISK_FLAGS = frozenset(item.value for item in RiskFlag)
 _RISK_LEVELS = frozenset(item.value for item in RiskLevel)
@@ -425,12 +426,22 @@ def _log_node_failure(
     ticket_id = state.get("ticket_id")
     if not isinstance(ticket_id, str) or _ID_PATTERN.fullmatch(ticket_id) is None:
         ticket_id = "invalid_ticket_id"
+    try:
+        exception_type = getattr(type(error), "__name__", None)
+    except Exception:
+        exception_type = None
+    if (
+        not isinstance(exception_type, str)
+        or _EXCEPTION_TYPE_PATTERN.fullmatch(exception_type) is None
+        or contains_unredacted_secret(exception_type)
+    ):
+        exception_type = "Exception"
     logger.error(
         "[orchestration] error_code=%s ticket_id=%s node_name=%s exception_type=%s",
         error_code,
         ticket_id,
         node_name,
-        type(error).__name__,
+        exception_type,
     )
 
 

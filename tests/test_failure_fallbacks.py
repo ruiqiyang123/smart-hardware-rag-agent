@@ -15,6 +15,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.types import Command, Interrupt, interrupt
 
 from agent.orchestration.runtime import (
+    CheckpointRestoreError,
     CommandFailedError,
     CommandInProgressError,
     NO_CHECKPOINT_WRITES,
@@ -283,6 +284,22 @@ class FailureFallbackTest(unittest.TestCase):
                 "SELECT * FROM ticket_commands WHERE command_id = ?", (command_id,)
             ).fetchone()
         return dict(row) if row else None
+
+    def prepare_expired_resume(self, request_id, *, checkpoint_mismatch=False):
+        ticket, checkpoint = self.seed_paused_ticket("pending_user")
+        command_id = f"request:{request_id}"
+        graph = FakeGraph([TimeoutError("first worker stopped")])
+        graph.checkpoint_values = copy.deepcopy(checkpoint)
+        if checkpoint_mismatch:
+            graph.checkpoint_values["status"] = "escalated"
+        runtime = self.runtime(graph)
+        with self.assertRaises(TimeoutError):
+            runtime.resume_user(
+                ticket["ticket_id"],
+                "设备型号 Pro",
+                request_id=request_id,
+            )
+        return ticket, command_id, graph, runtime
 
     @staticmethod
     def resolved_output(graph_input, **overrides):
@@ -620,6 +637,77 @@ class FailureFallbackTest(unittest.TestCase):
             self.command_row("request:commit-status-unknown")["status"],
             "in_progress",
         )
+
+    def test_commit_then_ack_loss_is_confirmed_by_same_idempotency_key(self):
+        graph = FakeGraph()
+        runtime = self.runtime(graph)
+        original_commit = self.repo.commit_command_result
+
+        def commit_then_raise(*args, **kwargs):
+            original_commit(*args, **kwargs)
+            raise RuntimeError("ack body must stay private")
+
+        with patch.object(
+            self.repo,
+            "commit_command_result",
+            side_effect=commit_then_raise,
+        ) as commit, patch.object(
+            self.repo, "fail_command", wraps=self.repo.fail_command
+        ) as fail_command, self.assertRaises(
+            PersistenceFailureError
+        ) as raised:
+            runtime.submit("蓝牙连不上", "1001", request_id="ack-lost")
+
+        commit.assert_called_once()
+        fail_command.assert_not_called()
+        self.assertIsNone(raised.exception.__cause__)
+        duplicate = runtime.submit(
+            "蓝牙连不上", "1001", request_id="ack-lost"
+        )
+        self.assertTrue(duplicate.duplicate)
+        self.assertEqual(duplicate.status, "escalated")
+        self.assertEqual(graph.calls, 1)
+        self.assertEqual(self.command_row("request:ack-lost")["status"], "completed")
+
+    def test_precommit_ticket_read_failure_never_attempts_status_write(self):
+        graph = FakeGraph()
+        runtime = self.runtime(graph)
+        with patch.object(
+            self.repo,
+            "get_ticket",
+            side_effect=RuntimeError("database read body must stay private"),
+        ), patch.object(
+            self.repo, "fail_command", wraps=self.repo.fail_command
+        ) as fail_command, self.assertRaises(
+            PersistenceFailureError
+        ) as raised:
+            runtime.submit(
+                "蓝牙连不上", "1001", request_id="precommit-read-failed"
+            )
+
+        fail_command.assert_not_called()
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(
+            self.command_row("request:precommit-read-failed")["status"],
+            "in_progress",
+        )
+
+    def test_runtime_sanitizes_hostile_exception_class_name_in_logs(self):
+        hostile_type = type("TemporaryProviderError", (RuntimeError,), {})
+        hostile_type.__name__ = f"{MNEMONIC}\nforged-log-line"
+        runtime = self.runtime(FakeGraph([hostile_type("private body")]))
+
+        with self.assertLogs("agent", level="ERROR") as captured, self.assertRaises(
+            CommandFailedError
+        ):
+            runtime.submit(
+                "蓝牙连不上", "1001", request_id="hostile-exception-type"
+            )
+
+        messages = "\n".join(captured.output)
+        self.assertNotIn(MNEMONIC, messages)
+        self.assertNotIn("forged-log-line", messages)
+        self.assertIn("exception_type=Exception", messages)
 
     def test_runtime_serializes_distinct_actions_for_one_ticket(self):
         class BlockingGraph(FakeGraph):
@@ -966,6 +1054,116 @@ class FailureFallbackTest(unittest.TestCase):
             [event["event_type"] for event in events],
         )
         self.assertEqual(graph.calls, 1)
+
+    def test_resume_checkpoint_read_failure_is_persistence_unknown(self):
+        ticket, command_id, graph, runtime = self.prepare_expired_resume(
+            "resume-read-failed"
+        )
+        hostile_type = type("TemporaryCheckpointError", (RuntimeError,), {})
+        hostile_type.__name__ = f"{MNEMONIC}\nforged-checkpoint-log"
+
+        with patch.object(
+            graph,
+            "get_state",
+            side_effect=hostile_type("checkpoint body must stay private"),
+        ), patch.object(
+            self.repo, "fail_command", wraps=self.repo.fail_command
+        ) as fail_command, self.assertLogs(
+            "agent", level="ERROR"
+        ) as captured, self.assertRaises(
+            PersistenceFailureError
+        ) as raised:
+            runtime.resume_user(
+                ticket["ticket_id"],
+                "设备型号 Pro",
+                request_id="resume-read-failed",
+            )
+
+        fail_command.assert_not_called()
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(self.command_row(command_id)["status"], "in_progress")
+        self.assertEqual(graph.calls, 1)
+        messages = "\n".join(captured.output)
+        self.assertNotIn(MNEMONIC, messages)
+        self.assertNotIn("forged-checkpoint-log", messages)
+        self.assertIn("exception_type=Exception", messages)
+
+    def test_malformed_checkpoint_fails_semantically_and_records_event(self):
+        ticket, command_id, graph, runtime = self.prepare_expired_resume(
+            "resume-malformed-checkpoint"
+        )
+        graph.checkpoint_values["unknown_checkpoint_field"] = "corrupt"
+        with patch.object(
+            self.repo, "fail_command", wraps=self.repo.fail_command
+        ) as fail_command, self.assertRaises(
+            CheckpointRestoreError
+        ) as raised:
+            runtime.resume_user(
+                ticket["ticket_id"],
+                "设备型号 Pro",
+                request_id="resume-malformed-checkpoint",
+            )
+
+        fail_command.assert_not_called()
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(self.command_row(command_id)["status"], "failed")
+        self.assertIn(
+            "system.checkpoint_restore_failed",
+            [event["event_type"] for event in self.repo.list_events(ticket["ticket_id"])],
+        )
+
+    def test_resume_ticket_read_failure_is_persistence_unknown(self):
+        ticket, command_id, graph, runtime = self.prepare_expired_resume(
+            "resume-ticket-read-failed"
+        )
+        with patch.object(
+            self.repo,
+            "get_ticket",
+            side_effect=RuntimeError("ticket row body must stay private"),
+        ), patch.object(
+            self.repo, "fail_command", wraps=self.repo.fail_command
+        ) as fail_command, self.assertRaises(
+            PersistenceFailureError
+        ) as raised:
+            runtime.resume_user(
+                ticket["ticket_id"],
+                "设备型号 Pro",
+                request_id="resume-ticket-read-failed",
+            )
+
+        fail_command.assert_not_called()
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(self.command_row(command_id)["status"], "in_progress")
+        self.assertEqual(graph.calls, 1)
+
+    def test_resume_mismatch_write_failure_is_persistence_unknown(self):
+        ticket, command_id, graph, runtime = self.prepare_expired_resume(
+            "resume-mismatch-write-failed", checkpoint_mismatch=True
+        )
+        with patch.object(
+            self.repo,
+            "fail_checkpoint_restore",
+            side_effect=RuntimeError("atomic write body must stay private"),
+        ) as fail_restore, patch.object(
+            self.repo, "fail_command", wraps=self.repo.fail_command
+        ) as fail_command, self.assertRaises(
+            PersistenceFailureError
+        ) as raised:
+            runtime.resume_user(
+                ticket["ticket_id"],
+                "设备型号 Pro",
+                request_id="resume-mismatch-write-failed",
+            )
+
+        fail_restore.assert_called_once()
+        fail_command.assert_not_called()
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(self.command_row(command_id)["status"], "in_progress")
+        self.assertEqual(graph.calls, 1)
+        self.assertNotIn(
+            "system.checkpoint_restore_failed",
+            [event["event_type"] for event in self.repo.list_events(ticket["ticket_id"])],
+        )
 
     def test_persistence_keeps_only_events_for_current_command(self):
         current = "request:filter-events"

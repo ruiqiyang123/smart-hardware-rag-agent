@@ -405,13 +405,16 @@ class WalletSafetyGuardTest(unittest.TestCase):
             self.assertNotIn(MNEMONIC_WORDS, ticket["sanitized_input"])
             self.assertNotIn(MNEMONIC_WORDS, str(caught.exception))
 
-    def test_fixed_secret_is_absent_from_all_recoverable_surfaces(self):
+    def test_fixed_secret_is_absent_from_durable_and_renderable_surfaces(self):
         from agent.orchestration.graph import build_support_graph, sqlite_checkpointer
         from agent.orchestration.runtime import SupportOrchestrator
         from agent.security.trusted_sources import TrustedSourcePolicy
 
+        hostile_type = type("TemporaryGraphError", (RuntimeError,), {})
+        hostile_type.__name__ = f"{MNEMONIC_WORDS}\nforged-log-line"
+
         def broken_triage(_state):
-            raise RuntimeError(f"provider body contained {MNEMONIC_WORDS}")
+            raise hostile_type(f"provider body contained {MNEMONIC_WORDS}")
 
         with tempfile.TemporaryDirectory() as directory:
             ticket_db_path = Path(directory) / "tickets.db"
@@ -452,7 +455,9 @@ class WalletSafetyGuardTest(unittest.TestCase):
                     "user-1",
                     request_id="secret-exception-body",
                 )
-            streamlit_messages = [
+            # These are the exact safe fields consumed by app.py's existing
+            # session-message rendering contract.
+            renderable_session_messages = [
                 {"role": "user", "content": secret_result.sanitized_input},
                 {
                     "role": "assistant",
@@ -470,8 +475,11 @@ class WalletSafetyGuardTest(unittest.TestCase):
             secret_bytes = MNEMONIC_WORDS.encode("utf-8")
             self.assertNotIn(secret_bytes, ticket_db_path.read_bytes())
             self.assertNotIn(secret_bytes, checkpoint_db_path.read_bytes())
-            self.assertNotIn(MNEMONIC_WORDS, str(streamlit_messages))
-            self.assertNotIn(MNEMONIC_WORDS, "\n".join(captured.output))
+            self.assertNotIn(MNEMONIC_WORDS, str(renderable_session_messages))
+            log_output = "\n".join(captured.output)
+            self.assertNotIn(MNEMONIC_WORDS, log_output)
+            self.assertNotIn("forged-log-line", log_output)
+            self.assertIn("exception_type=Exception", log_output)
 
 
 if __name__ == "__main__":
