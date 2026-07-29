@@ -31,6 +31,10 @@ _MAX_REVIEW_ITEMS = 6
 _SAFE_REASON_PATTERN = re.compile(r"[a-z_]{1,64}", re.ASCII)
 
 
+class _PolicyGuardFailure(RuntimeError):
+    """Internal marker for sanitized, fail-closed policy execution."""
+
+
 def _has_forbidden_control(value: str) -> bool:
     return any(
         (ord(character) < 0x20 and character not in {"\n", "\t"})
@@ -248,13 +252,18 @@ def _validated_state_inner(state: object) -> dict:
         ):
             raise ValueError("知识证据缺少 citation")
 
+    projected_evidence = [
+        evidence_by_id[evidence_id] for evidence_id in evidence_refs
+    ]
     payload = {
         "draft_answer": draft_answer,
         "recommended_actions": [
             action.model_dump(mode="json") for action in actions
         ],
         "evidence_refs": evidence_refs,
-        "evidence": [item.model_dump(mode="json") for item in evidence],
+        "evidence": [
+            item.model_dump(mode="json") for item in projected_evidence
+        ],
         "citations": [citation.model_dump(mode="json") for citation in citations],
     }
     encoded = json.dumps(
@@ -273,20 +282,22 @@ def _policy_decision(policy_guard: object, payload: dict) -> tuple[bool, List[st
         [payload["draft_answer"]]
         + [action["text"] for action in payload["recommended_actions"]]
     )
-    urls = list(
-        dict.fromkeys(
-            [
-                item["source_url"]
-                for item in payload["evidence"]
-                if item["source_url"] is not None
-            ]
-            + [citation["source_url"] for citation in payload["citations"]]
-        )
-    )
     try:
+        trusted_sources = policy_guard.trusted_sources
+        if any(
+            item["source_url"] is not None
+            and not trusted_sources.is_trusted(item["source_url"])
+            for item in payload["evidence"]
+        ):
+            return False, ["official_source_violation"]
+        urls = list(
+            dict.fromkeys(
+                citation["source_url"] for citation in payload["citations"]
+            )
+        )
         decision = policy_guard.evaluate(policy_text, urls)
     except Exception:
-        raise RuntimeError("Policy Guard 调用失败") from None
+        raise _PolicyGuardFailure("Policy Guard 调用失败") from None
     passed = getattr(decision, "passed", None)
     reasons = getattr(decision, "reason_codes", None)
     if (
@@ -302,7 +313,7 @@ def _policy_decision(policy_guard: object, payload: dict) -> tuple[bool, List[st
         or (passed and reasons)
         or (not passed and not reasons)
     ):
-        raise RuntimeError("Policy Guard 输出非法")
+        raise _PolicyGuardFailure("Policy Guard 输出非法")
     return passed, reasons
 
 
@@ -375,9 +386,17 @@ class ReviewAgent:
     def run(self, state: dict) -> dict:
         validated = _validated_state(state)
         payload = validated["payload"]
-        policy_passed, policy_reasons = _policy_decision(
-            self.policy_guard, payload
-        )
+        try:
+            policy_passed, policy_reasons = _policy_decision(
+                self.policy_guard, payload
+            )
+        except _PolicyGuardFailure:
+            return {
+                "review_decision": "escalate",
+                "review_reasons": ["policy_guard_failure"],
+                "review_issues": ["确定性 Policy Guard 执行失败"],
+                "required_changes": [],
+            }
         if not policy_passed:
             return {
                 "review_decision": "escalate",
