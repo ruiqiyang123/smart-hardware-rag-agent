@@ -26,6 +26,7 @@ streamlit run app.py
 MIMO_API_KEY=your-mimo-api-key
 MIMO_BASE_URL=https://token-plan-sgp.xiaomimimo.com/v1
 MIMO_CHAT_MODEL=mimo-v2.5-pro
+CHAT_PROVIDER=mimo
 ```
 
 V2 和人工工作台配置：
@@ -56,6 +57,7 @@ Secrets 示例采用 TOML 语法：
 MIMO_API_KEY = "your-mimo-api-key"
 MIMO_BASE_URL = "https://token-plan-sgp.xiaomimimo.com/v1"
 MIMO_CHAT_MODEL = "mimo-v2.5-pro"
+CHAT_PROVIDER = "mimo"
 KEYGUARD_AGENT_VERSION = "v2"
 KEYGUARD_OPERATOR_TOKEN = "replace-with-a-long-random-token"
 KEYGUARD_TICKET_DB = "data/keyguard_v2.db"
@@ -93,7 +95,7 @@ streamlit run app.py
 
 ### 页面启动但模型不可用
 
-检查 `MIMO_API_KEY`、`MIMO_BASE_URL`、`MIMO_CHAT_MODEL` 是否在当前部署环境生效。应用读取运行环境优先，不应在日志里打印 Key。
+检查 `MIMO_API_KEY`、`MIMO_BASE_URL`、`MIMO_CHAT_MODEL` 和 `CHAT_PROVIDER=mimo` 是否在当前部署环境生效。未声明 provider 时模型工厂可能回退到 DashScope；应用读取运行环境优先，不应在日志里打印 Key。
 
 ### 工单工作台打不开
 

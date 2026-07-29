@@ -181,11 +181,14 @@ class DemoReadinessTest(unittest.TestCase):
             "MIMO_API_KEY",
             "MIMO_BASE_URL",
             "MIMO_CHAT_MODEL",
+            "CHAT_PROVIDER",
             "KEYGUARD_OPERATOR_TOKEN",
             "KEYGUARD_TICKET_DB",
             "KEYGUARD_CHECKPOINT_DB",
         ):
             self.assertIn(secret, deployment)
+        self.assertIn("CHAT_PROVIDER=mimo", deployment)
+        self.assertIn('CHAT_PROVIDER = "mimo"', deployment)
         self.assertIn("必须使用不同文件", deployment)
         self.assertIn("Streamlit Cloud", deployment)
         self.assertIn("易失", deployment)

@@ -174,7 +174,7 @@ pytest -q
 streamlit run app.py
 ```
 
-至少填写 `MIMO_API_KEY`；需要使用工单工作台时再设置不可猜测的 `KEYGUARD_OPERATOR_TOKEN`。完整 Secrets 和数据库路径说明见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
+至少填写 `MIMO_API_KEY`，并确认 `CHAT_PROVIDER=mimo`，否则模型工厂可能回退到 DashScope；需要使用工单工作台时再设置不可猜测的 `KEYGUARD_OPERATOR_TOKEN`。完整 Secrets 和数据库路径说明见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
 
 ## 代码导览
 
