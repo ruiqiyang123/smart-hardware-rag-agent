@@ -246,12 +246,15 @@ class WalletSafetyGuardTest(unittest.TestCase):
 
     def test_policy_allows_official_hosts_and_exact_retrieved_citation(self):
         citation = "https://ethereum.org/developers/docs/gas/"
+        ledger_citation = "https://ledger.com/academy/security"
         text = (
             "参考 https://help.support.ledger.com/device?mode=safe，"
-            f"以及检索资料：{citation}。"
+            f"以及检索资料：{citation} 和 {ledger_citation}。"
         )
 
-        result = self.output.evaluate(text, citation_urls=[citation])
+        result = self.output.evaluate(
+            text, citation_urls=[citation, ledger_citation]
+        )
 
         self.assertTrue(result.passed)
         self.assertEqual(result.reason_codes, [])
@@ -280,6 +283,8 @@ class WalletSafetyGuardTest(unittest.TestCase):
         citations = (
             "http://ethereum.org/developers/docs/gas/",
             "https://attacker@ethereum.org/developers/docs/gas/",
+            "https://evil.example/invented-source",
+            "https://github.com/evil/project/blob/main/fake.md",
         )
         for index, citation in enumerate(citations):
             with self.subTest(case=index):
@@ -290,6 +295,15 @@ class WalletSafetyGuardTest(unittest.TestCase):
                 self.assertEqual(
                     result.reason_codes, ["official_source_violation"]
                 )
+
+    def test_policy_rejects_untrusted_citation_even_when_answer_omits_it(self):
+        result = self.output.evaluate(
+            "这是一段没有链接的安全回答。",
+            citation_urls=["https://evil.example/invented-source"],
+        )
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.reason_codes, ["official_source_violation"])
 
     def test_policy_rejects_secrets_requests_and_unsafe_promises_stably(self):
         text = (

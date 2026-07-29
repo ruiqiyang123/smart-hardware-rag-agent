@@ -4,11 +4,9 @@ import copy
 import json
 import math
 import re
-from ipaddress import ip_address
 from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Dict, List, Literal, Set
-from urllib.parse import urlsplit
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import Field, field_validator, model_validator
@@ -24,6 +22,7 @@ from agent.orchestration.state import (
     StrictModel,
 )
 from agent.security.secrets import contains_unredacted_secret
+from agent.security.trusted_sources import TrustedSourcePolicy
 
 
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "diagnosis_prompt.txt"
@@ -65,6 +64,7 @@ _HIGH_FLAGS = frozenset(
     }
 )
 _WARRANTY_QUERY = re.compile(r"[A-Za-z0-9]{4}", re.ASCII)
+_USER_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}", re.ASCII)
 _CHAIN_ALIASES = {
     "BTC": "BTC",
     "BITCOIN": "BTC",
@@ -267,7 +267,9 @@ def _terminal_result(
     return result
 
 
-def _validate_evidence_item(raw: object) -> EvidenceItem:
+def _validate_evidence_item(
+    raw: object, trusted_sources: TrustedSourcePolicy
+) -> EvidenceItem:
     if isinstance(raw, EvidenceItem):
         raw = raw.model_dump(mode="python")
     if not isinstance(raw, dict):
@@ -278,7 +280,8 @@ def _validate_evidence_item(raw: object) -> EvidenceItem:
         raise ValueError("evidence_id 非法")
     content = item.content
     if (
-        len(content) > _MAX_EVIDENCE_CONTENT
+        not content.strip()
+        or len(content) > _MAX_EVIDENCE_CONTENT
         or _has_forbidden_control(content)
         or contains_unredacted_secret(content)
     ):
@@ -287,7 +290,8 @@ def _validate_evidence_item(raw: object) -> EvidenceItem:
     source_url = item.source_url
     if source_url is not None:
         source_url = _safe_text(source_url, "source_url", max_length=2_000)
-        _validate_source_url(source_url)
+        if not trusted_sources.is_trusted(source_url):
+            raise ValueError("source_url 来源不可信")
     return item.model_copy(
         update={
             "evidence_id": evidence_id,
@@ -298,41 +302,20 @@ def _validate_evidence_item(raw: object) -> EvidenceItem:
     )
 
 
-def _validate_source_url(source_url: str) -> None:
-    if any(character.isspace() for character in source_url) or "\\" in source_url:
-        raise ValueError("source_url 非法")
-    if re.search(r"%(?:00|09|0a|0d|1[0-9a-f]|7f)", source_url, re.IGNORECASE):
-        raise ValueError("source_url 非法")
-    try:
-        parsed = urlsplit(source_url)
-        hostname = parsed.hostname
-        port = parsed.port
-    except ValueError:
-        raise ValueError("source_url 非法") from None
+def _safe_tool_context(state: dict, sanitized_input: str) -> dict[str, str]:
+    context = {"sanitized_input": sanitized_input}
+    if "user_id" not in state:
+        return context
+    user_id = state["user_id"]
     if (
-        parsed.scheme.lower() != "https"
-        or not hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or port not in {None, 443}
+        not isinstance(user_id, str)
+        or _USER_ID_PATTERN.fullmatch(user_id) is None
+        or _has_forbidden_control(user_id, allow_formatting=False)
+        or contains_unredacted_secret(user_id)
     ):
-        raise ValueError("source_url 非法")
-    try:
-        ip_address(hostname)
-    except ValueError:
-        pass
-    else:
-        raise ValueError("source_url 非法")
-    try:
-        ascii_hostname = hostname.rstrip(".").encode("idna").decode("ascii")
-    except UnicodeError:
-        raise ValueError("source_url 非法") from None
-    labels = ascii_hostname.split(".")
-    if len(ascii_hostname) > 253 or len(labels) < 2 or any(
-        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
-        for label in labels
-    ):
-        raise ValueError("source_url 非法")
+        raise ValueError("user_id 非法")
+    context["user_id"] = user_id
+    return context
 
 
 def _validate_answer(raw: object, evidence_by_id: Dict[str, EvidenceItem]) -> DiagnosisResult:
@@ -393,6 +376,9 @@ class DiagnosisAgent:
         answer_runner: object | None = None,
         timeout_seconds: float = 20,
         retries: int = 1,
+        trusted_source_policy: TrustedSourcePolicy | None = None,
+        trusted_source_domains: object | None = None,
+        trusted_source_url_prefixes: object | None = None,
     ) -> None:
         model_mode = model is not None and plan_runner is None and answer_runner is None
         runners_mode = model is None and plan_runner is not None and answer_runner is not None
@@ -424,6 +410,19 @@ class DiagnosisAgent:
         self.tool_registry = dict(tool_registry)
         self.timeout_seconds = timeout_seconds
         self.retries = retries
+        if trusted_source_policy is not None:
+            if not isinstance(trusted_source_policy, TrustedSourcePolicy):
+                raise TypeError("trusted_source_policy 类型非法")
+            if (
+                trusted_source_domains is not None
+                or trusted_source_url_prefixes is not None
+            ):
+                raise ValueError("可信来源策略与域名配置不能同时提供")
+            self.trusted_sources = trusted_source_policy
+        else:
+            self.trusted_sources = TrustedSourcePolicy(
+                trusted_source_domains, trusted_source_url_prefixes
+            )
         self.prompt = _load_prompt(_PROMPT_PATH)
 
     def run(self, state: dict) -> dict:
@@ -466,6 +465,7 @@ class DiagnosisAgent:
                 "需要补充必要信息",
                 remaining_unknowns=missing_fields,
             )
+        safe_tool_context = _safe_tool_context(state, sanitized_input)
 
         plan_payload = {
             "allowed_tools": sorted(allowed),
@@ -506,32 +506,34 @@ class DiagnosisAgent:
             try:
                 raw_items = invoke_with_policy(
                     lambda tool=tool, request=request: tool(
-                        copy.deepcopy(state), request.query
+                        copy.deepcopy(safe_tool_context), request.query
                     ),
                     self.timeout_seconds,
                     self.retries,
                 )
+                if not isinstance(raw_items, list):
+                    raise ValueError("工具证据必须是列表")
+                candidate_count += len(raw_items)
+                if candidate_count > _MAX_EVIDENCE_ITEMS:
+                    raise ValueError("工具证据数量超限")
+                for raw_item in raw_items:
+                    item = _validate_evidence_item(
+                        raw_item, self.trusted_sources
+                    )
+                    total_content += len(item.content)
+                    if total_content > _MAX_EVIDENCE_CONTENT:
+                        raise ValueError("工具证据内容超限")
+                    existing = evidence_by_id.get(item.evidence_id)
+                    if existing is None:
+                        evidence_by_id[item.evidence_id] = item
+                    elif existing != item:
+                        raise ValueError("工具证据 ID 冲突")
             except Exception:
                 return _terminal_result(
                     "escalate",
                     "只读取证失败，需要人工处理",
                     tool_errors=[f"tool_failure:{request.name}"],
                 )
-            if not isinstance(raw_items, list):
-                raise ValueError("工具证据必须是列表")
-            candidate_count += len(raw_items)
-            if candidate_count > _MAX_EVIDENCE_ITEMS:
-                raise ValueError("工具证据数量超限")
-            for raw_item in raw_items:
-                item = _validate_evidence_item(raw_item)
-                total_content += len(item.content)
-                if total_content > _MAX_EVIDENCE_CONTENT:
-                    raise ValueError("工具证据内容超限")
-                existing = evidence_by_id.get(item.evidence_id)
-                if existing is None:
-                    evidence_by_id[item.evidence_id] = item
-                elif existing != item:
-                    raise ValueError("工具证据 ID 冲突")
 
         if not evidence_by_id:
             return _terminal_result(
@@ -539,9 +541,6 @@ class DiagnosisAgent:
                 "没有可验证证据，需要人工处理",
                 tool_errors=["no_evidence"],
             )
-        if len(evidence_by_id) > _MAX_EVIDENCE_ITEMS:
-            raise ValueError("工具证据数量超限")
-
         evidence_json = [
             item.model_dump(mode="json") for item in evidence_by_id.values()
         ]

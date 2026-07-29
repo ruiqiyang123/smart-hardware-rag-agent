@@ -7,6 +7,7 @@ from agent.security.secrets import (
     contains_unredacted_secret,
     redact_unredacted_secrets,
 )
+from agent.security.trusted_sources import TrustedSourcePolicy
 
 
 MINIMAL_FAILURE_NOTICE = (
@@ -202,9 +203,18 @@ class IngressGuard:
 
 
 class PolicyGuard:
-    def __init__(self, policy: dict):
+    def __init__(
+        self,
+        policy: dict,
+        trusted_source_policy: TrustedSourcePolicy | None = None,
+    ):
         domains, _ = _validate_policy(policy)
+        if trusted_source_policy is not None and not isinstance(
+            trusted_source_policy, TrustedSourcePolicy
+        ):
+            raise TypeError("trusted_source_policy 类型非法")
         self.official_domains = frozenset(domains)
+        self.trusted_sources = trusted_source_policy or TrustedSourcePolicy()
 
     @staticmethod
     def _clean_url(url: str) -> str:
@@ -212,18 +222,7 @@ class PolicyGuard:
 
     @staticmethod
     def _safe_https_url(url: str) -> bool:
-        try:
-            parsed = urlparse(url)
-            port = parsed.port
-        except ValueError:
-            return False
-        return (
-            parsed.scheme.lower() == "https"
-            and bool(parsed.hostname)
-            and parsed.username is None
-            and parsed.password is None
-            and port in {None, 443}
-        )
+        return TrustedSourcePolicy.is_safe_https_url(url)
 
     def _official_url(self, url: str) -> bool:
         if not self._safe_https_url(url):
@@ -249,7 +248,11 @@ class PolicyGuard:
         if any(pattern.search(text) for pattern in _UNSAFE_ACTION_PATTERNS):
             reasons.append("unsafe_action")
 
-        safe_citations = {url for url in citation_urls if self._safe_https_url(url)}
+        safe_citations = {
+            url for url in citation_urls if self.trusted_sources.is_trusted(url)
+        }
+        if len(safe_citations) != len(citation_urls):
+            reasons.append("official_source_violation")
         for match in _URL_PATTERN.finditer(text):
             url = self._clean_url(match.group(0))
             if url in safe_citations or self._official_url(url):

@@ -773,6 +773,16 @@ class DiagnosisContractTest(unittest.TestCase):
         }
         cases = (
             (conflict_plan, conflict_tools),
+            (None, {"knowledge_search": lambda *_: {"not": "a list"}}),
+            (None, {"knowledge_search": lambda *_: [object()]}),
+            (
+                None,
+                {
+                    "knowledge_search": lambda *_: [
+                        self._evidence(content="   ")
+                    ]
+                },
+            ),
             (
                 None,
                 {
@@ -792,12 +802,38 @@ class DiagnosisContractTest(unittest.TestCase):
             ),
             (
                 None,
+                {
+                    "knowledge_search": lambda *_: [
+                        self._evidence(content="unsafe\x00control")
+                    ]
+                },
+            ),
+            (
+                None,
+                {
+                    "knowledge_search": lambda *_: [
+                        self._evidence(evidence_id="kb:one", content="a" * 17_000),
+                        self._evidence(evidence_id="kb:two", content="b" * 17_000),
+                    ]
+                },
+            ),
+            (
+                None,
                 {"knowledge_search": lambda *_: [dict(self._evidence(), reasoning="hidden")]},
             ),
         )
         for plan, tools in cases:
-            with self.subTest(plan=plan), self.assertRaises(ValueError):
-                self._agent(plan=plan, tools=tools, retries=0).run(self._state())
+            agent = self._agent(plan=plan, tools=tools, retries=0)
+            with self.subTest(plan=plan):
+                output = agent.run(self._state())
+                self.assertEqual(output["outcome"], "escalate")
+                self.assertTrue(output["tool_errors"][0].startswith("tool_failure:"))
+                self.assertEqual(agent.answer_runner.calls, [])
+                serialized = json.dumps(output, ensure_ascii=False)
+                self.assertNotIn("private key", serialized)
+                self.assertNotIn("111111", serialized)
+                self.assertNotIn("unsafe\x00control", serialized)
+                self.assertNotIn("hidden", serialized)
 
     def test_evidence_source_url_rejects_unsafe_or_invalid_authorities(self):
         unsafe_urls = (
@@ -809,6 +845,7 @@ class DiagnosisContractTest(unittest.TestCase):
             "https://support.example /help",
             "https://support.example\\@evil.example/help",
             "https://support.example/%0aevil",
+            "https://evil.example/help",
         )
         for source_url in unsafe_urls:
             tools = {
@@ -816,11 +853,18 @@ class DiagnosisContractTest(unittest.TestCase):
                     self._evidence(source_url=source_url)
                 ]
             }
-            with self.subTest(source_url=source_url), self.assertRaises(ValueError):
-                self._agent(tools=tools, retries=0).run(self._state())
+            agent = self._agent(tools=tools, retries=0)
+            with self.subTest(source_url=source_url):
+                output = agent.run(self._state())
+                self.assertEqual(output["outcome"], "escalate")
+                self.assertEqual(
+                    output["tool_errors"], ["tool_failure:knowledge_search"]
+                )
+                self.assertEqual(agent.answer_runner.calls, [])
+                self.assertNotIn(source_url, json.dumps(output))
 
     def test_unknown_refs_citation_mismatch_missing_citation_and_none_url_rejected(self):
-        evidence = self._evidence(source_url="https://support.example/help")
+        evidence = self._evidence(source_url="https://support.ledger.com/help")
         base_tools = {"knowledge_search": lambda *_: [evidence]}
         cases = (
             self._answer(
@@ -838,7 +882,7 @@ class DiagnosisContractTest(unittest.TestCase):
                     {
                         "source_id": "kb:usb:1",
                         "source_title": "错误标题",
-                        "source_url": "https://support.example/help",
+                        "source_url": "https://support.ledger.com/help",
                     }
                 ]
             ),
@@ -917,7 +961,7 @@ class DiagnosisContractTest(unittest.TestCase):
         )
 
     def test_valid_https_knowledge_citation_is_bound_exactly(self):
-        source_url = "https://support.example/help"
+        source_url = "https://support.ledger.com/help"
         evidence = self._evidence(source_url=source_url)
         answer = self._answer(
             citations=[
@@ -933,6 +977,163 @@ class DiagnosisContractTest(unittest.TestCase):
             tools={"knowledge_search": lambda *_: [evidence]},
         ).run(self._state())
         self.assertEqual(output["citations"][0]["source_url"], source_url)
+
+        root_url = "https://ledger.com/academy/security"
+        root_evidence = self._evidence(source_url=root_url)
+        root_answer = self._answer(
+            citations=[
+                {
+                    "source_id": "kb:usb:1",
+                    "source_title": "连接帮助",
+                    "source_url": root_url,
+                }
+            ]
+        )
+        root_output = self._agent(
+            answer=root_answer,
+            tools={"knowledge_search": lambda *_: [root_evidence]},
+        ).run(self._state())
+        self.assertEqual(root_output["outcome"], "draft")
+
+    def test_tool_receives_only_validated_safe_context(self):
+        observed = []
+
+        def inspect_context(tool_state, query):
+            observed.append(tool_state)
+            return [self._evidence()]
+
+        state = self._state(
+            raw_input="private key: " + "1" * 64,
+            api_token="NEVER_PASS_THIS_TOKEN",
+            arbitrary_extra={"secret": "NEVER_PASS_THIS_EXTRA"},
+        )
+        self._agent(tools={"knowledge_search": inspect_context}).run(state)
+        self.assertEqual(
+            observed,
+            [{"user_id": "1001", "sanitized_input": "设备无法连接"}],
+        )
+        self.assertNotIn("NEVER_PASS_THIS", json.dumps(observed))
+
+    def test_github_trust_is_limited_to_known_repository_prefixes(self):
+        trusted_url = "https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki"
+        evidence = self._evidence(source_url=trusted_url)
+        answer = self._answer(
+            citations=[
+                {
+                    "source_id": "kb:usb:1",
+                    "source_title": "连接帮助",
+                    "source_url": trusted_url,
+                }
+            ]
+        )
+        output = self._agent(
+            answer=answer,
+            tools={"knowledge_search": lambda *_: [evidence]},
+        ).run(self._state())
+        self.assertEqual(output["outcome"], "draft")
+
+        untrusted = self._evidence(
+            source_url="https://github.com/evil/project/blob/main/fake.md"
+        )
+        agent = self._agent(
+            tools={"knowledge_search": lambda *_: [untrusted]}, retries=0
+        )
+        rejected = agent.run(self._state())
+        self.assertEqual(rejected["outcome"], "escalate")
+        self.assertEqual(
+            rejected["tool_errors"], ["tool_failure:knowledge_search"]
+        )
+        self.assertEqual(agent.answer_runner.calls, [])
+
+        traversal = self._evidence(
+            source_url=(
+                "https://github.com/bitcoin/bips/%2e%2e/evil/"
+                "blob/main/fake.md"
+            )
+        )
+        traversal_agent = self._agent(
+            tools={"knowledge_search": lambda *_: [traversal]}, retries=0
+        )
+        traversal_output = traversal_agent.run(self._state())
+        self.assertEqual(traversal_output["outcome"], "escalate")
+        self.assertEqual(
+            traversal_output["tool_errors"],
+            ["tool_failure:knowledge_search"],
+        )
+
+    def test_trusted_source_domains_can_be_injected_strictly(self):
+        from agent.security.trusted_sources import TrustedSourcePolicy
+
+        source_url = "https://docs.example.test/help"
+        evidence = self._evidence(source_url=source_url)
+        answer = self._answer(
+            citations=[
+                {
+                    "source_id": "kb:usb:1",
+                    "source_title": "连接帮助",
+                    "source_url": source_url,
+                }
+            ]
+        )
+        output = self._agent(
+            answer=answer,
+            tools={"knowledge_search": lambda *_: [evidence]},
+            trusted_source_domains=["docs.example.test"],
+        ).run(self._state())
+        self.assertEqual(output["outcome"], "draft")
+
+        shared_policy = TrustedSourcePolicy(["docs.example.test"], [])
+        shared_agent = self._agent(trusted_source_policy=shared_policy)
+        self.assertIs(shared_agent.trusted_sources, shared_policy)
+        with self.assertRaises(ValueError):
+            self._agent(
+                trusted_source_policy=shared_policy,
+                trusted_source_domains=["docs.example.test"],
+            )
+
+        for domains in (
+            [],
+            ["HTTPS://docs.example.test"],
+            ["Docs.example.test"],
+            ["docs.example.test/path"],
+            ["github.com"],
+        ):
+            with self.subTest(domains=domains), self.assertRaises(ValueError):
+                self._agent(trusted_source_domains=domains)
+
+    def test_default_provenance_policy_covers_every_corpus_source(self):
+        import re
+
+        from agent.security.trusted_sources import TrustedSourcePolicy
+
+        policy = TrustedSourcePolicy()
+        data_directory = Path(__file__).resolve().parents[1] / "data"
+        urls = []
+        for source_file in data_directory.glob("*.txt"):
+            urls.extend(
+                re.findall(
+                    r"https://[^\s]+",
+                    source_file.read_text(encoding="utf-8"),
+                )
+            )
+        self.assertGreater(len(urls), 10)
+        self.assertEqual(
+            [url for url in urls if not policy.is_trusted(url)],
+            [],
+        )
+
+    def test_invalid_optional_user_id_is_rejected_before_tool_execution(self):
+        invalid_ids = (
+            "",
+            "user id",
+            "x" * 129,
+            "private key: " + "1" * 64,
+        )
+        for user_id in invalid_ids:
+            agent = self._agent()
+            with self.subTest(user_id=user_id), self.assertRaises(ValueError):
+                agent.run(self._state(user_id=user_id))
+            self.assertEqual(agent.plan_runner.calls, [])
 
     def test_timeout_is_not_retried_and_successful_warranty_draft_is_bound(self):
         release = threading.Event()
