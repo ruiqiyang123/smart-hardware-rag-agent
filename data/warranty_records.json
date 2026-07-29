@@ -1,4 +1,6 @@
-[
+{
+  "snapshot_as_of": "2026-07-29",
+  "records": [
   {
     "serial_last4": "A1B2",
     "device_model": "KeyGuard Pro",
@@ -63,4 +65,5 @@
     "warranty_status": "active",
     "note": "模拟数据：按键故障设备"
   }
-]
+  ]
+}

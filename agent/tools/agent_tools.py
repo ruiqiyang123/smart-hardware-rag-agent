@@ -1,4 +1,5 @@
 import os
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -15,6 +16,7 @@ from agent.services.usage_records import find_usage_record, load_usage_records
 
 rag = None
 _evidence_rag = None
+_rag_lock = threading.RLock()
 
 # 会话级用户上下文：替代原 random.choice(user_ids)
 # 在 Streamlit 前端通过 session_state 设置当前登录用户，见 app.py 侧边栏
@@ -33,21 +35,30 @@ def configure_rag_model(model):
     且无 key 报错」的割裂。
     """
     global rag
-    rag = RagSummarizeService(model=model)
+    with _rag_lock:
+        rag = RagSummarizeService(model=model)
 
 
 def _summary_rag() -> RagSummarizeService:
     global rag
-    if rag is None:
-        rag = RagSummarizeService()
-    return rag
+    instance = rag
+    if instance is None:
+        with _rag_lock:
+            if rag is None:
+                rag = RagSummarizeService()
+            instance = rag
+    return instance
 
 
 def _structured_evidence_rag() -> RagSummarizeService:
     global _evidence_rag
-    if _evidence_rag is None:
-        _evidence_rag = RagSummarizeService(evidence_only=True)
-    return _evidence_rag
+    instance = _evidence_rag
+    if instance is None:
+        with _rag_lock:
+            if _evidence_rag is None:
+                _evidence_rag = RagSummarizeService(evidence_only=True)
+            instance = _evidence_rag
+    return instance
 
 
 def resolve_location_or_ip(location: Optional[str] = None) -> str:

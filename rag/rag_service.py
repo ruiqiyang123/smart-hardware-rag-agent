@@ -7,6 +7,7 @@
 加来源标注后，用户可以追溯答案出处。
 """
 import hashlib
+from itertools import chain, islice
 import os
 import re
 from typing import Optional
@@ -27,6 +28,7 @@ from utils.path_tool import get_abs_path
 
 _MAX_QUERY_LENGTH = 500
 _MAX_EVIDENCE_ITEMS = 8
+_MAX_CANDIDATES_PER_SOURCE = 32
 _MAX_CONTENT_LENGTH = 4_000
 _MAX_SOURCE_TITLE_LENGTH = 300
 _MAX_SOURCE_URL_LENGTH = 2_048
@@ -256,7 +258,24 @@ class RagSummarizeService:
 
         results: list[dict] = []
         signatures_by_id: dict[str, tuple] = {}
-        for doc in _merge_docs(keyword_docs, vector_docs):
+        seen_candidates: set[tuple] = set()
+        candidates = chain(
+            islice(keyword_docs, _MAX_CANDIDATES_PER_SOURCE),
+            islice(vector_docs, _MAX_CANDIDATES_PER_SOURCE),
+        )
+        for doc in candidates:
+            if not isinstance(doc, Document):
+                continue
+            source = doc.metadata.get("source")
+            entry_id = doc.metadata.get("entry_id")
+            candidate_key = (
+                doc.page_content,
+                source if isinstance(source, str) else repr(source),
+                entry_id if isinstance(entry_id, (str, int)) else repr(entry_id),
+            )
+            if candidate_key in seen_candidates:
+                continue
+            seen_candidates.add(candidate_key)
             evidence = _document_to_evidence(doc)
             if evidence is None:
                 continue

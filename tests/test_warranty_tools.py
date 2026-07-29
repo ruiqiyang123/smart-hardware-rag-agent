@@ -1,10 +1,12 @@
 import copy
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from agent.orchestration.state import EvidenceItem
+import agent.tools.warranty_tools as warranty_module
 from agent.tools.warranty_tools import WarrantyRepository
 
 
@@ -43,28 +45,33 @@ def test_unknown_serial_and_invalid_serial_contract():
 
 
 def test_records_are_loaded_once_and_results_are_deep_copies(tmp_path):
-    path = tmp_path / "warranty.json"
     payload = default_records()
-    path.write_text(json.dumps(payload), encoding="utf-8")
+    path = write_payload(tmp_path, payload)
     repository = WarrantyRepository(path)
 
     first = repository.find_by_last4("A1B2")
     first["device_model"] = "mutated"
     payload[0]["device_model"] = "changed-on-disk"
-    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.write_text(json.dumps(snapshot_payload(payload)), encoding="utf-8")
 
     assert repository.find_by_last4("A1B2")["device_model"] == "KeyGuard Pro"
 
 
 def default_records():
     path = Path(__file__).resolve().parents[1] / "data" / "warranty_records.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8"))["records"]
 
 
 def write_payload(tmp_path, payload):
     path = tmp_path / "records.json"
+    if isinstance(payload, list):
+        payload = snapshot_payload(payload)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+def snapshot_payload(records, snapshot_as_of="2026-07-29"):
+    return {"snapshot_as_of": snapshot_as_of, "records": records}
 
 
 def invalid_cases():
@@ -163,4 +170,145 @@ def test_evidence_json_is_stable_and_explicitly_simulated():
 
     assert first == second
     assert "模拟" in content["simulation_notice"]
+    assert content["snapshot_as_of"] == repository.snapshot_as_of
+    assert repository.snapshot_as_of in content["simulation_notice"]
     assert content["warranty_record"]["serial_last4"] == "A1B2"
+    assert set(content["warranty_record"]) == {
+        "serial_last4",
+        "device_model",
+        "purchase_date",
+        "warranty_until",
+        "warranty_status",
+        "note",
+    }
+
+
+def test_dataset_declares_a_strict_snapshot_date():
+    path = Path(__file__).resolve().parents[1] / "data" / "warranty_records.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert set(payload) == {"snapshot_as_of", "records"}
+    assert payload["snapshot_as_of"] == "2026-07-29"
+    assert WarrantyRepository().snapshot_as_of == "2026-07-29"
+
+
+def test_repository_does_not_use_path_read_bytes(monkeypatch):
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda self: (_ for _ in ()).throw(AssertionError("必须从同一 fd 读取")),
+    )
+
+    assert WarrantyRepository().find_by_last4("A1B2") is not None
+
+
+def test_snapshot_property_is_read_only():
+    repository = WarrantyRepository()
+
+    with pytest.raises(AttributeError):
+        repository.snapshot_as_of = "2099-01-01"
+
+
+def test_rejects_symlink_and_does_not_disclose_path(tmp_path):
+    target = write_payload(tmp_path, default_records())
+    link = tmp_path / "sensitive-link-name.json"
+    link.symlink_to(target)
+
+    with pytest.raises(ValueError) as captured:
+        WarrantyRepository(link)
+
+    assert "sensitive-link-name" not in str(captured.value)
+    assert captured.value.__cause__ is None
+
+
+def test_rejects_file_replacement_between_lstat_and_open(monkeypatch, tmp_path):
+    expected = write_payload(tmp_path, default_records())
+    replacement = tmp_path / "replacement-sensitive-name.json"
+    replacement.write_text(
+        json.dumps(snapshot_payload(default_records()), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    real_open = os.open
+
+    def open_replacement(path, flags):
+        return real_open(replacement, flags)
+
+    monkeypatch.setattr(warranty_module.os, "open", open_replacement)
+    with pytest.raises(ValueError) as captured:
+        WarrantyRepository(expected)
+
+    assert "replacement-sensitive-name" not in str(captured.value)
+    assert captured.value.__cause__ is None
+
+
+def test_fd_reader_is_bounded_even_if_file_grows_after_fstat(monkeypatch):
+    requests = []
+
+    def endless_read(descriptor, size):
+        requests.append(size)
+        return b"x" * size
+
+    monkeypatch.setattr(warranty_module.os, "read", endless_read)
+    with pytest.raises(ValueError, match="大小限制"):
+        WarrantyRepository()
+
+    assert sum(requests) == warranty_module._MAX_FILE_SIZE + 1
+    assert all(size <= 64 * 1024 for size in requests)
+
+
+def test_secure_open_requests_nofollow_and_cloexec_when_available(monkeypatch):
+    observed_flags = []
+    real_open = os.open
+
+    def recording_open(path, flags):
+        observed_flags.append(flags)
+        return real_open(path, flags)
+
+    monkeypatch.setattr(warranty_module.os, "open", recording_open)
+    WarrantyRepository()
+
+    assert observed_flags
+    for flag_name in ("O_NOFOLLOW", "O_CLOEXEC"):
+        flag = getattr(os, flag_name, 0)
+        if flag:
+            assert observed_flags[0] & flag
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"warranty_status": "active", "warranty_until": "2026-07-28"},
+        {"warranty_status": "expired", "warranty_until": "2026-07-29"},
+        {"purchase_date": "2026-07-30", "warranty_until": "2027-07-30"},
+    ],
+)
+def test_warranty_status_is_validated_against_snapshot(tmp_path, changes):
+    records = default_records()
+    records[0].update(changes)
+
+    with pytest.raises(ValueError):
+        WarrantyRepository(write_payload(tmp_path, records))
+
+
+@pytest.mark.parametrize("snapshot", ["", "2026-02-30", "29-07-2026"])
+def test_snapshot_date_is_strict_iso(tmp_path, snapshot):
+    path = write_payload(tmp_path, snapshot_payload(default_records(), snapshot))
+
+    with pytest.raises(ValueError):
+        WarrantyRepository(path)
+
+
+def test_snapshot_object_rejects_extra_fields(tmp_path):
+    payload = snapshot_payload(default_records())
+    payload["generated_by"] = "untrusted"
+
+    with pytest.raises(ValueError):
+        WarrantyRepository(write_payload(tmp_path, payload))
+
+
+def test_legacy_top_level_record_list_is_rejected(tmp_path):
+    path = tmp_path / "legacy-list.json"
+    path.write_text(json.dumps(default_records()), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="快照对象"):
+        WarrantyRepository(path)

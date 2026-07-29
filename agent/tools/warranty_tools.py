@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 import re
 import stat
 from datetime import date
@@ -24,6 +25,7 @@ _EXPECTED_FIELDS = frozenset(
 _SERIAL_PATTERN = re.compile(r"[A-Z0-9]{4}")
 _UNSAFE_CONTROL_PATTERN = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _STATUS_VALUES = frozenset({"active", "expired", "missing_info"})
+_SNAPSHOT_FIELDS = frozenset({"snapshot_as_of", "records"})
 
 
 def _reject_duplicate_json_keys(pairs):
@@ -66,26 +68,73 @@ class WarrantyRepository:
     def __init__(self, path: Optional[Union[str, Path]] = None):
         default_path = Path(__file__).resolve().parents[2] / "data" / "warranty_records.json"
         self.path = Path(path) if path is not None else default_path
-        self._records = self._load_records()
+        self._snapshot_as_of, self._records = self._load_records()
         self._by_last4 = {
             record["serial_last4"]: record for record in self._records
         }
 
-    def _load_records(self) -> list[dict]:
+    @property
+    def snapshot_as_of(self) -> str:
+        return self._snapshot_as_of
+
+    def _read_bytes_from_single_fd(self) -> bytes:
         try:
-            info = self.path.lstat()
+            expected = os.lstat(self.path)
         except OSError:
             raise ValueError("保修数据文件不可用") from None
-        if not stat.S_ISREG(info.st_mode):
+        if not stat.S_ISREG(expected.st_mode):
             raise ValueError("保修数据路径必须是普通文件")
-        if info.st_size > _MAX_FILE_SIZE:
+        if expected.st_size > _MAX_FILE_SIZE:
             raise ValueError("保修数据文件超过大小限制")
 
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = None
         try:
-            raw = self.path.read_bytes()
+            descriptor = os.open(self.path, flags)
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_dev != expected.st_dev
+                or opened.st_ino != expected.st_ino
+            ):
+                raise ValueError("保修数据文件在打开期间发生变化")
+            observed_path = os.lstat(self.path)
+            if (
+                not stat.S_ISREG(observed_path.st_mode)
+                or observed_path.st_dev != opened.st_dev
+                or observed_path.st_ino != opened.st_ino
+            ):
+                raise ValueError("保修数据文件在打开期间发生变化")
+            if opened.st_size > _MAX_FILE_SIZE:
+                raise ValueError("保修数据文件超过大小限制")
+
+            chunks: list[bytes] = []
+            total = 0
+            while total <= _MAX_FILE_SIZE:
+                remaining = _MAX_FILE_SIZE + 1 - total
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            raw = b"".join(chunks)
             if len(raw) > _MAX_FILE_SIZE:
                 raise ValueError("保修数据文件超过大小限制")
-            text = raw.decode("utf-8", errors="strict")
+            return raw
+        except OSError:
+            raise ValueError("保修数据文件不可用") from None
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def _load_records(self) -> tuple[str, list[dict]]:
+        try:
+            text = self._read_bytes_from_single_fd().decode("utf-8", errors="strict")
             payload = json.loads(
                 text,
                 object_pairs_hook=_reject_duplicate_json_keys,
@@ -93,27 +142,31 @@ class WarrantyRepository:
                     ValueError("保修数据包含非标准 JSON 数值")
                 ),
             )
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError):
             raise ValueError("保修数据文件不是有效 UTF-8 JSON") from None
 
-        if not isinstance(payload, list):
-            raise TypeError("保修数据顶层必须是列表")
-        if len(payload) != 8:
+        if not isinstance(payload, dict) or set(payload) != _SNAPSHOT_FIELDS:
+            raise ValueError("保修数据顶层必须是严格快照对象")
+        snapshot = _iso_date(payload["snapshot_as_of"], "snapshot_as_of")
+        records_payload = payload["records"]
+        if not isinstance(records_payload, list):
+            raise TypeError("records 必须是列表")
+        if len(records_payload) != 8:
             raise ValueError("保修数据必须恰好包含 8 条模拟记录")
 
         records: list[dict] = []
         seen: set[str] = set()
-        for item in payload:
-            record = self._validate_record(item)
+        for item in records_payload:
+            record = self._validate_record(item, snapshot)
             serial = record["serial_last4"]
             if serial in seen:
                 raise ValueError("保修数据 serial_last4 不得重复")
             seen.add(serial)
             records.append(record)
-        return records
+        return snapshot.isoformat(), records
 
     @staticmethod
-    def _validate_record(item: object) -> dict:
+    def _validate_record(item: object, snapshot: date) -> dict:
         if not isinstance(item, dict):
             raise TypeError("保修记录必须是对象")
         if set(item) != _EXPECTED_FIELDS:
@@ -141,6 +194,12 @@ class WarrantyRepository:
             warranty_until = _iso_date(until_value, "warranty_until")
             if purchase_date > warranty_until:
                 raise ValueError("purchase_date 不得晚于 warranty_until")
+            if purchase_date > snapshot:
+                raise ValueError("purchase_date 不得晚于快照日期")
+            if status_value == "active" and warranty_until < snapshot:
+                raise ValueError("active 记录在快照日期必须仍有效")
+            if status_value == "expired" and warranty_until >= snapshot:
+                raise ValueError("expired 记录在快照日期必须已过期")
 
         return {
             "serial_last4": serial,
@@ -177,7 +236,11 @@ class WarrantyRepository:
             return None
         content = json.dumps(
             {
-                "simulation_notice": "仅用于 KeyGuard 演示的模拟保修记录，不代表真实设备权益",
+                "simulation_notice": (
+                    "仅用于 KeyGuard 演示的模拟保修记录，不代表真实设备权益；"
+                    f"状态快照日期为 {self.snapshot_as_of}"
+                ),
+                "snapshot_as_of": self.snapshot_as_of,
                 "warranty_record": record,
             },
             ensure_ascii=False,

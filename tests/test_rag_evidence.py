@@ -1,4 +1,6 @@
 import logging
+import threading
+import time
 
 import pytest
 from langchain_core.documents import Document
@@ -275,3 +277,155 @@ def test_v1_rag_summary_behavior_remains_available(monkeypatch):
     assert result.startswith("V1 摘要")
     assert "📚 参考来源：故障排除.txt 第1条「连接失败」" in result
     assert service.chain.calls[0]["input"] == "连接失败"
+
+
+def test_v2_candidate_iteration_is_bounded():
+    class GuardedList(list):
+        def __iter__(self):
+            for index, item in enumerate(super().__iter__()):
+                if index >= 32:
+                    raise AssertionError("单个证据源不得扫描超过 32 个候选")
+                yield item
+
+    invalid = GuardedList(["invalid"] * 100)
+    service = service_with(invalid)
+
+    assert service.search_evidence("连接问题", fallback_docs=invalid) == []
+
+
+def test_agent_tool_module_exposes_process_wide_rag_lock():
+    import agent.tools.agent_tools as tools_module
+
+    assert isinstance(tools_module._rag_lock, type(threading.RLock()))
+
+
+def test_concurrent_rag_accessors_construct_each_service_once(monkeypatch):
+    import agent.tools.agent_tools as tools_module
+
+    class FakeService:
+        counts = {"summary": 0, "evidence": 0}
+        count_lock = threading.Lock()
+
+        def __init__(self, model=None, *, evidence_only=False):
+            kind = "evidence" if evidence_only else "summary"
+            with self.count_lock:
+                self.counts[kind] += 1
+            time.sleep(0.01)
+            self.kind = kind
+
+    monkeypatch.setattr(tools_module, "RagSummarizeService", FakeService)
+    monkeypatch.setattr(tools_module, "rag", None)
+    monkeypatch.setattr(tools_module, "_evidence_rag", None)
+    barrier = threading.Barrier(24)
+    results = []
+    errors = []
+
+    def access(accessor):
+        try:
+            barrier.wait(timeout=2)
+            results.append(accessor())
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [
+        threading.Thread(
+            target=access,
+            args=(
+                tools_module._summary_rag
+                if index % 2 == 0
+                else tools_module._structured_evidence_rag,
+            ),
+        )
+        for index in range(24)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert FakeService.counts == {"summary": 1, "evidence": 1}
+    assert len({id(item) for item in results if item.kind == "summary"}) == 1
+    assert len({id(item) for item in results if item.kind == "evidence"}) == 1
+
+
+def test_configure_rag_model_publishes_only_fully_constructed_service(monkeypatch):
+    import agent.tools.agent_tools as tools_module
+
+    old_service = object()
+    construction_started = threading.Event()
+    release_construction = threading.Event()
+
+    class SlowConfiguredService:
+        def __init__(self, model=None, *, evidence_only=False):
+            self.ready = False
+            self.model = model
+            construction_started.set()
+            assert release_construction.wait(timeout=2)
+            self.ready = True
+
+    monkeypatch.setattr(tools_module, "RagSummarizeService", SlowConfiguredService)
+    monkeypatch.setattr(tools_module, "rag", old_service)
+    thread = threading.Thread(
+        target=tools_module.configure_rag_model,
+        args=("configured-model",),
+    )
+    thread.start()
+    assert construction_started.wait(timeout=2)
+
+    # Readers may safely finish with the previous complete instance while the
+    # replacement is being built, but must never observe the partial object.
+    assert tools_module._summary_rag() is old_service
+    release_construction.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert tools_module.rag.ready is True
+    assert tools_module.rag.model == "configured-model"
+
+
+def test_v2_stops_after_eight_valid_items_without_touching_vector_source():
+    class CountingList(list):
+        def __init__(self, values):
+            super().__init__(values)
+            self.visited = 0
+
+        def __iter__(self):
+            for item in super().__iter__():
+                self.visited += 1
+                yield item
+
+    keyword_docs = CountingList(
+        [doc(f"关键词 {index}", entry_id=f"kw-{index}") for index in range(100)]
+    )
+    vector_docs = CountingList(
+        [doc(f"向量 {index}", entry_id=f"vec-{index}") for index in range(100)]
+    )
+    service = service_with(vector_docs)
+
+    result = service.search_evidence("连接问题", fallback_docs=keyword_docs)
+
+    assert len(result) == 8
+    assert keyword_docs.visited == 8
+    assert vector_docs.visited == 0
+
+
+def test_v2_scans_at_most_32_invalid_candidates_from_each_source():
+    class CountingList(list):
+        def __init__(self):
+            super().__init__(["invalid"] * 10_000)
+            self.visited = 0
+
+        def __iter__(self):
+            for item in super().__iter__():
+                self.visited += 1
+                yield item
+
+    keyword_docs = CountingList()
+    vector_docs = CountingList()
+    service = service_with(vector_docs)
+
+    assert service.search_evidence("连接问题", fallback_docs=keyword_docs) == []
+    assert keyword_docs.visited == 32
+    assert vector_docs.visited == 32
