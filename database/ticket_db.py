@@ -1,6 +1,5 @@
 import json
 import math
-import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -9,6 +8,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from agent.security.secrets import contains_unredacted_secret, is_fully_redacted
+
 
 class CommandDisposition(str, Enum):
     START = "start"
@@ -16,6 +17,14 @@ class CommandDisposition(str, Enum):
     IN_PROGRESS = "in_progress"
     RESUME = "resume"
     FAILED = "failed"
+
+
+class CommandType(str, Enum):
+    USER_INPUT = "user_input"
+    HUMAN_APPROVE = "human_approve"
+    HUMAN_EDIT_SEND = "human_edit_send"
+    HUMAN_ASK = "human_ask"
+    HUMAN_REJECT = "human_reject"
 
 
 @dataclass(frozen=True)
@@ -54,6 +63,7 @@ CATEGORY_VALUES = {
     "security_report",
     "other",
 }
+SCHEMA_VERSION = 3
 
 
 SCHEMA = """
@@ -102,7 +112,9 @@ CREATE TABLE IF NOT EXISTS tickets (
 CREATE TABLE IF NOT EXISTS ticket_commands (
     command_id TEXT PRIMARY KEY CHECK(length(trim(command_id)) > 0),
     ticket_id TEXT NOT NULL CHECK(length(trim(ticket_id)) > 0),
-    command_type TEXT NOT NULL CHECK(length(trim(command_type)) > 0),
+    command_type TEXT NOT NULL CHECK(command_type IN (
+        'user_input', 'human_approve', 'human_edit_send', 'human_ask', 'human_reject'
+    )),
     status TEXT NOT NULL CHECK(status IN ('in_progress', 'completed', 'failed')),
     lease_expires_at TEXT NOT NULL CHECK(length(trim(lease_expires_at)) > 0),
     lease_version INTEGER NOT NULL DEFAULT 1
@@ -148,24 +160,8 @@ CREATE TABLE IF NOT EXISTS ticket_events (
     FOREIGN KEY(ticket_id, command_id)
         REFERENCES ticket_commands(ticket_id, command_id)
 );
+PRAGMA user_version = 3;
 """
-
-
-_REDACTED_PATTERN = re.compile(r"\[REDACTED_[A-Z0-9_]+\]", re.IGNORECASE)
-_MNEMONIC_PATTERN = re.compile(
-    r"(?<![A-Za-z])(?:[a-z]{3,12}[ \t\r\n]+){11,23}[a-z]{3,12}(?![A-Za-z])",
-    re.ASCII,
-)
-_PRIVATE_KEY_PATTERN = re.compile(
-    r"(?:private[_ -]?key|私钥)\s*[:=：]\s*(?:0x)?[0-9a-fA-F]{64}\b",
-    re.IGNORECASE,
-)
-_PIN_PATTERN = re.compile(r"\bpin\s*[:=：]\s*\d{4,8}\b", re.IGNORECASE)
-_PASSPHRASE_PATTERN = re.compile(
-    r"(?:passphrase|password|seed[_ -]?phrase|mnemonic|助记词|密码|口令)"
-    r"\s*[:=：]\s*\S+",
-    re.IGNORECASE,
-)
 _SENSITIVE_METADATA_KEYS = {
     "pin",
     "passphrase",
@@ -188,7 +184,7 @@ class TicketRepository:
         "missing_fields_json",
         "evidence_refs_json",
     }
-    _UPDATABLE_FIELDS = {
+    _WORKFLOW_UPDATABLE_FIELDS = {
         "status",
         "category",
         "priority",
@@ -203,6 +199,7 @@ class TicketRepository:
         "requires_human",
         "manual_gate_reason",
     }
+    _ADMIN_UPDATABLE_FIELDS = {"requires_human", "manual_gate_reason"}
     _EVENT_FIELDS = {
         "step_index",
         "node_name",
@@ -217,6 +214,17 @@ class TicketRepository:
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
+            existing_tables = connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                """
+            ).fetchall()
+            schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if existing_tables and schema_version != SCHEMA_VERSION:
+                raise RuntimeError(
+                    "schema 版本不兼容；请备份后重建 KeyGuard V2 数据库"
+                )
             connection.executescript(SCHEMA)
 
     def _connect(self) -> sqlite3.Connection:
@@ -279,23 +287,14 @@ class TicketRepository:
 
     @staticmethod
     def _assert_no_secret(text: str) -> None:
-        candidate = _REDACTED_PATTERN.sub("", text)
-        if any(
-            pattern.search(candidate)
-            for pattern in (
-                _MNEMONIC_PATTERN,
-                _PRIVATE_KEY_PATTERN,
-                _PIN_PATTERN,
-                _PASSPHRASE_PATTERN,
-            )
-        ):
+        if contains_unredacted_secret(text):
             raise ValueError("检测到未脱敏的敏感信息")
 
     @classmethod
     def _assert_safe_metadata(cls, value: object, parent_key: str = "") -> None:
         if isinstance(value, str):
             if parent_key.lower() in _SENSITIVE_METADATA_KEYS:
-                if _REDACTED_PATTERN.fullmatch(value.strip()) is None:
+                if not is_fully_redacted(value):
                     raise ValueError("检测到未脱敏的敏感信息")
             cls._assert_no_secret(value)
             return
@@ -328,10 +327,15 @@ class TicketRepository:
         return value
 
     @classmethod
-    def _prepare_updates(cls, updates: Dict[str, object]) -> Dict[str, object]:
+    def _prepare_updates(
+        cls,
+        updates: Dict[str, object],
+        allowed_fields: Optional[set] = None,
+    ) -> Dict[str, object]:
         if not isinstance(updates, dict) or not updates:
             raise ValueError("updates 不能为空")
-        unknown = set(updates) - cls._UPDATABLE_FIELDS
+        allowed = allowed_fields or cls._WORKFLOW_UPDATABLE_FIELDS
+        unknown = set(updates) - allowed
         if unknown:
             raise ValueError(f"禁止更新字段: {sorted(unknown)}")
 
@@ -415,11 +419,21 @@ class TicketRepository:
         command: sqlite3.Row,
         ticket_id: Optional[str],
         lease_version: int,
+        require_active: bool = False,
     ) -> None:
         if ticket_id is not None and command["ticket_id"] != ticket_id:
             raise ValueError("command 不属于指定工单")
         if command["lease_version"] != lease_version:
             raise ValueError("lease_version 已过期")
+        if require_active:
+            if command["status"] != "in_progress":
+                raise ValueError("command 不是 in_progress")
+            try:
+                expires_at = datetime.fromisoformat(command["lease_expires_at"])
+            except (TypeError, ValueError) as error:
+                raise ValueError("command lease 无效") from error
+            if datetime.now(timezone.utc) >= expires_at:
+                raise ValueError("command lease 已过期")
 
     @staticmethod
     def _event_matches(
@@ -524,7 +538,10 @@ class TicketRepository:
         ticket_id = self._nonempty_text(ticket_id, "ticket_id")
         command_id = self._nonempty_text(command_id, "command_id")
         command_type = self._nonempty_text(command_type, "command_type")
-        self._assert_no_secret(command_type)
+        try:
+            command_type = CommandType(command_type).value
+        except ValueError as error:
+            raise ValueError("command_type 非法") from error
         lease_seconds = self._positive_integer(lease_seconds, "lease_seconds")
         now = datetime.now(timezone.utc)
         lease = (now + timedelta(seconds=lease_seconds)).isoformat()
@@ -602,70 +619,6 @@ class TicketRepository:
             )
             return CommandDecision(CommandDisposition.START, 1)
 
-    def _validate_result_event(
-        self,
-        connection: sqlite3.Connection,
-        command: sqlite3.Row,
-        result_event_id: Optional[int],
-    ) -> None:
-        if result_event_id is None:
-            return
-        result_event_id = self._positive_integer(result_event_id, "result_event_id")
-        event = connection.execute(
-            """
-            SELECT 1 FROM ticket_events
-            WHERE event_id = ? AND ticket_id = ? AND command_id = ?
-            """,
-            (result_event_id, command["ticket_id"], command["command_id"]),
-        ).fetchone()
-        if event is None:
-            raise ValueError("result_event_id 不属于当前 command")
-
-    def complete_command(
-        self,
-        command_id: str,
-        lease_version: int,
-        result_status: str,
-        result_event_id: Optional[int],
-    ) -> None:
-        command_id = self._nonempty_text(command_id, "command_id")
-        lease_version = self._positive_integer(lease_version, "lease_version")
-        if result_status not in STATUS_VALUES:
-            raise ValueError("result_status 非法")
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            existing = self._command_row(connection, command_id)
-            if existing is None:
-                raise ValueError(f"command 不存在: {command_id}")
-            self._check_command_owner(existing, None, lease_version)
-            if existing["status"] == "completed":
-                if (
-                    existing["result_status"] == result_status
-                    and existing["result_event_id"] == result_event_id
-                ):
-                    return
-                raise ValueError("completed command 不得用不同结果覆盖")
-            if existing["status"] != "in_progress":
-                raise ValueError("非 in_progress command 不得标记 completed")
-            self._validate_result_event(connection, existing, result_event_id)
-            cursor = connection.execute(
-                """
-                UPDATE ticket_commands
-                SET status = 'completed', result_status = ?, result_event_id = ?,
-                    updated_at = ?
-                WHERE command_id = ? AND status = 'in_progress' AND lease_version = ?
-                """,
-                (
-                    result_status,
-                    result_event_id,
-                    self._now(),
-                    command_id,
-                    lease_version,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise ValueError("command 完成时 lease 已失效")
-
     def fail_command(
         self, command_id: str, lease_version: int, error_code: str
     ) -> None:
@@ -684,13 +637,18 @@ class TicketRepository:
                 raise ValueError("failed command 不得用不同 error_code 覆盖")
             if existing["status"] != "in_progress":
                 raise ValueError("非 in_progress command 不得标记 failed")
+            self._check_command_owner(
+                existing, None, lease_version, require_active=True
+            )
+            stamp = self._now()
             cursor = connection.execute(
                 """
                 UPDATE ticket_commands
                 SET status = 'failed', error_code = ?, updated_at = ?
-                WHERE command_id = ? AND status = 'in_progress' AND lease_version = ?
+                WHERE command_id = ? AND status = 'in_progress'
+                  AND lease_version = ? AND lease_expires_at > ?
                 """,
-                (error_code, self._now(), command_id, lease_version),
+                (error_code, stamp, command_id, lease_version, stamp),
             )
             if cursor.rowcount != 1:
                 raise ValueError("command 失败写入时 lease 已失效")
@@ -706,9 +664,9 @@ class TicketRepository:
         command = self._command_row(connection, command_id)
         if command is None:
             raise ValueError(f"command 不存在: {command_id}")
-        self._check_command_owner(command, ticket_id, lease_version)
-        if command["status"] != "in_progress":
-            raise ValueError("只有 in_progress command 可以写事件")
+        self._check_command_owner(
+            command, ticket_id, lease_version, require_active=True
+        )
 
         key = self._event_key(
             command_id, int(event["step_index"]), str(event["event_type"])
@@ -818,9 +776,11 @@ class TicketRepository:
         if cursor.rowcount != 1:
             raise ValueError(f"工单不存在: {ticket_id}")
 
-    def update_ticket(self, ticket_id: str, updates: Dict[str, object]) -> None:
+    def admin_update_ticket(
+        self, ticket_id: str, updates: Dict[str, object]
+    ) -> None:
         ticket_id = self._nonempty_text(ticket_id, "ticket_id")
-        prepared = self._prepare_updates(updates)
+        prepared = self._prepare_updates(updates, self._ADMIN_UPDATABLE_FIELDS)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._update_ticket_in_transaction(
@@ -869,6 +829,23 @@ class TicketRepository:
             last_event_id,
         )
 
+    @staticmethod
+    def _validate_terminal_result(
+        prepared_updates: Dict[str, object],
+        prepared_events: List[Dict[str, object]],
+    ) -> str:
+        final_status = prepared_updates.get("status")
+        if final_status not in STATUS_VALUES:
+            raise ValueError("atomic workflow commit 必须显式更新合法 status")
+        final_event = prepared_events[-1]
+        if final_event["step_index"] <= 0:
+            raise ValueError("final event 的 step_index 必须大于 0")
+        if final_event["event_type"] != f"ticket.{final_status}":
+            raise ValueError("final event_type 必须与 final status 匹配")
+        if final_event["to_status"] != final_status:
+            raise ValueError("final event to_status 必须等于 final status")
+        return str(final_status)
+
     def commit_command_result(
         self,
         ticket_id: str,
@@ -884,6 +861,9 @@ class TicketRepository:
         if not isinstance(events, list) or not events:
             raise ValueError("events 必须是非空 list")
         prepared_events = [self._prepare_event(event) for event in events]
+        final_status = self._validate_terminal_result(
+            prepared_updates, prepared_events
+        )
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -905,6 +885,9 @@ class TicketRepository:
                 )
             if command["status"] != "in_progress":
                 raise ValueError("只有 in_progress command 可以提交结果")
+            self._check_command_owner(
+                command, ticket_id, lease_version, require_active=True
+            )
 
             stamp = self._now()
             self._update_ticket_in_transaction(
@@ -918,6 +901,9 @@ class TicketRepository:
             ticket_status = connection.execute(
                 "SELECT status FROM tickets WHERE ticket_id = ?", (ticket_id,)
             ).fetchone()["status"]
+            if ticket_status != final_status:
+                raise ValueError("ticket final status 与 terminal event 不一致")
+            completion_stamp = self._now()
             cursor = connection.execute(
                 """
                 UPDATE ticket_commands
@@ -925,14 +911,16 @@ class TicketRepository:
                     updated_at = ?
                 WHERE command_id = ? AND ticket_id = ?
                   AND status = 'in_progress' AND lease_version = ?
+                  AND lease_expires_at > ?
                 """,
                 (
                     ticket_status,
                     last_event_id,
-                    stamp,
+                    completion_stamp,
                     command_id,
                     ticket_id,
                     lease_version,
+                    completion_stamp,
                 ),
             )
             if cursor.rowcount != 1:
