@@ -29,7 +29,7 @@
 3. 运行定向测试并确认先失败：
 
 ```bash
-DASHSCOPE_API_KEY=test /private/tmp/keyguard-v2-deps/bin/python -m pytest tests/test_model_config.py tests/test_demo_readiness.py -q
+DEEPSEEK_API_KEY=test /private/tmp/keyguard-v2-deps/bin/python -m pytest tests/test_model_config.py tests/test_demo_readiness.py -q
 ```
 
 ## 任务 2：实现 Provider、工厂与 Streamlit 配置
@@ -106,7 +106,7 @@ ChatOpenAI(
 ### 自动验证
 
 ```bash
-DASHSCOPE_API_KEY=test /private/tmp/keyguard-v2-deps/bin/python -m pytest -q
+DEEPSEEK_API_KEY=test /private/tmp/keyguard-v2-deps/bin/python -m pytest -q
 /private/tmp/keyguard-v2-deps/bin/python -m compileall -q agent database rag eval tests utils
 git diff --check
 git status --short

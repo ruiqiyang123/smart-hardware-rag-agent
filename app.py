@@ -27,9 +27,16 @@ from agent.tools.agent_tools import configure_rag_model
 from database.profile_db import ProfileDatabase, UserProfile
 from database.ticket_db import IdempotencyConflictError, TicketRepository
 from model.factory import build_chat_model
-from utils.config_handler import load_orchestration_config, load_security_policy
+from utils.config_handler import load_orchestration_config, load_security_policy, rag_conf
 from utils.logger_handler import logger
-from utils.model_config import DEFAULT_MIMO_BASE_URL, DEFAULT_MIMO_CHAT_MODEL, build_chat_config
+from utils.model_config import (
+    DEFAULT_DEEPSEEK_BASE_URL,
+    DEFAULT_DEEPSEEK_CHAT_MODEL,
+    DEFAULT_DEEPSEEK_THINKING,
+    DEFAULT_MIMO_BASE_URL,
+    DEFAULT_MIMO_CHAT_MODEL,
+    build_chat_config,
+)
 from utils.session_context import set_location, set_user_id
 from utils.ui_command_state import (
     ACTION_ID_SESSION_PREFIX,
@@ -157,17 +164,37 @@ def _escape_markdown_text(value: str) -> str:
 def _escape_markdown_url(value: str) -> str:
     return quote(value, safe=":/?#@!$&'*+,;=%")
 
-env_mimo_key = _runtime_secret("MIMO_API_KEY")
-env_mimo_base_url = _runtime_secret("MIMO_BASE_URL") or DEFAULT_MIMO_BASE_URL
-env_mimo_model = _runtime_secret("MIMO_CHAT_MODEL") or DEFAULT_MIMO_CHAT_MODEL
-selected_provider = "mimo"
-dashscope_key = None
-mimo_key = env_mimo_key
-mimo_base_url = env_mimo_base_url
-mimo_model_name = env_mimo_model
+selected_provider = (_runtime_secret("CHAT_PROVIDER") or "deepseek").strip().lower()
+dashscope_key = _runtime_secret("DASHSCOPE_API_KEY")
+mimo_key = _runtime_secret("MIMO_API_KEY")
+mimo_base_url = _runtime_secret("MIMO_BASE_URL") or DEFAULT_MIMO_BASE_URL
+mimo_model_name = _runtime_secret("MIMO_CHAT_MODEL") or DEFAULT_MIMO_CHAT_MODEL
+deepseek_key = _runtime_secret("DEEPSEEK_API_KEY")
+deepseek_base_url = (
+    _runtime_secret("DEEPSEEK_BASE_URL") or DEFAULT_DEEPSEEK_BASE_URL
+)
+deepseek_model_name = (
+    _runtime_secret("DEEPSEEK_CHAT_MODEL") or DEFAULT_DEEPSEEK_CHAT_MODEL
+)
+deepseek_thinking = (
+    _runtime_secret("DEEPSEEK_THINKING") or DEFAULT_DEEPSEEK_THINKING
+)
+
+if selected_provider == "deepseek":
+    provider_label = "DeepSeek"
+    selected_model_name = deepseek_model_name
+elif selected_provider in {"mimo", "openai"}:
+    provider_label = "MiMo"
+    selected_model_name = mimo_model_name
+elif selected_provider in {"dashscope", "qwen", "tongyi"}:
+    provider_label = "DashScope"
+    selected_model_name = rag_conf["chat_model_name"]
+else:
+    provider_label = "Unsupported"
+    selected_model_name = selected_provider
 
 with st.sidebar:
-    st.caption(f"模型：MiMo · `{mimo_model_name}`")
+    st.caption(f"模型：{provider_label} · `{selected_model_name}`")
     st.divider()
 
 
@@ -179,6 +206,10 @@ def resolve_chat_config() -> tuple[dict, str]:
         mimo_key=mimo_key,
         mimo_base_url=mimo_base_url,
         mimo_model_name=mimo_model_name,
+        deepseek_key=deepseek_key,
+        deepseek_base_url=deepseek_base_url,
+        deepseek_model_name=deepseek_model_name,
+        deepseek_thinking=deepseek_thinking,
     )
     return config.kwargs, config.signature
 

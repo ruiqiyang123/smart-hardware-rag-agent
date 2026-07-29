@@ -23,11 +23,14 @@ streamlit run app.py
 `.env` 或 Streamlit Secrets 至少需要以下聊天模型配置：
 
 ```dotenv
-MIMO_API_KEY=your-mimo-api-key
-MIMO_BASE_URL=https://token-plan-sgp.xiaomimimo.com/v1
-MIMO_CHAT_MODEL=mimo-v2.5-pro
-CHAT_PROVIDER=mimo
+CHAT_PROVIDER=deepseek
+DEEPSEEK_API_KEY=your-deepseek-api-key
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_CHAT_MODEL=deepseek-v4-flash
+DEEPSEEK_THINKING=disabled
 ```
+
+DeepSeek V4 Flash 官方默认开启 thinking；本 Demo 显式设为 `disabled`，减少客服短任务的额外推理输出。若需回退 MiMo，可把 Provider 改为 `mimo` 并配置 `MIMO_API_KEY`、`MIMO_BASE_URL`、`MIMO_CHAT_MODEL`；不同 Provider 的 Key 不会互相借用。
 
 V2 和人工工作台配置：
 
@@ -54,10 +57,15 @@ KEYGUARD_CHECKPOINT_DB=data/keyguard_v2_checkpoints.sqlite3
 Secrets 示例采用 TOML 语法：
 
 ```toml
+CHAT_PROVIDER = "deepseek"
+DEEPSEEK_API_KEY = "your-deepseek-api-key"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_CHAT_MODEL = "deepseek-v4-flash"
+DEEPSEEK_THINKING = "disabled"
+# 兼容回退时使用：
 MIMO_API_KEY = "your-mimo-api-key"
 MIMO_BASE_URL = "https://token-plan-sgp.xiaomimimo.com/v1"
 MIMO_CHAT_MODEL = "mimo-v2.5-pro"
-CHAT_PROVIDER = "mimo"
 KEYGUARD_AGENT_VERSION = "v2"
 KEYGUARD_OPERATOR_TOKEN = "replace-with-a-long-random-token"
 KEYGUARD_TICKET_DB = "data/keyguard_v2.db"
@@ -99,7 +107,7 @@ streamlit run app.py
 
 ### 页面启动但模型不可用
 
-检查 `MIMO_API_KEY`、`MIMO_BASE_URL`、`MIMO_CHAT_MODEL` 和 `CHAT_PROVIDER=mimo` 是否在当前部署环境生效。未声明 provider 时模型工厂可能回退到 DashScope；应用读取运行环境优先，不应在日志里打印 Key。
+默认配置请检查 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_CHAT_MODEL`、`DEEPSEEK_THINKING=disabled` 和 `CHAT_PROVIDER=deepseek` 是否在当前部署环境生效。应用读取运行环境优先，不应在日志里打印 Key，也不会在 DeepSeek 配置缺失时回退并借用 MiMo 或 DashScope Key。
 
 ### 工单工作台打不开
 

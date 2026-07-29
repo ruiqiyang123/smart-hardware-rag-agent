@@ -183,7 +183,7 @@ pytest -q
 streamlit run app.py
 ```
 
-至少填写 `MIMO_API_KEY`，并确认 `CHAT_PROVIDER=mimo`，否则模型工厂可能回退到 DashScope；需要使用工单工作台时再设置不可猜测的 `KEYGUARD_OPERATOR_TOKEN`。完整 Secrets 和数据库路径说明见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
+至少填写 `DEEPSEEK_API_KEY`，并确认 `CHAT_PROVIDER=deepseek`。默认模型为 `deepseek-v4-flash`，通过 `DEEPSEEK_THINKING=disabled` 关闭思考模式；所选 Provider 缺少配置时系统 fail closed，不会借用其他 Provider 的 Key。需要使用工单工作台时再设置不可猜测的 `KEYGUARD_OPERATOR_TOKEN`。完整 Secrets 和数据库路径说明见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
 
 ## 代码导览
 

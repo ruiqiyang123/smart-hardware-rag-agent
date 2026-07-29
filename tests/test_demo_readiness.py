@@ -141,10 +141,11 @@ class DemoReadinessTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def test_streamlit_demo_is_fixed_to_mimo(self):
+    def test_streamlit_demo_defaults_to_deepseek_without_runtime_key_form(self):
         app = read_text("app.py")
 
-        self.assertIn('selected_provider = "mimo"', app)
+        self.assertIn('or "deepseek"', app)
+        self.assertIn('provider_label = "DeepSeek"', app)
         self.assertNotIn('st.radio(\n        "聊天模型"', app)
         self.assertNotIn("阿里云 DashScope", app)
         self.assertNotIn("MiMo API Key", app)
@@ -153,7 +154,7 @@ class DemoReadinessTest(unittest.TestCase):
         self.assertNotIn("系统状态", app)
         self.assertNotIn("后台 MiMo", app)
         self.assertNotIn("访客无需配置", app)
-        self.assertIn('st.caption(f"模型：MiMo · `{mimo_model_name}`")', app)
+        self.assertIn('st.caption(f"模型：{provider_label} · `{selected_model_name}`")', app)
 
     def test_streamlit_demo_is_keyguard_wallet_scenario(self):
         app = read_text("app.py")
@@ -178,10 +179,14 @@ class DemoReadinessTest(unittest.TestCase):
 
         env_example = read_text(".env.example")
         self.assertIn("DASHSCOPE_API_KEY=", env_example)
+        self.assertIn("DEEPSEEK_API_KEY=your-deepseek-api-key", env_example)
+        self.assertIn("DEEPSEEK_BASE_URL=https://api.deepseek.com", env_example)
+        self.assertIn("DEEPSEEK_CHAT_MODEL=deepseek-v4-flash", env_example)
+        self.assertIn("DEEPSEEK_THINKING=disabled", env_example)
         self.assertIn("MIMO_API_KEY=", env_example)
         self.assertIn("MIMO_BASE_URL=", env_example)
         self.assertIn("MIMO_CHAT_MODEL=mimo-v2.5-pro", env_example)
-        self.assertIn("CHAT_PROVIDER=mimo", env_example)
+        self.assertIn("CHAT_PROVIDER=deepseek", env_example)
         self.assertIn("EMBEDDING_PROVIDER=", env_example)
         self.assertTrue((ROOT / "model/local_embeddings.py").exists())
 
@@ -301,6 +306,10 @@ class DemoReadinessTest(unittest.TestCase):
         ):
             self.assertIn(command, deployment)
         for secret in (
+            "DEEPSEEK_API_KEY",
+            "DEEPSEEK_BASE_URL",
+            "DEEPSEEK_CHAT_MODEL",
+            "DEEPSEEK_THINKING",
             "MIMO_API_KEY",
             "MIMO_BASE_URL",
             "MIMO_CHAT_MODEL",
@@ -310,8 +319,8 @@ class DemoReadinessTest(unittest.TestCase):
             "KEYGUARD_CHECKPOINT_DB",
         ):
             self.assertIn(secret, deployment)
-        self.assertIn("CHAT_PROVIDER=mimo", deployment)
-        self.assertIn('CHAT_PROVIDER = "mimo"', deployment)
+        self.assertIn("CHAT_PROVIDER=deepseek", deployment)
+        self.assertIn('CHAT_PROVIDER = "deepseek"', deployment)
         self.assertIn("必须使用不同文件", deployment)
         self.assertIn("Streamlit Cloud", deployment)
         self.assertIn("易失", deployment)

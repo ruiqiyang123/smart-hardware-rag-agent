@@ -22,6 +22,9 @@ from model.local_embeddings import LocalHashEmbeddings
 from utils.config_handler import rag_conf
 from utils.logger_handler import logger
 from utils.model_config import (
+    DEFAULT_DEEPSEEK_BASE_URL,
+    DEFAULT_DEEPSEEK_CHAT_MODEL,
+    DEFAULT_DEEPSEEK_THINKING,
     DEFAULT_EMBEDDING_PROVIDER,
     DEFAULT_LOCAL_EMBEDDING_DIMENSION,
     DEFAULT_MIMO_BASE_URL,
@@ -30,7 +33,7 @@ from utils.model_config import (
 
 load_dotenv(override=False)
 
-_DEFAULT_CHAT_PROVIDER = "dashscope"
+_DEFAULT_CHAT_PROVIDER = "deepseek"
 _DEFAULT_EMBEDDING_PROVIDER = DEFAULT_EMBEDDING_PROVIDER
 
 
@@ -47,6 +50,7 @@ class ChatModelFactory(BaseModelFactory):
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model_name: Optional[str] = None,
+        thinking: Optional[str] = None,
     ) -> BaseChatModel:
         """显式构建 chat 模型；缺省值从环境变量 / 配置文件解析。
 
@@ -54,6 +58,36 @@ class ChatModelFactory(BaseModelFactory):
         而非依赖 os.environ 路由（后者无法在运行时切换）。
         """
         provider = (provider or os.getenv("CHAT_PROVIDER", _DEFAULT_CHAT_PROVIDER)).lower()
+
+        if provider == "deepseek":
+            api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+            base_url = (
+                (os.getenv("DEEPSEEK_BASE_URL") or DEFAULT_DEEPSEEK_BASE_URL)
+                if base_url is None
+                else base_url.strip()
+            )
+            model_name = (
+                (os.getenv("DEEPSEEK_CHAT_MODEL") or DEFAULT_DEEPSEEK_CHAT_MODEL)
+                if model_name is None
+                else model_name.strip()
+            )
+            thinking = (
+                os.getenv("DEEPSEEK_THINKING", DEFAULT_DEEPSEEK_THINKING)
+                if thinking is None
+                else thinking
+            ).strip().lower()
+            if thinking not in {"enabled", "disabled"}:
+                raise ValueError("DEEPSEEK_THINKING 只支持 enabled 或 disabled")
+            if not api_key or not base_url or not model_name:
+                raise ValueError("使用 DeepSeek 模型时，请配置 api_key、base_url 和 model")
+            logger.info(f"[ChatModelFactory]构建 DeepSeek 模型：{model_name}")
+            return ChatOpenAI(
+                model=model_name,
+                api_key=api_key,
+                base_url=base_url,
+                temperature=0,
+                extra_body={"thinking": {"type": thinking}},
+            )
 
         if provider in {"mimo", "openai"}:
             api_key = api_key or os.getenv("MIMO_API_KEY") or os.getenv("OPENAI_API_KEY")

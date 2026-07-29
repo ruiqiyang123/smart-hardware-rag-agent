@@ -11,7 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # 单元测试不调用真实 LLM/API，dummy key 仅保证模型实例在导入时可构造
-      DASHSCOPE_API_KEY: dummy
+      CHAT_PROVIDER: deepseek
+      DEEPSEEK_API_KEY: dummy
       # CI 用本地哈希 embedding，避免依赖外部 embedding 服务
       EMBEDDING_PROVIDER: local
     steps:
