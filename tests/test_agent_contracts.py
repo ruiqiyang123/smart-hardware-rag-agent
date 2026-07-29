@@ -54,6 +54,15 @@ class FakeModel:
 
 
 class AgentContractTest(unittest.TestCase):
+    def test_diagnosis_filters_tool_plan_by_category(self):
+        from agent.nodes.diagnosis import allowed_tools
+
+        self.assertEqual(
+            allowed_tools("warranty_service"),
+            {"knowledge_search", "profile", "warranty"},
+        )
+        self.assertNotIn("chain_status", allowed_tools("warranty_service"))
+
     def test_constructor_requires_exactly_one_model_or_runner(self):
         runner = FakeStructuredRunner(triage_result())
         for kwargs in ({}, {"model": FakeModel(runner), "runner": runner}):
@@ -476,6 +485,503 @@ class AgentContractTest(unittest.TestCase):
         }
         state.update(overrides)
         return state
+
+
+class DiagnosisContractTest(unittest.TestCase):
+    @staticmethod
+    def _evidence(**overrides):
+        values = {
+            "evidence_id": "kb:usb:1",
+            "kind": "knowledge",
+            "content": "请重新连接原装数据线。",
+            "source_title": "连接帮助",
+            "source_url": None,
+        }
+        values.update(overrides)
+        return values
+
+    @staticmethod
+    def _answer(**overrides):
+        values = {
+            "outcome": "draft",
+            "diagnosis_summary": "证据支持进行连接排查",
+            "recommended_actions": [
+                {
+                    "action_code": "generic_troubleshooting",
+                    "text": "重新连接原装数据线",
+                    "evidence_refs": ["kb:usb:1"],
+                }
+            ],
+            "evidence_refs": ["kb:usb:1"],
+            "citations": [],
+            "draft_answer": "请重新连接原装数据线。",
+            "remaining_unknowns": [],
+        }
+        values.update(overrides)
+        return values
+
+    @staticmethod
+    def _state(**overrides):
+        values = {
+            "sanitized_input": "设备无法连接",
+            "category": "usb_connection",
+            "risk_level": "low",
+            "risk_flags": [],
+            "missing_fields": [],
+            "requires_human": False,
+            "user_id": "1001",
+        }
+        values.update(overrides)
+        return values
+
+    def _agent(self, plan=None, answer=None, tools=None, **kwargs):
+        from agent.nodes.diagnosis import DiagnosisAgent
+
+        plan = (
+            {"requests": [{"name": "knowledge_search", "query": "USB"}]}
+            if plan is None
+            else plan
+        )
+        answer = self._answer() if answer is None else answer
+        tools = (
+            {"knowledge_search": lambda state, query: [self._evidence()]}
+            if tools is None
+            else tools
+        )
+        return DiagnosisAgent(
+            plan_runner=FakeStructuredRunner(plan),
+            answer_runner=FakeStructuredRunner(answer),
+            tool_registry=tools,
+            **kwargs,
+        )
+
+    def test_allowed_tools_are_exact_and_unknown_category_is_rejected(self):
+        from agent.nodes.diagnosis import allowed_tools
+
+        self.assertEqual(allowed_tools("other"), {"knowledge_search", "profile"})
+        self.assertEqual(
+            allowed_tools("transaction_boundary"),
+            {"knowledge_search", "profile", "chain_status"},
+        )
+        self.assertEqual(allowed_tools("security_incident"), set())
+        self.assertEqual(allowed_tools("security_report"), set())
+        with self.assertRaises(ValueError):
+            allowed_tools("made_up")
+
+    def test_plan_models_are_strict_safe_and_deduplicated(self):
+        from agent.nodes.diagnosis import DiagnosisPlan, ToolRequest
+
+        self.assertEqual(ToolRequest(name="warranty", query=" a1b2 ").query, "a1b2")
+        invalid_requests = (
+            {"name": "write_device", "query": "x"},
+            {"name": "profile", "query": ""},
+            {"name": "profile", "query": "x" * 301},
+            {"name": "profile", "query": "x\x00hidden"},
+            {"name": "profile", "query": "private key: " + "1" * 64},
+            {"name": "profile", "query": "x", "reasoning": "hidden"},
+        )
+        for request in invalid_requests:
+            with self.subTest(request=request), self.assertRaises(ValueError):
+                ToolRequest.model_validate(request)
+        with self.assertRaises(ValueError):
+            DiagnosisPlan(
+                requests=[
+                    ToolRequest(name="profile", query="1001"),
+                    ToolRequest(name="profile", query="1002"),
+                ]
+            )
+        with self.assertRaises(ValueError):
+            DiagnosisPlan.model_validate({"requests": [], "reasoning": "hidden"})
+
+    def test_constructor_supports_model_or_two_runners_and_validates_registry(self):
+        from agent.nodes.diagnosis import DiagnosisAgent, DiagnosisPlan
+        from agent.orchestration.state import DiagnosisResult
+
+        plan_runner = FakeStructuredRunner({"requests": []})
+        answer_runner = FakeStructuredRunner(self._answer())
+
+        class Model:
+            def __init__(self):
+                self.calls = []
+
+            def with_structured_output(inner_self, schema, **kwargs):
+                inner_self.calls.append((schema, kwargs))
+                return plan_runner if schema is DiagnosisPlan else answer_runner
+
+        model = Model()
+        agent = DiagnosisAgent(model=model, tool_registry={"profile": lambda *_: []})
+        self.assertIs(agent.plan_runner, plan_runner)
+        self.assertEqual(
+            model.calls,
+            [
+                (DiagnosisPlan, {"method": "function_calling"}),
+                (DiagnosisResult, {"method": "function_calling"}),
+            ],
+        )
+        invalid = (
+            {},
+            {"model": model, "plan_runner": plan_runner, "answer_runner": answer_runner},
+            {"plan_runner": plan_runner},
+        )
+        for constructor in invalid:
+            with self.subTest(constructor=constructor), self.assertRaises(ValueError):
+                DiagnosisAgent(tool_registry={"profile": lambda *_: []}, **constructor)
+        for registry in ({}, {"unknown": lambda *_: []}, {"profile": object()}):
+            with self.subTest(registry=registry), self.assertRaises(ValueError):
+                DiagnosisAgent(
+                    plan_runner=plan_runner,
+                    answer_runner=answer_runner,
+                    tool_registry=registry,
+                )
+
+    def test_high_risk_human_security_and_missing_fields_short_circuit(self):
+        cases = (
+            (self._state(risk_level="high"), "escalate"),
+            (self._state(risk_flags=["remote_control"]), "escalate"),
+            (self._state(requires_human=True), "escalate"),
+            (self._state(category="security_report"), "escalate"),
+            (self._state(missing_fields=["device_model"]), "need_user"),
+        )
+        for state, expected in cases:
+            plan = FakeStructuredRunner(AssertionError("model must not run"))
+            answer = FakeStructuredRunner(AssertionError("model must not run"))
+            tool_calls = []
+            from agent.nodes.diagnosis import DiagnosisAgent
+
+            agent = DiagnosisAgent(
+                plan_runner=plan,
+                answer_runner=answer,
+                tool_registry={"knowledge_search": lambda *_: tool_calls.append(1)},
+            )
+            with self.subTest(expected=expected, state=state):
+                result = agent.run(state)
+                self.assertEqual(result["outcome"], expected)
+                self.assertEqual(result["draft_answer"], "")
+                self.assertEqual(plan.calls, [])
+                self.assertEqual(answer.calls, [])
+                self.assertEqual(tool_calls, [])
+
+    def test_plan_and_answer_messages_are_json_without_reasoning(self):
+        agent = self._agent()
+        output = agent.run(self._state())
+        plan_payload = json.loads(agent.plan_runner.calls[0][1].content)
+        answer_payload = json.loads(agent.answer_runner.calls[0][1].content)
+        self.assertEqual(plan_payload["sanitized_input"], "设备无法连接")
+        self.assertEqual(
+            plan_payload["allowed_tools"], ["knowledge_search", "profile"]
+        )
+        self.assertEqual(
+            set(answer_payload), {"sanitized_input", "triage", "evidence"}
+        )
+        self.assertEqual(answer_payload["sanitized_input"], "设备无法连接")
+        self.assertNotIn("reasoning", json.dumps(answer_payload))
+        self.assertEqual(output["tool_errors"], [])
+
+    def test_disallowed_missing_registry_and_invalid_special_queries_fail_closed(self):
+        cases = (
+            (
+                self._state(category="warranty_service"),
+                {"requests": [{"name": "chain_status", "query": "ETH"}]},
+                {"chain_status": lambda *_: [self._evidence()]},
+            ),
+            (
+                self._state(category="warranty_service"),
+                {"requests": [{"name": "warranty", "query": "A1B2"}]},
+                {"profile": lambda *_: [self._evidence()]},
+            ),
+            (
+                self._state(category="warranty_service"),
+                {"requests": [{"name": "warranty", "query": "12345"}]},
+                {"warranty": lambda *_: [self._evidence()]},
+            ),
+            (
+                self._state(category="transaction_boundary"),
+                {"requests": [{"name": "chain_status", "query": "DOGE"}]},
+                {"chain_status": lambda *_: [self._evidence()]},
+            ),
+        )
+        for state, plan, tools in cases:
+            with self.subTest(plan=plan), self.assertRaises(ValueError) as captured:
+                self._agent(plan=plan, tools=tools, retries=0).run(state)
+            self.assertNotIn("DOGE", str(captured.exception))
+
+    def test_warranty_and_chain_queries_are_normalized_before_call(self):
+        calls = []
+        warranty_evidence = self._evidence(
+            evidence_id="warranty:A1B2", kind="warranty"
+        )
+        answer = self._answer(
+            recommended_actions=[
+                {
+                    "action_code": "warranty_decision",
+                    "text": "检查模拟保修记录",
+                    "evidence_refs": ["warranty:A1B2"],
+                }
+            ],
+            evidence_refs=["warranty:A1B2"],
+        )
+        self._agent(
+            plan={"requests": [{"name": "warranty", "query": "a1b2"}]},
+            answer=answer,
+            tools={"warranty": lambda state, query: calls.append(query) or [warranty_evidence]},
+        ).run(self._state(category="warranty_service"))
+        chain_evidence = self._evidence(evidence_id="chain:ETH", kind="chain")
+        chain_answer = self._answer(
+            recommended_actions=[
+                {
+                    "action_code": "transaction_check",
+                    "text": "检查模拟链状态",
+                    "evidence_refs": ["chain:ETH"],
+                }
+            ],
+            evidence_refs=["chain:ETH"],
+        )
+        self._agent(
+            plan={"requests": [{"name": "chain_status", "query": "以太坊"}]},
+            answer=chain_answer,
+            tools={"chain_status": lambda state, query: calls.append(query) or [chain_evidence]},
+        ).run(self._state(category="transaction_boundary"))
+        self.assertEqual(calls, ["A1B2", "ETH"])
+
+    def test_tool_exception_and_no_evidence_escalate_without_answer(self):
+        for tool, code in (
+            (
+                lambda *_: (_ for _ in ()).throw(
+                    RuntimeError("raw PIN 123456")
+                ),
+                "tool_failure:knowledge_search",
+            ),
+            (lambda *_: [], "no_evidence"),
+        ):
+            agent = self._agent(tools={"knowledge_search": tool})
+            output = agent.run(self._state())
+            self.assertEqual(output["outcome"], "escalate")
+            self.assertEqual(output["tool_errors"], [code])
+            self.assertEqual(agent.answer_runner.calls, [])
+            self.assertNotIn("123456", json.dumps(output))
+
+    def test_evidence_conflicts_limits_secrets_and_extra_fields_are_rejected(self):
+        conflict_plan = {
+            "requests": [
+                {"name": "knowledge_search", "query": "USB"},
+                {"name": "profile", "query": "1001"},
+            ]
+        }
+        conflict_tools = {
+            "knowledge_search": lambda *_: [self._evidence(content="one")],
+            "profile": lambda *_: [self._evidence(content="two")],
+        }
+        cases = (
+            (conflict_plan, conflict_tools),
+            (
+                None,
+                {
+                    "knowledge_search": lambda *_: [
+                        self._evidence(evidence_id=f"kb:{i}")
+                        for i in range(17)
+                    ]
+                },
+            ),
+            (
+                None,
+                {
+                    "knowledge_search": lambda *_: [
+                        self._evidence(content="private key: " + "1" * 64)
+                    ]
+                },
+            ),
+            (
+                None,
+                {"knowledge_search": lambda *_: [dict(self._evidence(), reasoning="hidden")]},
+            ),
+        )
+        for plan, tools in cases:
+            with self.subTest(plan=plan), self.assertRaises(ValueError):
+                self._agent(plan=plan, tools=tools, retries=0).run(self._state())
+
+    def test_evidence_source_url_rejects_unsafe_or_invalid_authorities(self):
+        unsafe_urls = (
+            "http://support.example/help",
+            "https://user@support.example/help",
+            "https://support.example:444/help",
+            "https://localhost/help",
+            "https://127.0.0.1/help",
+            "https://support.example /help",
+            "https://support.example\\@evil.example/help",
+            "https://support.example/%0aevil",
+        )
+        for source_url in unsafe_urls:
+            tools = {
+                "knowledge_search": lambda *_, source_url=source_url: [
+                    self._evidence(source_url=source_url)
+                ]
+            }
+            with self.subTest(source_url=source_url), self.assertRaises(ValueError):
+                self._agent(tools=tools, retries=0).run(self._state())
+
+    def test_unknown_refs_citation_mismatch_missing_citation_and_none_url_rejected(self):
+        evidence = self._evidence(source_url="https://support.example/help")
+        base_tools = {"knowledge_search": lambda *_: [evidence]}
+        cases = (
+            self._answer(
+                evidence_refs=["kb:unknown"],
+                recommended_actions=[
+                    {
+                        "action_code": "generic_troubleshooting",
+                        "text": "安全操作",
+                        "evidence_refs": ["kb:unknown"],
+                    }
+                ],
+            ),
+            self._answer(
+                citations=[
+                    {
+                        "source_id": "kb:usb:1",
+                        "source_title": "错误标题",
+                        "source_url": "https://support.example/help",
+                    }
+                ]
+            ),
+            self._answer(citations=[]),
+        )
+        for answer in cases:
+            with self.subTest(answer=answer), self.assertRaises(ValueError):
+                self._agent(answer=answer, tools=base_tools, retries=0).run(self._state())
+        none_url_answer = self._answer(
+            citations=[
+                {
+                    "source_id": "kb:usb:1",
+                    "source_title": "连接帮助",
+                    "source_url": "https://invented.example",
+                }
+            ]
+        )
+        with self.assertRaises(ValueError):
+            self._agent(answer=none_url_answer, retries=0).run(self._state())
+
+    def test_runner_dict_extra_prompt_cwd_input_safety_and_tool_state_copy(self):
+        extra_plan = {"requests": [], "reasoning": "hidden"}
+        with self.assertRaises(ValueError):
+            self._agent(plan=extra_plan, retries=0).run(self._state())
+
+        original = Path.cwd()
+        agent = None
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                agent = self._agent()
+                agent.run(self._state())
+            finally:
+                os.chdir(original)
+        self.assertIn("只依据工具返回证据", agent.prompt)
+
+        import agent.nodes.diagnosis as diagnosis_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            prompt_target = Path(directory) / "target.txt"
+            prompt_target.write_text("只依据安全证据生成结构化诊断。", encoding="utf-8")
+            prompt_link = Path(directory) / "linked-prompt.txt"
+            prompt_link.symlink_to(prompt_target)
+            with patch.object(
+                diagnosis_module, "_PROMPT_PATH", prompt_link
+            ), self.assertRaises(RuntimeError):
+                self._agent()
+
+        invalid_states = (
+            self._state(sanitized_input="x\x00hidden"),
+            self._state(sanitized_input="private key: " + "1" * 64),
+            self._state(category="unknown"),
+            self._state(risk_level="unknown"),
+            self._state(risk_flags="remote_control"),
+            self._state(missing_fields=["unknown"]),
+            self._state(requires_human=1),
+        )
+        for state in invalid_states:
+            with self.subTest(state=state), self.assertRaises((TypeError, ValueError)):
+                self._agent().run(state)
+
+        state = self._state()
+
+        def mutate(tool_state, query):
+            tool_state["user_id"] = "changed"
+            return [self._evidence()]
+
+        self._agent(tools={"knowledge_search": mutate}).run(state)
+        self.assertEqual(state["user_id"], "1001")
+
+        normalized_answer = self._answer()
+        normalized_answer["recommended_actions"][0]["text"] = "  重新\n连接原装数据线  "
+        normalized = self._agent(answer=normalized_answer).run(self._state())
+        self.assertEqual(
+            normalized["recommended_actions"][0]["text"], "重新 连接原装数据线"
+        )
+
+    def test_valid_https_knowledge_citation_is_bound_exactly(self):
+        source_url = "https://support.example/help"
+        evidence = self._evidence(source_url=source_url)
+        answer = self._answer(
+            citations=[
+                {
+                    "source_id": "kb:usb:1",
+                    "source_title": "连接帮助",
+                    "source_url": source_url,
+                }
+            ]
+        )
+        output = self._agent(
+            answer=answer,
+            tools={"knowledge_search": lambda *_: [evidence]},
+        ).run(self._state())
+        self.assertEqual(output["citations"][0]["source_url"], source_url)
+
+    def test_timeout_is_not_retried_and_successful_warranty_draft_is_bound(self):
+        release = threading.Event()
+        calls = []
+
+        def block():
+            calls.append(1)
+            release.wait()
+            return {"requests": []}
+
+        try:
+            with self.assertRaises(TimeoutError):
+                self._agent(
+                    plan=block,
+                    timeout_seconds=0.01,
+                    retries=3,
+                ).run(self._state())
+            self.assertEqual(calls, [1])
+        finally:
+            release.set()
+            time.sleep(0.02)
+
+        evidence = self._evidence(
+            evidence_id="warranty:A1B2",
+            kind="warranty",
+            content="模拟保修记录有效",
+            source_title="模拟保修记录",
+        )
+        answer = self._answer(
+            diagnosis_summary="模拟保修记录支持继续核验",
+            recommended_actions=[
+                {
+                    "action_code": "warranty_decision",
+                    "text": "核验购买凭证",
+                    "evidence_refs": ["warranty:A1B2"],
+                }
+            ],
+            evidence_refs=["warranty:A1B2"],
+            draft_answer="模拟记录显示可继续核验购买凭证。",
+        )
+        output = self._agent(
+            plan={"requests": [{"name": "warranty", "query": "a1b2"}]},
+            answer=answer,
+            tools={"warranty": lambda *_: [evidence]},
+        ).run(self._state(category="warranty_service"))
+        self.assertEqual(output["outcome"], "draft")
+        self.assertEqual(output["evidence_refs"], ["warranty:A1B2"])
+        self.assertEqual(output["evidence"], [evidence])
+        self.assertEqual(output["tool_errors"], [])
 
 
 if __name__ == "__main__":

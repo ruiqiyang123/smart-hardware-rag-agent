@@ -3,13 +3,13 @@
 import copy
 import json
 import math
-import stat
 from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from agent.orchestration.invoke import invoke_with_policy
+from agent.nodes.prompt_loader import load_safe_prompt
 from agent.orchestration.state import (
     MissingField,
     RiskFlag,
@@ -20,7 +20,6 @@ from agent.security.secrets import contains_unredacted_secret
 
 
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "triage_prompt.txt"
-_MAX_PROMPT_SIZE = 16 * 1024
 _CATEGORY_VALUES = frozenset(
     {
         "power",
@@ -152,31 +151,7 @@ def _contains_forbidden_control(value: str) -> bool:
 
 
 def _load_prompt(path: Path) -> str:
-    try:
-        metadata = path.stat()
-    except OSError:
-        raise RuntimeError("Triage prompt 不可用") from None
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_size <= 0
-        or metadata.st_size > _MAX_PROMPT_SIZE
-    ):
-        raise RuntimeError("Triage prompt 不可用") from None
-    try:
-        with path.open("r", encoding="utf-8", newline="") as prompt_file:
-            prompt = prompt_file.read(_MAX_PROMPT_SIZE + 1)
-    except (OSError, UnicodeError):
-        raise RuntimeError("Triage prompt 不可用") from None
-    if (
-        len(prompt) > _MAX_PROMPT_SIZE
-        or _contains_forbidden_control(prompt)
-        or contains_unredacted_secret(prompt)
-    ):
-        raise ValueError("Triage prompt 内容非法") from None
-    prompt = prompt.strip()
-    if not prompt:
-        raise ValueError("Triage prompt 内容非法") from None
-    return prompt
+    return load_safe_prompt(path, "Triage")
 
 
 def _safe_history(value: object) -> list[dict[str, str]]:
