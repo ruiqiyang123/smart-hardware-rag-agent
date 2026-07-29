@@ -413,6 +413,28 @@ class AgentContractTest(unittest.TestCase):
         self.assertNotIn("chain_of_thought", payload)
         self.assertNotIn("reasoning", payload)
 
+    def test_triage_schema_documents_required_fields_authority(self):
+        properties = TriageResult.model_json_schema()["properties"]
+        description = properties["missing_fields"]["description"]
+
+        self.assertIn("required_fields", description)
+        self.assertIn("分类未出现在", description)
+        self.assertIn("空数组", description)
+        route_description = properties["suggested_route"]["description"]
+        self.assertIn("missing_fields 非空", route_description)
+        self.assertIn("不得使用 ask_user", route_description)
+
+    def test_triage_prompt_forbids_inventing_unconfigured_missing_fields(self):
+        agent = TriageAgent(
+            runner=FakeStructuredRunner(triage_result()),
+            required_fields={"firmware_repair": ["device_model"]},
+        )
+
+        self.assertIn("required_fields 是必要字段的唯一权威白名单", agent.prompt)
+        self.assertIn("category 未出现在 required_fields", agent.prompt)
+        self.assertIn("不得凭常识新增必要字段", agent.prompt)
+        self.assertIn("missing_fields 为空时不得使用 ask_user", agent.prompt)
+
     def test_prompt_load_is_independent_of_current_working_directory(self):
         runner = FakeStructuredRunner(triage_result())
         original = Path.cwd()
@@ -676,6 +698,32 @@ class DiagnosisContractTest(unittest.TestCase):
         self.assertEqual(answer_payload["sanitized_input"], "设备无法连接")
         self.assertNotIn("reasoning", json.dumps(answer_payload))
         self.assertEqual(output["tool_errors"], [])
+
+    def test_diagnosis_schema_and_prompt_bind_draft_to_no_unknowns(self):
+        from agent.orchestration.state import DiagnosisAction, DiagnosisResult
+
+        properties = DiagnosisResult.model_json_schema()["properties"]
+        outcome_description = properties["outcome"]["description"]
+        unknowns_description = properties["remaining_unknowns"]["description"]
+        action_description = DiagnosisAction.model_json_schema()["properties"][
+            "action_code"
+        ]["description"]
+
+        self.assertIn("draft", outcome_description)
+        self.assertIn("remaining_unknowns", outcome_description)
+        self.assertIn("回答生成阶段", unknowns_description)
+        self.assertIn("空数组", unknowns_description)
+        self.assertIn("warranty_service", action_description)
+        self.assertIn("warranty_decision", action_description)
+        self.assertIn("其他普通分类", action_description)
+        self.assertIn("generic_troubleshooting", action_description)
+
+        prompt = self._agent().prompt
+        self.assertIn("进入回答生成阶段表示必要字段已经齐全", prompt)
+        self.assertIn("outcome=draft 时 remaining_unknowns 必须为空数组", prompt)
+        self.assertIn("warranty_decision 只能用于 warranty_service", prompt)
+        self.assertIn("其他普通分类只能使用 generic_troubleshooting", prompt)
+
     def test_disallowed_missing_registry_and_invalid_special_queries_fail_closed(self):
         cases = (
             (

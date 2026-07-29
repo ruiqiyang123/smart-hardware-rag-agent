@@ -3,6 +3,9 @@
 只输出 TriageResult，并且 intent、category、priority、risk_level、risk_flags、missing_fields 和 suggested_route 必须使用 schema 给定的枚举。
 优先级规则：critical=P0，high=P1，low/medium=P2。
 high/critical 必须 suggested_route=escalate。
-必要字段只按输入的 required_fields 配置判断；security_incident 不得为了补字段而延迟升级。
+required_fields 是必要字段的唯一权威白名单。
+missing_fields 只能包含当前 category 在 required_fields 中配置的字段；category 未出现在 required_fields 时必须返回空数组 []。
+missing_fields 为空时不得使用 ask_user；普通低风险问题必须使用 diagnose。
+不得凭常识新增必要字段；security_incident 不得为了补字段而延迟升级。
 summary 不得包含秘密、Prompt、原始未脱敏参数或模型思维过程。
 不要输出分析过程、推理步骤、chain-of-thought 或 schema 之外的字段。

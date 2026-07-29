@@ -19,11 +19,14 @@
 
 - `agent/orchestration/state.py`
 - `prompts/triage_prompt.txt`
+- `prompts/diagnosis_prompt.txt`
 
 1. 为 `TriageResult.missing_fields` 增加靠近 Tool Calling 参数的 Schema 描述。
 2. 强化分诊 Prompt 的白名单与空数组规则。
-3. 不修改 `agent/nodes/triage.py` 的严格校验，不修改 `config/orchestration.yml`。
-4. 运行定向 Agent/Graph 测试。
+3. 完整链路若暴露同类结构化一致性问题，只在对应 Schema/Prompt 层补充明确描述；不得放宽校验。
+4. 为 Diagnosis 回答阶段声明 `outcome=draft` 必须与 `remaining_unknowns=[]` 一致。
+5. 不修改 `agent/nodes/triage.py` 的严格校验，不修改 `config/orchestration.yml`。
+6. 运行定向 Agent/Graph 测试。
 
 ## 任务 3：真实 DeepSeek 与完整回归
 

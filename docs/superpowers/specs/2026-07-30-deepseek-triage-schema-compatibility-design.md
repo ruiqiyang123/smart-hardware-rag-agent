@@ -1,7 +1,7 @@
 # DeepSeek 分诊 Schema 兼容修复设计
 
 **日期：** 2026-07-30  
-**状态：** 用户已批准 A 方案，等待书面规格复核  
+**状态：** 用户已批准书面规格，兼容修复已完成本地验证
 **目标：** 修复 DeepSeek V4 Flash 在普通售后问题中生成配置外 `missing_fields`、导致分诊 fail-closed 的兼容问题，同时保留现有安全校验和人工升级边界。
 
 ## 1. 问题与证据
@@ -67,6 +67,12 @@
 
 `agent/nodes/triage.py` 中对配置外必要字段的拒绝逻辑保持不变。修复目标是让 DeepSeek 更稳定地产生合规输出，而不是降低验证标准。
 
+### 4.4 完整链路验收发现：Diagnosis 结果一致性
+
+真实 V2 回归确认 Triage 修复生效后，DeepSeek 在 Diagnosis 回答阶段先生成了 `outcome=draft` 与非空 `remaining_unknowns` 的矛盾组合，随后又为 `power` 分类生成了只应由 `warranty_service` 使用的 `warranty_decision` 人工门禁动作。该阶段只会在 Triage 已确认必要字段齐全后运行，因此继续采用同一 A 方案：为 `DiagnosisResult.outcome`、`remaining_unknowns` 和 `DiagnosisAction.action_code` 增加 Schema 描述，并在 `diagnosis_prompt.txt` 明确 `draft` 必须使用空数组、动作代码必须匹配分类。
+
+这属于完整链路验收中发现的同类结构化输出兼容问题，不修改 Diagnosis 校验、工具白名单、证据绑定或安全升级规则。
+
 ## 5. 数据流
 
 1. Runtime 将脱敏后的问题、入口风险和 `required_fields` 传给 Triage Agent。
@@ -82,6 +88,7 @@
 
 - `TriageResult` JSON Schema 的 `missing_fields` 包含权威映射描述。
 - 分诊 Prompt 明确包含“分类不在 `required_fields` 时返回空数组”的规则。
+- `DiagnosisResult` JSON Schema 与 Prompt 明确 `outcome=draft` 时 `remaining_unknowns=[]`，并约束 `action_code` 与分类的适用关系。
 - 现有测试继续证明配置外 `missing_fields` 会抛出错误，防止安全约束被弱化。
 - Model factory、Provider 配置、Graph、人工接管、恢复和全量测试继续通过。
 - 运行 `git diff --check` 与 Python 编译检查。

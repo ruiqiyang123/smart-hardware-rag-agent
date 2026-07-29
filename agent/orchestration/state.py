@@ -114,8 +114,18 @@ class TriageResult(StrictModel):
     priority: Literal["P0", "P1", "P2"]
     risk_level: RiskLevel
     risk_flags: List[RiskFlag]
-    missing_fields: List[MissingField]
-    suggested_route: Literal["ask_user", "diagnose", "escalate"]
+    missing_fields: List[MissingField] = Field(
+        description=(
+            "只能包含输入 required_fields 中当前 category 对应列表里的字段；"
+            "如果当前分类未出现在 required_fields 映射中，必须返回空数组。"
+        )
+    )
+    suggested_route: Literal["ask_user", "diagnose", "escalate"] = Field(
+        description=(
+            "只有 missing_fields 非空时才可使用 ask_user；missing_fields 为空的普通"
+            "低风险问题不得使用 ask_user，应使用 diagnose；高风险问题使用 escalate。"
+        )
+    )
     summary: str = Field(min_length=1, max_length=300)
 
     @model_validator(mode="after")
@@ -168,7 +178,14 @@ class DiagnosisAction(StrictModel):
         "wallet_recovery",
         "warranty_decision",
         "transaction_check",
-    ]
+    ] = Field(
+        description=(
+            "按 triage category 选择：warranty_decision 仅用于 warranty_service；"
+            "transaction_check 仅用于 transaction_boundary；wallet_recovery 仅用于"
+            "backup_recovery 或 device_loss_damage；device_reset 和 bootloader_recovery"
+            "仅用于 firmware_repair。其他普通分类只能使用 generic_troubleshooting。"
+        )
+    )
     text: str = Field(min_length=1, max_length=300)
     evidence_refs: List[EvidenceRef] = Field(min_length=1)
 
@@ -179,13 +196,23 @@ class DiagnosisAction(StrictModel):
 
 
 class DiagnosisResult(StrictModel):
-    outcome: Literal["draft", "need_user", "escalate"]
+    outcome: Literal["draft", "need_user", "escalate"] = Field(
+        description=(
+            "有充分证据生成回答时使用 draft，且 remaining_unknowns 必须为空；"
+            "仅在确有必要未知字段时使用 need_user；无法安全支持时使用 escalate。"
+        )
+    )
     diagnosis_summary: str = Field(min_length=1, max_length=500)
     recommended_actions: List[DiagnosisAction] = Field(max_length=6)
     evidence_refs: List[EvidenceRef]
     citations: List[Citation]
     draft_answer: str = Field(max_length=2000)
-    remaining_unknowns: List[MissingField]
+    remaining_unknowns: List[MissingField] = Field(
+        description=(
+            "回答生成阶段表示必要字段已经齐全；outcome 为 draft 或 escalate 时必须"
+            "返回空数组。只有 outcome=need_user 时才可列出必要未知字段。"
+        )
+    )
 
     @model_validator(mode="after")
     def validate_outcome(self):
