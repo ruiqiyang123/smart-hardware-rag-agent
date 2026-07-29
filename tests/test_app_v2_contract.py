@@ -26,6 +26,47 @@ class AppV2ContractTest(unittest.TestCase):
         self.assertIn('"客户对话"', self.source)
         self.assertIn('"工单工作台"', self.source)
 
+    def test_explicit_empty_environment_secret_does_not_probe_streamlit_secrets(self):
+        runtime_secret = self.function_source("_runtime_secret")
+
+        self.assertIn("if name in os.environ", runtime_secret)
+        self.assertLess(
+            runtime_secret.index("if name in os.environ"),
+            runtime_secret.index("st.secrets.get"),
+        )
+
+    def test_provider_secrets_are_loaded_only_inside_selected_provider_branches(self):
+        provider_loader = self.function_source("_load_provider_runtime_config")
+        for provider, secret in (
+            ("deepseek", "DEEPSEEK_API_KEY"),
+            ("mimo", "MIMO_API_KEY"),
+            ("dashscope", "DASHSCOPE_API_KEY"),
+        ):
+            self.assertIn(f'provider == "{provider}"', provider_loader)
+            self.assertIn(f'_runtime_secret("{secret}")', provider_loader)
+
+        top_level_provider_secret_calls = []
+        for node in self.tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            for call in (
+                item for item in ast.walk(node) if isinstance(item, ast.Call)
+            ):
+                if not (
+                    isinstance(call.func, ast.Name)
+                    and call.func.id == "_runtime_secret"
+                    and call.args
+                    and isinstance(call.args[0], ast.Constant)
+                ):
+                    continue
+                name = call.args[0].value
+                if isinstance(name, str) and name.startswith(
+                    ("DEEPSEEK_", "MIMO_", "DASHSCOPE_")
+                ):
+                    top_level_provider_secret_calls.append(name)
+
+        self.assertEqual(top_level_provider_secret_calls, [])
+
     def test_v2_is_default_and_v1_is_only_explicit_compatibility_path(self):
         self.assertIn('or "v2"', self.source)
         self.assertIn('AGENT_VERSION == "v1"', self.source)

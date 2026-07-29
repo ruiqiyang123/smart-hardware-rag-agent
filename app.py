@@ -36,6 +36,7 @@ from utils.model_config import (
     DEFAULT_MIMO_BASE_URL,
     DEFAULT_MIMO_CHAT_MODEL,
     build_chat_config,
+    normalize_provider,
 )
 from utils.session_context import set_location, set_user_id
 from utils.ui_command_state import (
@@ -86,9 +87,9 @@ st.caption("LangGraph 多 Agent 工单协同 · 安全分诊、证据诊断、�
 
 def _runtime_secret(name: str) -> Optional[str]:
     """读取环境变量 / Streamlit Secrets，避免 Cloud 与本地配置方式不一致。"""
-    value = os.getenv(name)
-    if value:
-        return value
+    if name in os.environ:
+        value = os.environ[name]
+        return value if value else None
 
     try:
         secret_value = st.secrets.get(name)
@@ -164,34 +165,71 @@ def _escape_markdown_text(value: str) -> str:
 def _escape_markdown_url(value: str) -> str:
     return quote(value, safe=":/?#@!$&'*+,;=%")
 
-selected_provider = (_runtime_secret("CHAT_PROVIDER") or "deepseek").strip().lower()
-dashscope_key = _runtime_secret("DASHSCOPE_API_KEY")
-mimo_key = _runtime_secret("MIMO_API_KEY")
-mimo_base_url = _runtime_secret("MIMO_BASE_URL") or DEFAULT_MIMO_BASE_URL
-mimo_model_name = _runtime_secret("MIMO_CHAT_MODEL") or DEFAULT_MIMO_CHAT_MODEL
-deepseek_key = _runtime_secret("DEEPSEEK_API_KEY")
-deepseek_base_url = (
-    _runtime_secret("DEEPSEEK_BASE_URL") or DEFAULT_DEEPSEEK_BASE_URL
+def _load_provider_runtime_config(provider: str) -> dict:
+    """只读取当前 Provider 的 Secrets，避免泄漏或无关配置告警。"""
+    provider = normalize_provider(provider)
+    config = {
+        "provider": provider,
+        "dashscope_key": None,
+        "mimo_key": None,
+        "mimo_base_url": DEFAULT_MIMO_BASE_URL,
+        "mimo_model_name": DEFAULT_MIMO_CHAT_MODEL,
+        "deepseek_key": None,
+        "deepseek_base_url": DEFAULT_DEEPSEEK_BASE_URL,
+        "deepseek_model_name": DEFAULT_DEEPSEEK_CHAT_MODEL,
+        "deepseek_thinking": DEFAULT_DEEPSEEK_THINKING,
+    }
+    if provider == "deepseek":
+        config.update(
+            deepseek_key=_runtime_secret("DEEPSEEK_API_KEY"),
+            deepseek_base_url=(
+                _runtime_secret("DEEPSEEK_BASE_URL") or DEFAULT_DEEPSEEK_BASE_URL
+            ),
+            deepseek_model_name=(
+                _runtime_secret("DEEPSEEK_CHAT_MODEL")
+                or DEFAULT_DEEPSEEK_CHAT_MODEL
+            ),
+            deepseek_thinking=(
+                _runtime_secret("DEEPSEEK_THINKING") or DEFAULT_DEEPSEEK_THINKING
+            ),
+        )
+    elif provider == "mimo":
+        config.update(
+            mimo_key=_runtime_secret("MIMO_API_KEY"),
+            mimo_base_url=(
+                _runtime_secret("MIMO_BASE_URL") or DEFAULT_MIMO_BASE_URL
+            ),
+            mimo_model_name=(
+                _runtime_secret("MIMO_CHAT_MODEL") or DEFAULT_MIMO_CHAT_MODEL
+            ),
+        )
+    elif provider == "dashscope":
+        config["dashscope_key"] = _runtime_secret("DASHSCOPE_API_KEY")
+    return config
+
+
+provider_runtime = _load_provider_runtime_config(
+    (_runtime_secret("CHAT_PROVIDER") or "deepseek").strip().lower()
 )
-deepseek_model_name = (
-    _runtime_secret("DEEPSEEK_CHAT_MODEL") or DEFAULT_DEEPSEEK_CHAT_MODEL
-)
-deepseek_thinking = (
-    _runtime_secret("DEEPSEEK_THINKING") or DEFAULT_DEEPSEEK_THINKING
-)
+selected_provider = provider_runtime["provider"]
+dashscope_key = provider_runtime["dashscope_key"]
+mimo_key = provider_runtime["mimo_key"]
+mimo_base_url = provider_runtime["mimo_base_url"]
+mimo_model_name = provider_runtime["mimo_model_name"]
+deepseek_key = provider_runtime["deepseek_key"]
+deepseek_base_url = provider_runtime["deepseek_base_url"]
+deepseek_model_name = provider_runtime["deepseek_model_name"]
+deepseek_thinking = provider_runtime["deepseek_thinking"]
 
 if selected_provider == "deepseek":
     provider_label = "DeepSeek"
     selected_model_name = deepseek_model_name
-elif selected_provider in {"mimo", "openai"}:
+elif selected_provider == "mimo":
     provider_label = "MiMo"
     selected_model_name = mimo_model_name
-elif selected_provider in {"dashscope", "qwen", "tongyi"}:
+elif selected_provider == "dashscope":
     provider_label = "DashScope"
     selected_model_name = rag_conf["chat_model_name"]
-else:
-    provider_label = "Unsupported"
-    selected_model_name = selected_provider
 
 with st.sidebar:
     st.caption(f"模型：{provider_label} · `{selected_model_name}`")

@@ -403,6 +403,18 @@ class DemoReadinessTest(unittest.TestCase):
     def test_root_license_file_is_not_exposed(self):
         self.assertFalse((ROOT / "LICENSE").exists())
 
+    def test_runtime_ticket_and_checkpoint_databases_are_gitignored(self):
+        for relative_path in (
+            "data/keyguard_v2.db",
+            "data/keyguard_v2_checkpoints.sqlite3",
+        ):
+            completed = subprocess.run(
+                ["git", "check-ignore", "-q", relative_path],
+                cwd=ROOT,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, relative_path)
+
 
 if __name__ == "__main__":
     unittest.main()
