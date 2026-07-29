@@ -1,70 +1,100 @@
 <div align="center">
 
-# KeyGuard 2.0｜多 Agent 硬件钱包售后工单协同系统
+# 🔐 KeyGuard 2.0｜多 Agent 硬件钱包售后工单协同系统
 
-**一个可本地复现、可观测、带安全边界与人工接管的 LangGraph 工单编排 Demo**
+**面向多 Agent 初学者与 AI 应用岗位的可运行项目**
 
-[![Python](https://img.shields.io/badge/Python-3.11-blue)](https://www.python.org/)
+用 LangGraph 把 Triage、Diagnosis、Review 三个 Agent 编排成一条可暂停、可恢复、可审计的售后工单流程。
+
+[![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-1.0-orange)](https://github.com/langchain-ai/langgraph)
-[![Streamlit](https://img.shields.io/badge/Streamlit-1.40-red)](https://streamlit.io/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-1.40-red?logo=streamlit)](https://streamlit.io/)
+[![CI](https://github.com/ruiqiyang123/ai-hardware-cs-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/ruiqiyang123/ai-hardware-cs-agent/actions/workflows/ci.yml)
 
-[在线体验](https://ai-hardware-cs-agent.streamlit.app/) · [部署说明](./DEPLOYMENT.md) · [5 分钟演示脚本](./docs/DEMO_SCRIPT.md)
+[🚀 在线体验](https://ai-hardware-cs-agent.streamlit.app/) · [🎬 5 分钟演示](./docs/DEMO_SCRIPT.md) · [📦 部署说明](./DEPLOYMENT.md)
 
 </div>
 
-## 项目定位
+---
 
-KeyGuard 2.0 把“模型回答一个问题”升级成“多个职责受限的 Agent 协同处理一张售后工单”。系统用虚构品牌和模拟数据演示硬件钱包的蓝牙连接、固件修复、敏感信息泄露、保修判断等流程；它不接触真实客户或真实资产，也不是生产客服系统。
+## 📖 目录
 
-V2 默认走显式 LangGraph `StateGraph`：先在写入数据库前清理敏感信息，再由 Triage Agent、Diagnosis Agent、Review Agent 分工处理，最后经过确定性策略检查。遇到高风险内容、需要用户补充信息或需要设备重置等动作时，流程停在可解释的状态，等待用户或人工操作员继续。
+1. [这个项目是什么](#-这个项目是什么)
+2. [系统架构：一张工单如何流转](#-系统架构一张工单如何流转)
+3. [为什么是三个 Agent](#-为什么是三个-agent)
+4. [Router 为什么不是第四个 Agent](#-router-为什么不是第四个-agent)
+5. [安全、可靠性与人工接管](#-安全可靠性与人工接管)
+6. [四条推荐演示路径](#-四条推荐演示路径)
+7. [快速开始](#-快速开始)
+8. [测试与评测](#-测试与评测)
+9. [项目结构](#-项目结构)
+10. [面试高频问题](#-面试高频问题)
+11. [简历写法与项目边界](#-简历写法与项目边界)
 
-在线地址展示的是所配置分支的部署结果，行为取决于部署提交、Secrets 和持久化环境，不能据此断言线上部署已经同步本仓库的 V2 代码。需要核验完整链路时，请按“本地启动”复现。
+---
 
-## V1 → V2
+## 🤔 这个项目是什么？
 
-| 维度 | V1：单 ReAct 对话 | V2：工单编排 |
+### 用一句话解释
+
+> 普通 AI 客服让一个模型回答全部问题；KeyGuard 让三个职责受限的 Agent 分工处理一张工单，并由确定性代码决定流程何时继续、暂停或转人工。
+
+KeyGuard 使用虚构硬件钱包品牌和模拟业务数据，演示蓝牙连接、固件修复、敏感信息泄露、保修判断等售后场景。它不连接真实钱包、资产、厂商售后或区块链节点。
+
+### 它解决了什么问题？
+
+| 常见 Agent Demo 问题 | 常见做法 | KeyGuard 2.0 |
 |---|---|---|
-| 核心对象 | 一段聊天上下文 | 带版本、状态和审计事件的工单 |
-| 决策方式 | 模型在一次 ReAct 循环中选择工具 | 三个 Agent 分工，Router 用确定性代码决定下一跳 |
-| 流程状态 | 隐含在消息历史中 | 7 个显式业务状态，可暂停、恢复和审计 |
-| 安全控制 | Prompt 约束为主 | Ingress Guard 前置脱敏 + Policy Guard 输出校验 + 风险粘性 |
-| 返工边界 | 无独立次数约束 | Review 最多一次返工，防止图循环失控 |
-| 人工协同 | 以聊天回答为主 | 工作台执行批准、编辑后发送、追问用户、拒绝 |
-| 持久化 | 对话与档案 | 工单 SQLite + LangGraph checkpoint SQLite |
-| 兼容性 | `KEYGUARD_AGENT_VERSION=v1` 可保留旧链路 | 默认 `KEYGUARD_AGENT_VERSION=v2` |
+| 模型决定全部流程 | 一次 ReAct 循环自由选择工具 | Router 使用确定性规则控制下一跳 |
+| 信息不足时仍然回答 | 依赖 Prompt 提醒模型不要猜 | 进入 `pending_user`，补充信息后恢复 |
+| 敏感信息进入历史 | 只在最终回答中隐藏 | Ingress Guard 在持久化之前脱敏 |
+| 高风险动作自动执行 | 继续让模型生成步骤 | 进入 `escalated` 和人工工作台 |
+| Agent 反复返工 | 没有独立循环边界 | Review 最多退回一次，再失败转人工 |
+| 中断后重新开始 | 对话状态只在内存中 | 工单数据库与 checkpoint 分离持久化 |
+| 工具事实被自由改写 | 工具结果直接混进模型上下文 | Tool 返回事实，Review 检查证据和引用 |
 
-## 系统架构
+### V1 → V2
+
+| 维度 | V1：单 ReAct 客服 | V2：多 Agent 工单编排 |
+|---|---|---|
+| 核心对象 | 一段聊天消息 | 有版本、状态和审计事件的工单 |
+| 职责边界 | 一个 Agent 理解、查证和回答 | Triage、Diagnosis、Review 分工 |
+| 控制流 | 隐含在模型决策中 | LangGraph + 确定性 Router |
+| 中断恢复 | 主要依赖消息历史 | SQLite 工单 + 独立 checkpoint |
+| 人工协同 | 文字上建议“转人工” | 可执行的操作员工作台 |
+| 安全边界 | Prompt 约束为主 | 入站脱敏、风险粘性、出站策略门禁 |
+
+---
+
+## 🏗 系统架构：一张工单如何流转
 
 ```mermaid
 flowchart LR
-    U["用户 / 客户对话"] --> IG["Ingress Guard<br/>敏感信息脱敏"]
-    IG --> TS["Ticket Store<br/>工单与审计事件"]
-    TS --> T["Triage Agent<br/>分类、风险、缺失字段"]
-    T --> R1{"确定性 Triage Router"}
-    R1 -->|信息不足| PU["pending_user"]
-    R1 -->|高风险| ES["escalated"]
-    R1 -->|可诊断| D["Diagnosis Agent<br/>证据检索与方案生成"]
-    D --> K["只读 Tools<br/>知识 / 档案 / 保修 / 链状态"]
-    K --> D
+    U["用户 / 客户对话"] --> IG["Ingress Guard<br/>持久化前脱敏"]
+    IG --> DB["Ticket Store<br/>工单与审计事件"]
+    DB --> T["Triage Agent<br/>分类、风险、缺失字段"]
+    T --> TR{"Triage Router"}
+    TR -->|信息不足| PU["pending_user<br/>等待用户补充"]
+    TR -->|高风险| ES["escalated<br/>人工接管"]
+    TR -->|可以诊断| D["Diagnosis Agent<br/>检索证据、生成方案"]
+    D <--> TOOLS["只读 Tools<br/>RAG / 档案 / 保修 / 链状态"]
     D --> R2{"确定性 Diagnosis Router"}
     R2 -->|信息仍不足| PU
     R2 -->|需要人工动作| ES
-    R2 -->|可审查| RV["Review Agent<br/>证据、安全、可执行性"]
+    R2 -->|形成草稿| RV["Review Agent<br/>证据、安全、可执行性"]
     RV --> R3{"确定性 Review Router"}
     R3 -->|一次返工| D
     R3 -->|升级人工| ES
     R3 -->|审查通过| PG["Policy Guard<br/>最终确定性校验"]
     PG -->|通过| OK["resolved"]
     PG -->|阻断| ES
-    PU -->|用户补充后重新分诊| T
+    PU -->|补充非敏感信息| T
     ES --> WB["工单工作台 / HITL"]
-    WB -->|批准或编辑后发送| OK
     WB -->|追问| PU
-    CP[("LangGraph Checkpoint<br/>节点执行期间持续记录")] -.仅从暂停态恢复.-> PU
-    CP -.仅从暂停态恢复.-> ES
+    WB -->|批准或编辑后发送| OK
+    CP[("LangGraph Checkpoint")] -. "仅从暂停态恢复" .-> PU
+    CP -. "仅从暂停态恢复" .-> ES
 ```
-
-Checkpoint 会在节点执行期间持续记录图状态，但**命令恢复入口只接受 `pending_user` 和 `escalated`** 两个暂停态，不能任意从 Triage、Diagnosis 或 Review 节点恢复。
 
 ### 七状态工单图
 
@@ -73,16 +103,16 @@ stateDiagram-v2
     [*] --> new
     new --> triaged: Triage 完成
     new --> escalated: 入口风险门禁
-    triaged --> pending_user: 缺少必要信息
-    triaged --> escalated: 高风险或需人工
-    triaged --> diagnosing: 信息足够
-    diagnosing --> pending_user: 诊断仍缺信息
+    triaged --> pending_user: 信息不足
+    triaged --> diagnosing: 信息齐全
+    triaged --> escalated: 高风险
+    diagnosing --> pending_user: 仍需补充
+    diagnosing --> reviewing: 形成证据方案
     diagnosing --> escalated: 需要人工动作
-    diagnosing --> reviewing: 形成带证据方案
-    reviewing --> diagnosing: Review 要求返工（最多一次）
-    reviewing --> escalated: Review 或 Policy Guard 阻断
-    reviewing --> resolved: 审查通过
-    pending_user --> triaged: 用户补充信息
+    reviewing --> diagnosing: 返工（最多一次）
+    reviewing --> resolved: Review 和 Policy 通过
+    reviewing --> escalated: 复核或策略阻断
+    pending_user --> triaged: 用户补充
     pending_user --> escalated: 补充输入触发风险门禁
     escalated --> pending_user: 操作员追问
     escalated --> resolved: 操作员批准或编辑后发送
@@ -90,121 +120,377 @@ stateDiagram-v2
     resolved --> [*]
 ```
 
-状态集合固定为 `new`、`triaged`、`diagnosing`、`reviewing`、`pending_user`、`escalated`、`resolved`。状态和事件用于解释流程，不把模型的自由文本当成控制面。
+状态集合固定为 `new`、`triaged`、`diagnosing`、`reviewing`、`pending_user`、`escalated`、`resolved`。模型输出结构化建议，但不能创造第八种状态或绕过允许的状态转移。
 
-## 为什么是三个 Agent
+---
 
-| 角色 | 只负责什么 | 主要输入 | 结构化输出 |
-|---|---|---|---|
-| Triage Agent | 识别意图、风险和必要字段是否齐全 | 已脱敏问题、工单上下文 | 类别、风险、缺失字段、路由建议 |
-| Diagnosis Agent | 调用只读工具收集证据，提出下一步方案 | 分诊结果、用户补充、工具结果 | 证据、引用、建议动作、答复草稿 |
-| Review Agent | 检查证据充分性、安全性和可执行性 | 诊断产物、策略上下文 | 通过、一次返工或升级人工 |
+## 🤖 为什么是三个 Agent？
 
-拆成三个角色是为了让每一步的输入、输出和失败边界都能测试。**Router 不是 Agent**：它不调用模型，只根据结构化字段、允许的状态迁移和安全规则决定下一节点，因此同一状态下的控制流可重复验证。
+### Agent 1：Triage Agent（分诊）
 
-### Agent 与 Tool 边界
+**它做什么？**
 
-Agent 负责理解和生成；Tool 负责返回事实。工具不替模型“思考”，Agent 也不能改写工具的事实结果。
+先判断用户遇到的是什么问题、风险有多高、继续处理还缺什么信息。
 
-| 只读 Tool | 用途 | 数据边界 |
+| 输入 | 结构化输出 | 不负责 |
 |---|---|---|
-| `knowledge_search` / RAG | 检索排障与安全条目，返回引用 | 本仓库 72 条 source-backed 客服条目 |
-| Profile Tool | 获取演示用户的设备与偏好上下文 | 本地模拟 SQLite 数据 |
-| Warranty Tool | 按序列号后四位查询保修证据 | 模拟保修记录，不连接厂商系统 |
-| Chain Status Tool | 解释交易 pending 等链状态 | 模拟状态，不代表实时链上数据或费率 |
+| 已脱敏问题、工单上下文 | 意图、类别、优先级、风险、缺失字段、路由建议 | 不查询保修、不生成最终解决方案 |
 
-设备重置、bootloader 恢复、钱包恢复、保修结论等具有影响的动作不会被 Tool 自动执行，而是进入 Human-in-the-loop。
+高风险输出必须满足 Pydantic 约束。例如助记词泄露、钓鱼或资产丢失必须是 `critical / P0 / escalate`，模型不能把它们静默降级。
 
-## 安全、可靠性与 Human-in-the-loop
+### Agent 2：Diagnosis Agent（诊断）
 
-- **Ingress Guard**：在内容写入工单或 checkpoint 之前识别助记词、私钥等秘密并脱敏；后续节点只看到清理后的文本。
-- **Policy Guard**：在答复离开系统前做最终确定性校验，阻断未脱敏秘密、不安全动作和不可信 URL。证据充分性由 Diagnosis / Review 验证链负责，不归到最终 Policy Guard。
-- **风险粘性**：工单一旦被判为高风险，后续轮次不能仅靠模型输出把风险静默降级。
-- **最多一次返工**：Review 可把诊断退回一次；再次失败转人工，避免无限循环。
-- **可恢复执行**：工单数据库保存业务状态，独立 checkpoint 数据库保存图执行位置；超时、有限重试和命令租约降低重复执行风险。
-- **人工操作面**：工单工作台提供批准、编辑后发送、向用户追问、拒绝等动作。未配置 `KEYGUARD_OPERATOR_TOKEN` 时工作台默认关闭，而不是匿名开放。
+**它做什么？**
 
-## 两个界面、四条演示路径
+调用窄接口、只读工具收集事实，把证据组织成可执行的排障方案。
 
-Streamlit 页面有两个标签页：**客户对话**用于提交问题和补充信息，**工单工作台**用于查看状态、证据、审计记录并执行人工动作。
-
-| 场景 | 输入示例 | 应观察到的编排行为 |
+| 输入 | 结构化输出 | 不负责 |
 |---|---|---|
-| 蓝牙故障 | “蓝牙连不上手机，系统和 App 都是最新版。” | 自动分诊、检索证据、Review 后 `resolved`，答案带来源 |
-| 固件中断 | “升级固件时断开了，现在怎么办？” | 因缺少设备型号或错误状态进入 `pending_user`；补充后重新分诊 |
-| 助记词泄露 | 在问题中粘贴测试助记词 | 入库前脱敏、显示固定安全提示、风险保持并进入 `escalated` |
-| 保修判断 | 提供演示序列号后四位 `A1B2` | 查询模拟保修证据；涉及保修结论时等待人工处理 |
+| 分诊结果、用户补充、工具结果 | 证据、引用、建议动作、回答草稿、剩余未知字段 | 不决定最终发送，不执行设备重置或资产操作 |
 
-完整讲解顺序见 [docs/DEMO_SCRIPT.md](./docs/DEMO_SCRIPT.md)。
+#### Agent 与 Tool 边界
 
-## RAG 数据与来源
+Agent 负责理解和生成，Tool 负责返回窄接口事实。可用工具包括：
 
-`data/` 下 5 个知识文件覆盖故障排除、固件升级、安全使用、助记词与备份、交易与链网络，共 **72 条 source-backed 客服条目**。内容依据公开的官方支持页和协议标准重新组织为 KeyGuard 客服格式；“source-backed”表示可追溯参考，不表示获得任何真实品牌授权。
+- `knowledge_search`：检索 72 条 source-backed 客服条目；
+- Profile Tool：读取模拟用户设备与偏好；
+- Warranty Tool：通过演示序列号后四位查询模拟保修证据；
+- Chain Status Tool：解释模拟交易状态，不提供真实链上费率或资产操作。
 
-| 方向 | 代表性参考 |
-|---|---|
-| USB / 设备识别 | [Ledger USB connection issues](https://support.ledger.com/article/115005165269-zd)、[Trezor device issues](https://trezor.io/support/troubleshooting/device-issues/trezor-suite-doesn-t-see-my-device) |
-| 蓝牙 | [Ledger Bluetooth setup](https://support.ledger.com/article/360019138694-zd)、[pairing issues](https://support.ledger.com/article/360025864773-zd) |
-| 固件 | [Ledger OS update](https://support.ledger.com/article/360013349800-zd)、[Trezor firmware issues](https://trezor.io/support/troubleshooting/device-issues/firmware-update-issues) |
-| 备份与派生 | [BIP39](https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki)、[BIP44](https://github.com/bitcoin/bips/blob/master/bip-0044.mediawiki)、[Trezor backups](https://trezor.io/learn/security-privacy/personal-security-standards/understanding-trezor-wallet-backups-12-20-or-24-words) |
-| Passphrase | [Ledger Passphrase](https://www.ledger.com/academy/passphrase-an-advanced-security-feature)、[Trezor hidden wallets](https://trezor.io/support/troubleshooting/trezor-suite-issues/passphrase-hidden-wallets-issues) |
-| 交易边界 | [Ethereum gas](https://ethereum.org/developers/docs/gas/)、[Bitcoin RBF](https://bitcoincore.org/en/faq/optin_rbf/)、[WalletConnect](https://docs.walletconnect.network/wallet-sdk/overview) |
+### Agent 3：Review Agent（复核）
 
-检索默认使用本地 1024 维 Hash Embedding 和 Chroma 缓存 `chroma_db_v1/`。它方便 Demo 离线启动，但不等价于生产级语义向量模型。
+**它做什么？**
 
-## 48 条离线评测
+像代码审查一样检查诊断草稿：证据是否存在、引用是否有效、步骤是否安全、是否作出无法证明的承诺。
 
-V2 的 [multi_agent_cases.json](./eval/multi_agent_cases.json) 共 48 条：**30 条继承 + 18 条新增**，覆盖 happy path、信息补充、敏感信息、人工升级、恢复执行和状态转移。评测关注路由、状态、脱敏、证据、引用和人工接管等可观察结果，不应把单一数字包装成生产业务指标。
+| 输入 | 结构化输出 | 不负责 |
+|---|---|---|
+| 诊断证据、草稿、策略上下文 | `approve`、`revise` 或 `escalate`，以及原因码 | 不直接修改工单状态，不无限返工 |
 
-仓库内已有的 [wallet-rag-v2.json](./eval/eval_results/wallet-rag-v2.json) 是 V1 的 30 题结果，记录的是 **83.3% 关键词覆盖率**，不是答案准确率，也不是 V2 多 Agent 评测结果。
+Review 只能退回 Diagnosis 一次。第二次仍不满足要求时，确定性路由会把工单交给人工。
 
-V2 runner 是显式注入接口。只有接入真实 orchestration runner 后才执行并保存结果：
+---
+
+## 🧭 Router 为什么不是第四个 Agent？
+
+**Router 不是 Agent**，它是确定性的控制面。
+
+Router 不需要语言创造力。它只根据结构化字段和固定规则选择下一节点，因此使用普通 Python 函数更容易测试、复现和审计。
+
+下面是当前代码的简化片段：
+
+```python
+def route_after_review(state: object) -> str:
+    values = _state_mapping(state)
+    decision = _required(values, "review_decision")
+    revision_count = _required(values, "revision_count")
+
+    if values.get("requires_human"):
+        return "escalate"
+    if decision == "approve":
+        return "finalize"
+    if decision == "revise" and revision_count == 0:
+        return "revision"
+    return "escalate"
+```
+
+> 💡 **小白解读**：Agent 像负责判断和写方案的同事；Router 像只能按制度流转工单的流程引擎。这样模型负责它擅长的理解与生成，代码负责状态、安全和副作用。
+
+固定状态转移定义在 [`agent/orchestration/routes.py`](./agent/orchestration/routes.py)，LangGraph 组装在 [`agent/orchestration/graph.py`](./agent/orchestration/graph.py)。非法字段或非法状态不会被“尽量执行”，而是直接拒绝。
+
+Checkpoint 会在节点执行期间持续记录状态，但命令恢复入口只接受 `pending_user` 和 `escalated`；不能任意从 Triage、Diagnosis 或 Review 节点恢复。
+
+---
+
+## 🛡️ 安全、可靠性与人工接管
+
+### 两道安全门
+
+| 边界 | 发生时机 | 作用 |
+|---|---|---|
+| Ingress Guard | 写入工单和 checkpoint 之前 | 识别并替换助记词、私钥、WIF、PIN、Passphrase 等秘密 |
+| Policy Guard | 回答离开系统之前 | 阻断未脱敏秘密、不安全动作和不可信 URL |
+
+证据充分性由 Diagnosis / Review 验证链负责；Policy Guard 只承担最终确定性安全校验，不重复扮演证据审查 Agent。
+
+脱敏接口返回受约束的 `SanitizedText`；如果仍能检测到未脱敏秘密，对象不会创建成功：
+
+```python
+@dataclass(frozen=True)
+class SanitizedText:
+    value: str
+
+    def __post_init__(self) -> None:
+        if contains_unredacted_secret(self.value):
+            raise ValueError("检测到未脱敏的敏感信息")
+```
+
+> 💡 **小白解读**：不是等模型回答完再把秘密遮住，而是在秘密进入业务历史之前就处理。后面的 Agent、数据库和 checkpoint 只接触清理后的文本。
+
+### 可恢复执行与失败边界
+
+- **风险粘性**：工单一旦进入高风险，后续模型输出不能独自把风险降回普通问题；
+- **最多一次返工**：Review 不会让图进入无限循环；
+- **有限重试与超时**：模型失败后执行受限重试，并返回清理过的错误；
+- **命令租约与幂等键**：减少重复恢复命令造成的双重执行；
+- **双数据库隔离**：工单和 checkpoint 必须使用不同 SQLite 文件；
+- **Fail closed**：缺少所选模型 Key 或操作员令牌时，不会借用其他 Provider Key，也不会匿名开放工作台。
+
+### Human-in-the-loop 不是一句提示
+
+“工单工作台”支持四种操作：
+
+1. 批准并发送；
+2. 编辑草稿后发送；
+3. 向用户追问，回到 `pending_user`；
+4. 拒绝并保持人工升级。
+
+设备重置、bootloader 恢复、钱包恢复和保修结论等有影响的动作不会被 Tool 自动执行。
+
+---
+
+## 🎬 四条推荐演示路径
+
+打开 [在线体验](https://ai-hardware-cs-agent.streamlit.app/) 后，可按以下顺序测试：
+
+| 场景 | 示例输入 | 应观察到的编排行为 |
+|---|---|---|
+| 蓝牙故障 | “蓝牙连不上手机，权限已开，App 和系统都是最新版。” | 自动分诊、检索证据、Review 后解决，回答附来源 |
+| 固件中断 | “升级固件时断开了，现在怎么办？” | 信息不足时进入 `pending_user`，补充设备和错误状态后恢复 |
+| 敏感信息 | 使用仓库测试词串模拟助记词泄露 | 入库前脱敏、固定安全提示、风险保持并进入 `escalated` |
+| 保修判断 | 提供演示序列号后四位 `A1B2` | 查询模拟证据；涉及保修结论时等待人工处理 |
+
+> ⚠️ 只能使用测试数据，绝不要向 Demo 输入真实助记词、私钥、PIN、Passphrase、账户或资产信息。
+
+完整讲解顺序见 [5 分钟演示脚本](./docs/DEMO_SCRIPT.md)。
+
+---
+
+## 🚀 快速开始
+
+### 前置条件
+
+- Python 3.10+，推荐 3.11；
+- 一个 DeepSeek API Key；
+- macOS、Linux 或 Windows WSL。
+
+### 本地启动
+
+#### 1. 克隆和安装
+
+```bash
+git clone https://github.com/ruiqiyang123/ai-hardware-cs-agent.git
+cd ai-hardware-cs-agent
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+#### 2. 配置本地环境
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env`，至少配置：
+
+```dotenv
+CHAT_PROVIDER=deepseek
+DEEPSEEK_API_KEY=your-deepseek-api-key
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_CHAT_MODEL=deepseek-v4-flash
+DEEPSEEK_THINKING=disabled
+
+EMBEDDING_PROVIDER=local
+KEYGUARD_AGENT_VERSION=v2
+```
+
+DeepSeek V4 Flash 默认可能启用 thinking；本 Demo 显式关闭，减少客服短任务的额外推理输出。所选 Provider 配置缺失时系统 fail closed，不会借用 MiMo 或 DashScope 的 Key。
+
+#### 3. 初始化、测试和启动
+
+```bash
+python scripts/init_knowledge_base.py
+pytest -q
+streamlit run app.py
+```
+
+浏览器打开 `http://localhost:8501`。
+
+如需使用工单工作台，在 `.env` 中设置一个不可猜测的 `KEYGUARD_OPERATOR_TOKEN`。未配置时工作台默认关闭。
+
+### 关键配置
+
+| 变量 | 默认 / 示例 | 作用 |
+|---|---|---|
+| `CHAT_PROVIDER` | `deepseek` | 选择聊天模型 Provider |
+| `DEEPSEEK_CHAT_MODEL` | `deepseek-v4-flash` | Demo 默认模型 |
+| `DEEPSEEK_THINKING` | `disabled` | 关闭额外思考输出 |
+| `EMBEDDING_PROVIDER` | `local` | 本地 1024 维 Hash Embedding |
+| `KEYGUARD_AGENT_VERSION` | `v2` | 使用多 Agent 工单链路 |
+| `KEYGUARD_OPERATOR_TOKEN` | 无 | 工作台令牌；缺失时 fail closed |
+| `KEYGUARD_TICKET_DB` | `data/keyguard_v2.db` | 工单和审计事件 |
+| `KEYGUARD_CHECKPOINT_DB` | `data/keyguard_v2_checkpoints.sqlite3` | LangGraph 恢复点 |
+
+完整 Secrets、Streamlit Cloud 和数据库说明见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
+
+---
+
+## 🧪 测试与评测
+
+### 自动化测试
+
+```bash
+pytest -q
+```
+
+当前发布基线（2026-07-29）：
+
+- **429 个测试通过**；
+- **597 个参数化子测试通过**；
+- 覆盖状态转移、路由、安全脱敏、证据、持久化、恢复、Human-in-the-loop 和故障注入。
+
+### 48 条离线评测
+
+[`eval/multi_agent_cases.json`](./eval/multi_agent_cases.json) 包含 **30 条继承 + 18 条新增**，关注以下可观察结果：
+
+- 路由和最终状态；
+- 持久化前脱敏；
+- 证据和引用；
+- 人工升级与恢复；
+- 超时、返工和失败边界。
+
+V2 runner 使用显式注入接口：
 
 ```bash
 export KEYGUARD_ORCHESTRATION_EVAL_RUNNER=module:attribute
 python eval/run_orchestration_eval.py --tag keyguard-v2
 ```
 
-配置 runner 后，结果 JSON 会保存 aggregate metrics 与 operational metrics，并在 `results` 中保留逐 case scores、`status_trace`、`citations` 等受限字段；可从未通过的 scores 选择 bad case 复盘。
+未配置真实 runner 时，脚本在 stderr 输出配置错误并以状态码 2 失败，不生成结果文件，保持**零结果产物**。这是有意设计的 **fail closed**，避免把占位数字包装成评测结果。
 
-未配置 runner 时脚本会 **fail closed**：stderr 显示配置错误并以状态码 2 退出，但不生成评测结果文件，保持**零结果产物**。因此仓库不预填未实测的 V2 分数。
+配置 runner 后，结果文件包含 aggregate metrics，并在逐 case scores 中保留 `status_trace`、`citations` 等受限字段；可以从未通过的分项选择一个 bad case，按“预期状态—实际状态—失败边界”复盘。
 
-## 本地启动
+仓库内 [`wallet-rag-v2.json`](./eval/eval_results/wallet-rag-v2.json) 的 83.3% 是 V1 的 30 题**关键词覆盖率**，不是答案准确率，也不是 V2 多 Agent 指标。
 
-```bash
-git clone https://github.com/ruiqiyang123/ai-hardware-cs-agent.git
-cd ai-hardware-cs-agent
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-python scripts/init_knowledge_base.py
-pytest -q
-streamlit run app.py
+---
+
+## 📁 项目结构
+
+```text
+ai-hardware-cs-agent/
+├── app.py                         # Streamlit 客户对话 + 工单工作台
+├── agent/
+│   ├── nodes/                     # Triage / Diagnosis / Review
+│   ├── orchestration/             # StateGraph、Router、Runtime、Checkpoint
+│   ├── policies/                  # 出站安全与策略门禁
+│   ├── security/                  # 秘密检测、脱敏、可信来源
+│   └── tools/                     # RAG、档案、保修等工具适配
+├── database/
+│   ├── ticket_db.py               # 工单、版本、命令租约和审计事件
+│   └── profile_db.py              # 模拟用户档案
+├── rag/                           # 检索、来源格式化与关键词降级
+├── data/                          # Source-backed 知识与模拟数据
+├── eval/                          # V1/V2 案例、Scorer 和 Runner
+├── tests/                         # 单元、集成、安全和故障路径测试
+├── config/                        # Agent、RAG、编排和安全策略
+├── docs/DEMO_SCRIPT.md            # 5 分钟演示脚本
+└── DEPLOYMENT.md                  # 本地与 Streamlit Cloud 部署
 ```
 
-至少填写 `DEEPSEEK_API_KEY`，并确认 `CHAT_PROVIDER=deepseek`。默认模型为 `deepseek-v4-flash`，通过 `DEEPSEEK_THINKING=disabled` 关闭思考模式；所选 Provider 缺少配置时系统 fail closed，不会借用其他 Provider 的 Key。需要使用工单工作台时再设置不可猜测的 `KEYGUARD_OPERATOR_TOKEN`。完整 Secrets 和数据库路径说明见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
+建议按这个顺序阅读代码：
 
-## 代码导览
+1. [`agent/orchestration/state.py`](./agent/orchestration/state.py)：先认识状态和结构化输出；
+2. [`agent/orchestration/routes.py`](./agent/orchestration/routes.py)：理解确定性控制流；
+3. [`agent/orchestration/graph.py`](./agent/orchestration/graph.py)：看节点如何组装成图；
+4. [`agent/orchestration/runtime.py`](./agent/orchestration/runtime.py)：理解持久化、恢复与命令边界；
+5. [`app.py`](./app.py)：最后看客户对话和人工工作台如何调用编排层。
 
-| 路径 | 作用 |
+---
+
+## ❓ 面试高频问题
+
+### Q1：为什么用 Multi-Agent，而不是一个大 Agent？
+
+因为分诊、查证和复核需要不同上下文与失败边界。拆分后，每个 Agent 的输入输出都能独立约束和测试，也能避免把所有工具、策略和历史塞给同一个模型。
+
+### Q2：为什么 Router 不能交给模型？
+
+路由只需要根据有限字段执行有限状态转移，不需要生成能力。确定性代码更便于复现、测试和审计，也能阻止模型绕过人工门禁。
+
+### Q3：业务工单和 LangGraph checkpoint 有什么区别？
+
+工单是业务真相，保存状态、版本和审计事件；checkpoint 保存图执行位置和节点状态。两者生命周期与恢复语义不同，因此使用独立数据库并检查路径不能重合。
+
+### Q4：为什么脱敏必须发生在持久化之前？
+
+如果只清理最终回答，秘密可能已经进入消息历史、日志、数据库或 checkpoint。Ingress Guard 先生成受约束的安全文本，后续组件不再接触原始秘密。
+
+### Q5：Review Agent 会不会造成无限循环？
+
+不会。`revision_count == 0` 时允许一次返工；之后仍是 `revise` 或出现高风险就进入 `escalated`。
+
+### Q6：Human-in-the-loop 如何恢复？
+
+只有 `pending_user` 和 `escalated` 是命令恢复入口。用户补充或操作员动作会带版本、幂等键和租约进入 Runtime，再从 checkpoint 安全继续。
+
+### Q7：这个项目离生产还差什么？
+
+至少还需要外部可靠数据库、企业身份与权限、真实工具适配、密钥轮换、监控告警、数据保留策略、并发压测以及通过真实 runner 建立的评测基线。
+
+---
+
+## 📝 简历写法与项目边界
+
+### 简历项目描述参考
+
+```text
+KeyGuard 2.0｜多 Agent 硬件钱包售后工单系统｜个人项目
+
+• 基于 LangGraph StateGraph 设计 Triage、Diagnosis、Review 三 Agent 工单流程，
+  使用七状态状态机和确定性 Router 管理信息补充、一次返工、自动解决与人工升级。
+
+• 实现持久化前敏感信息脱敏、风险粘性和出站 Policy Guard，覆盖助记词、私钥、
+  PIN、Passphrase 与不可信链接等安全边界。
+
+• 使用独立 SQLite 保存业务工单和 LangGraph checkpoint，增加版本控制、命令租约、
+  幂等恢复和审计事件，并提供 Streamlit 工单工作台执行人工批准、编辑、追问和拒绝。
+
+• 构建 48 条多 Agent 编排评测案例，并通过自动化测试覆盖路由、状态迁移、证据、
+  持久化、故障注入和 Human-in-the-loop；支持 DeepSeek V4 Flash 低成本演示。
+
+技术栈：Python · LangGraph · LangChain · Streamlit · SQLite · Chroma · DeepSeek
+```
+
+请根据自己真正理解、实现和能在面试中解释的部分调整，不要直接把不熟悉的能力写进简历。
+
+### 已知限制
+
+- 所有品牌、用户、设备、序列号、保修、链状态和业务案例均为虚构或模拟数据；
+- 本地 Hash Embedding 方便 Demo 离线启动，但不能代表生产级语义召回能力；
+- Streamlit Cloud 文件系统是易失环境，SQLite、checkpoint 和向量缓存可能在重启或重新部署后丢失；
+- `KEYGUARD_OPERATOR_TOKEN` 是 Demo 级共享令牌，不具备企业级身份、权限分层和轮换；
+- 外部保修和链状态工具均为模拟实现，没有连接厂商售后、真实 RPC 或资产操作接口；
+- V2 评测框架已经就绪，但仓库不预填未经真实 runner 执行的准确率、成本下降或 SLA。
+
+---
+
+## 📚 延伸文档
+
+| 文档 | 用途 |
 |---|---|
-| [app.py](./app.py) | 两个标签页、V1/V2 入口、操作员认证与人工动作 |
-| [agent/orchestration/](./agent/orchestration) | StateGraph、状态、Router、事件、调用与运行时边界 |
-| [agent/nodes/](./agent/nodes) | Triage / Diagnosis / Review 节点 |
-| [agent/policies/security.py](./agent/policies/security.py) | 输出策略与风险控制 |
-| [agent/security/](./agent/security) | 秘密检测、脱敏与可信来源规则 |
-| [agent/tools/](./agent/tools) | RAG、档案、保修等工具适配层 |
-| [database/ticket_db.py](./database/ticket_db.py) | 工单、版本和审计事件持久化 |
-| [eval/run_orchestration_eval.py](./eval/run_orchestration_eval.py) | 可注入 runner 的 V2 离线评测入口 |
-| [tests/](./tests) | 路由、状态机、安全、持久化、恢复和文档合约测试 |
+| [5 分钟演示脚本](./docs/DEMO_SCRIPT.md) | 面试时按四条路径讲解项目 |
+| [部署与复现](./DEPLOYMENT.md) | 本地、Streamlit Secrets、易失持久化和故障排查 |
+| [V2 设计规格](./docs/superpowers/specs/2026-07-28-keyguard-v2-multi-agent-support-design.md) | 多 Agent 架构、安全边界与状态设计 |
+| [DeepSeek Provider 设计](./docs/superpowers/specs/2026-07-29-deepseek-provider-design.md) | Provider 隔离、配置与验证方式 |
 
-## 已知限制
+---
 
-- 所有品牌、用户、序列号、保修、设备、链状态和业务案例均为模拟或演示数据；项目不处理真实资产。
-- 本地 Hash Embedding 主要用于降低运行门槛，语义召回能力不能代表生产模型；知识条目也需要正式内容审核和持续更新。
-- 工单与 checkpoint 使用两个 SQLite 文件，适合单实例 Demo。Streamlit Cloud 文件系统可能重启或重部署，数据是易失的，不能视为生产持久化。
-- `KEYGUARD_OPERATOR_TOKEN` 是 Demo 级共享令牌，不包含企业级身份、权限分层、轮换和完整审计体系；未配置时工作台关闭。
-- 外部保修与链状态工具均为模拟实现，没有连接厂商售后、真实区块链 RPC 或资产操作接口。
-- V2 评测框架和 48 条案例已经就绪，但仓库不包含未经真实 runner 执行的结果，不应提前填写准确率、成本下降或 SLA。
-- 在线体验可能因休眠、配额、部署提交或 Secrets 与本地行为不同；技术核验以固定提交的本地复现为准。
+<div align="center">
+
+如果这个项目帮助你理解了多 Agent 编排，欢迎通过 GitHub Issue 交流。
+
+**这是一套工程学习与求职演示项目，不是资产安全建议或生产客服服务。**
+
+</div>
