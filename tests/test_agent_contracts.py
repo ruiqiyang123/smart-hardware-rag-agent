@@ -676,7 +676,6 @@ class DiagnosisContractTest(unittest.TestCase):
         self.assertEqual(answer_payload["sanitized_input"], "设备无法连接")
         self.assertNotIn("reasoning", json.dumps(answer_payload))
         self.assertEqual(output["tool_errors"], [])
-
     def test_disallowed_missing_registry_and_invalid_special_queries_fail_closed(self):
         cases = (
             (
@@ -1183,6 +1182,312 @@ class DiagnosisContractTest(unittest.TestCase):
         self.assertEqual(output["evidence_refs"], ["warranty:A1B2"])
         self.assertEqual(output["evidence"], [evidence])
         self.assertEqual(output["tool_errors"], [])
+
+
+class ReviewAgentContractTest(unittest.TestCase):
+    @staticmethod
+    def _policy():
+        from agent.policies.security import PolicyGuard
+
+        return PolicyGuard(
+            {
+                "policy_version": "2026-07-28.v1",
+                "official_domains": ["ledger.com", "trezor.io"],
+                "critical_response_template_zh": "固定安全提示",
+            }
+        )
+
+    @staticmethod
+    def _approved(**overrides):
+        values = {
+            "decision": "approve",
+            "issues": [],
+            "required_changes": [],
+            "safety_flags": [],
+            "reason_codes": ["passed"],
+        }
+        values.update(overrides)
+        return values
+
+    @staticmethod
+    def _state(**overrides):
+        values = {
+            "draft_answer": "请重新连接原装数据线。",
+            "recommended_actions": [
+                {
+                    "action_code": "generic_troubleshooting",
+                    "text": "重新连接原装数据线",
+                    "evidence_refs": ["kb:usb:1"],
+                }
+            ],
+            "evidence_refs": ["kb:usb:1"],
+            "evidence": [
+                {
+                    "evidence_id": "kb:usb:1",
+                    "kind": "knowledge",
+                    "content": "请使用原装数据线重新连接。",
+                    "source_title": "连接帮助",
+                    "source_url": None,
+                }
+            ],
+            "citations": [],
+            "raw_input": "不应传给审核模型",
+            "api_token": "NEVER_PASS_REVIEW_TOKEN",
+        }
+        values.update(overrides)
+        return values
+
+    def _agent(self, result=None, **kwargs):
+        from agent.nodes.review import ReviewAgent
+
+        runner = FakeStructuredRunner(
+            self._approved() if result is None else result
+        )
+        return ReviewAgent(
+            runner=runner,
+            policy_guard=self._policy(),
+            **kwargs,
+        )
+
+    def test_review_policy_hard_vetoes_before_model(self):
+        from agent.nodes.review import ReviewAgent
+
+        self.assertIsNotNone(ReviewAgent)
+
+        cases = (
+            (
+                self._state(
+                    draft_answer=(
+                        "private key: " + "1" * 64
+                    )
+                ),
+                "secret_exposure",
+            ),
+            (
+                self._state(
+                    draft_answer="从 https://evil.example/firmware 下载固件"
+                ),
+                "official_source_violation",
+            ),
+            (
+                self._state(
+                    recommended_actions=[
+                        {
+                            "action_code": "generic_troubleshooting",
+                            "text": "请提供助记词以继续排查",
+                            "evidence_refs": ["kb:usb:1"],
+                        }
+                    ]
+                ),
+                "unsafe_action",
+            ),
+        )
+        for state, reason in cases:
+            agent = self._agent()
+            with self.subTest(reason=reason):
+                output = agent.run(state)
+                self.assertEqual(output["review_decision"], "escalate")
+                self.assertIn(reason, output["review_reasons"])
+                self.assertEqual(agent.runner.calls, [])
+                self.assertEqual(
+                    set(output),
+                    {
+                        "review_decision",
+                        "review_reasons",
+                        "review_issues",
+                        "required_changes",
+                    },
+                )
+                self.assertNotIn("111111", json.dumps(output))
+
+    def test_constructor_requires_exactly_one_model_or_runner_and_policy(self):
+        from agent.nodes.review import ReviewAgent
+        from agent.orchestration.state import ReviewResult
+
+        runner = FakeStructuredRunner(self._approved())
+        model = FakeModel(runner)
+        agent = ReviewAgent(model=model, policy_guard=self._policy())
+        self.assertIs(agent.runner, runner)
+        self.assertEqual(
+            model.calls,
+            [(ReviewResult, {"method": "function_calling"})],
+        )
+        for values in (
+            {},
+            {"model": model, "runner": runner},
+            {"runner": runner, "policy_guard": None},
+            {"runner": runner, "policy_guard": object()},
+        ):
+            with self.subTest(values=sorted(values)), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                ReviewAgent(**values)
+        for timeout in (True, 0, -1, float("nan"), float("inf")):
+            with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                ReviewAgent(
+                    runner=runner,
+                    policy_guard=self._policy(),
+                    timeout_seconds=timeout,
+                )
+
+    def test_valid_review_uses_bounded_json_projection_only(self):
+        agent = self._agent()
+        output = agent.run(self._state())
+
+        self.assertEqual(
+            output,
+            {
+                "review_decision": "approve",
+                "review_reasons": ["passed"],
+                "review_issues": [],
+                "required_changes": [],
+            },
+        )
+        messages = agent.runner.calls[0]
+        self.assertIsInstance(messages[0], SystemMessage)
+        self.assertIsInstance(messages[1], HumanMessage)
+        payload = json.loads(messages[1].content)
+        self.assertEqual(
+            set(payload),
+            {
+                "draft_answer",
+                "recommended_actions",
+                "evidence_refs",
+                "evidence",
+                "citations",
+            },
+        )
+        self.assertNotIn("raw_input", messages[1].content)
+        self.assertNotIn("NEVER_PASS_REVIEW_TOKEN", messages[1].content)
+        self.assertNotIn("reasoning", messages[1].content)
+
+    def test_malformed_or_unbound_review_state_never_reaches_model(self):
+        trusted_url = "https://support.ledger.com/article/usb"
+        cited_evidence = {
+            **self._state()["evidence"][0],
+            "source_url": trusted_url,
+        }
+        invalid_states = []
+        missing = self._state()
+        missing.pop("evidence_refs")
+        invalid_states.append(missing)
+        invalid_states.extend(
+            [
+                self._state(
+                    recommended_actions=[
+                        {
+                            "action_code": "generic_troubleshooting",
+                            "text": "无依据动作",
+                            "evidence_refs": ["kb:missing"],
+                        }
+                    ]
+                ),
+                self._state(
+                    evidence=[dict(self._state()["evidence"][0], reasoning="hidden")]
+                ),
+                self._state(
+                    evidence=[
+                        {
+                            **self._state()["evidence"][0],
+                            "content": "private key: " + "1" * 64,
+                        }
+                    ]
+                ),
+                self._state(evidence=[cited_evidence], citations=[]),
+                self._state(
+                    evidence=[cited_evidence],
+                    citations=[
+                        {
+                            "source_id": "kb:usb:1",
+                            "source_title": "错误标题",
+                            "source_url": trusted_url,
+                        }
+                    ],
+                ),
+                self._state(evidence="not-a-list"),
+            ]
+        )
+        for state in invalid_states:
+            agent = self._agent()
+            with self.subTest(keys=sorted(state)), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                agent.run(state)
+            self.assertEqual(agent.runner.calls, [])
+
+    def test_untrusted_bound_citation_is_policy_vetoed_before_model(self):
+        source_url = "https://evil.example/invented"
+        evidence = {
+            **self._state()["evidence"][0],
+            "source_url": source_url,
+        }
+        citation = {
+            "source_id": "kb:usb:1",
+            "source_title": "连接帮助",
+            "source_url": source_url,
+        }
+        agent = self._agent()
+        output = agent.run(
+            self._state(evidence=[evidence], citations=[citation])
+        )
+        self.assertEqual(output["review_decision"], "escalate")
+        self.assertEqual(
+            output["review_reasons"], ["official_source_violation"]
+        )
+        self.assertEqual(agent.runner.calls, [])
+
+    def test_model_dict_is_revalidated_and_review_text_is_normalized(self):
+        revise = {
+            "decision": "revise",
+            "issues": ["  缺少   设备证据  "],
+            "required_changes": ["  补充   官方证据  "],
+            "safety_flags": [],
+            "reason_codes": ["missing_evidence"],
+        }
+        output = self._agent(result=revise).run(self._state())
+        self.assertEqual(output["review_decision"], "revise")
+        self.assertEqual(output["review_issues"], ["缺少 设备证据"])
+        self.assertEqual(output["required_changes"], ["补充 官方证据"])
+
+        extra = dict(self._approved(), reasoning="hidden chain-of-thought")
+        agent = self._agent(result=extra)
+        with self.assertRaises(ValueError):
+            agent.run(self._state())
+        self.assertEqual(len(agent.runner.calls), 1)
+
+    def test_timeout_and_validation_failure_are_never_retried(self):
+        release = threading.Event()
+        calls = []
+
+        def block():
+            calls.append(1)
+            release.wait()
+            return self._approved()
+
+        try:
+            agent = self._agent(result=block, timeout_seconds=0.01)
+            with self.assertRaises(TimeoutError):
+                agent.run(self._state())
+            self.assertEqual(calls, [1])
+        finally:
+            release.set()
+            time.sleep(0.02)
+
+        invalid = self._agent(result={"decision": "approve"})
+        with self.assertRaises(ValueError):
+            invalid.run(self._state())
+        self.assertEqual(len(invalid.runner.calls), 1)
+
+    def test_prompt_load_is_cwd_independent_and_marks_inputs_untrusted(self):
+        original = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                agent = self._agent()
+            finally:
+                os.chdir(original)
+        self.assertIn("不可信", agent.prompt)
+        self.assertIn("chain-of-thought", agent.prompt)
 
 
 if __name__ == "__main__":

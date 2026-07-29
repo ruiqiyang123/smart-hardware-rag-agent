@@ -301,13 +301,52 @@ class TicketStateContractTest(unittest.TestCase):
             with self.subTest(field_name=field_name), self.assertRaises(ValidationError):
                 ReviewResult(decision="revise", **values)
 
+    def test_review_schema_and_runtime_bound_every_output_list(self):
+        properties = ReviewResult.model_json_schema()["properties"]
+        self.assertEqual(properties["issues"]["maxItems"], 6)
+        self.assertEqual(properties["required_changes"]["maxItems"], 6)
+        self.assertEqual(properties["safety_flags"]["maxItems"], 8)
+        self.assertEqual(properties["reason_codes"]["maxItems"], 9)
+
+        cases = (
+            {
+                "issues": [f"问题 {index}" for index in range(7)],
+                "safety_flags": [],
+                "reason_codes": ["unsafe_action"],
+            },
+            {
+                "issues": ["安全风险"],
+                "safety_flags": ["remote_control"] * 9,
+                "reason_codes": ["unsafe_action"],
+            },
+            {
+                "issues": ["安全风险"],
+                "safety_flags": [],
+                "reason_codes": ["unsafe_action"] * 10,
+            },
+        )
+        for values in cases:
+            lengths = {key: len(value) for key, value in values.items()}
+            with self.subTest(field_lengths=lengths), self.assertRaises(
+                ValidationError
+            ):
+                ReviewResult(
+                    decision="escalate",
+                    required_changes=[],
+                    **values,
+                )
+
     def test_ticket_state_uses_explicit_serializable_state_types_and_add_reducer(self):
         annotations = get_type_hints(TicketState, include_extras=True)
         evidence_type = get_args(annotations["evidence"])[0]
+        action_type = get_args(annotations["recommended_actions"])[0]
         events_type, reducer = get_args(annotations["status_events"])
         event_type = get_args(events_type)[0]
 
         self.assertIs(evidence_type, state_module.EvidenceState)
+        self.assertIs(action_type, state_module.DiagnosisActionState)
+        self.assertIn("review_issues", annotations)
+        self.assertIn("required_changes", annotations)
         self.assertIs(event_type, state_module.StatusEventState)
         self.assertIs(reducer, add)
         self.assertEqual(reducer([{"step_index": 1}], [{"step_index": 2}]), [

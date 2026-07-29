@@ -302,6 +302,34 @@ class OrchestrationRoutesTest(unittest.TestCase):
             "escalate",
         )
 
+    def test_review_revise_is_allowed_exactly_once_from_reviewing(self):
+        base = {
+            "status": "reviewing",
+            "review_decision": "revise",
+            "requires_human": False,
+        }
+        self.assertEqual(
+            route_after_review({**base, "revision_count": 0}), "revision"
+        )
+        for revision_count in (1, 2, 100):
+            with self.subTest(revision_count=revision_count):
+                self.assertEqual(
+                    route_after_review(
+                        {**base, "revision_count": revision_count}
+                    ),
+                    "escalate",
+                )
+        self.assertEqual(
+            route_after_review(
+                {
+                    **base,
+                    "status": "escalated",
+                    "revision_count": 0,
+                }
+            ),
+            "escalate",
+        )
+
     def test_human_routes_only_supported_statuses(self):
         self.assertEqual(route_after_human({"status": "resolved"}), "end")
         self.assertEqual(

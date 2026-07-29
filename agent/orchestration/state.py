@@ -215,9 +215,9 @@ class DiagnosisResult(StrictModel):
 
 class ReviewResult(StrictModel):
     decision: Literal["approve", "revise", "escalate"]
-    issues: List[ReviewItem]
+    issues: List[ReviewItem] = Field(max_length=6)
     required_changes: List[ReviewItem] = Field(max_length=6)
-    safety_flags: List[RiskFlag]
+    safety_flags: List[RiskFlag] = Field(max_length=8)
     reason_codes: List[
         Literal[
             "passed",
@@ -230,7 +230,7 @@ class ReviewResult(StrictModel):
             "overpromise",
             "official_source_violation",
         ]
-    ]
+    ] = Field(max_length=9)
 
     @model_validator(mode="after")
     def validate_decision(self):
@@ -266,6 +266,12 @@ class EvidenceState(TypedDict, total=False):
     metadata: Dict[str, JSONValue]
 
 
+class DiagnosisActionState(TypedDict):
+    action_code: str
+    text: str
+    evidence_refs: List[str]
+
+
 class StatusEventState(TypedDict):
     command_id: str
     step_index: int
@@ -294,12 +300,18 @@ class TicketState(TypedDict, total=False):
     missing_fields: List[str]
     suggested_route: str
     customer_context: Dict[str, str]
+    diagnosis_summary: str
+    recommended_actions: List[DiagnosisActionState]
+    evidence_refs: List[str]
+    remaining_unknowns: List[str]
     evidence: List[EvidenceState]
     citations: List[Dict[str, str]]
     tool_errors: List[str]
     draft_answer: str
     review_decision: str
     review_reasons: List[str]
+    review_issues: List[str]
+    required_changes: List[str]
     revision_count: int
     response_version: int
     status: str
