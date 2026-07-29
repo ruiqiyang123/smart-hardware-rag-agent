@@ -148,6 +148,21 @@ class AppV2ContractTest(unittest.TestCase):
         self.assertIn("graph_timeout_seconds=orchestration[", source)
         self.assertIn("checkpointer.close()", source)
 
+    def test_orchestrator_cache_key_includes_contract_version(self):
+        source = self.function_source("get_or_build_orchestrator")
+
+        self.assertIn("contract_version: str", source)
+        self.assertIn(
+            "contract_version != ORCHESTRATOR_CONTRACT_VERSION",
+            source,
+        )
+        self.assertIn(
+            "get_or_build_orchestrator(\n"
+            "            current_model_signature, ORCHESTRATOR_CONTRACT_VERSION\n"
+            "        )",
+            self.source,
+        )
+
     def test_workbench_only_lists_safe_event_fields_and_human_actions(self):
         source = self.function_source("_render_workbench")
         for field in ("event_type", "summary", "from_status", "to_status"):
