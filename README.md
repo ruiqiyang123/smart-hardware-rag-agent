@@ -40,17 +40,20 @@ flowchart LR
     U["用户 / 客户对话"] --> IG["Ingress Guard<br/>敏感信息脱敏"]
     IG --> TS["Ticket Store<br/>工单与审计事件"]
     TS --> T["Triage Agent<br/>分类、风险、缺失字段"]
-    T --> R1{"确定性 Router"}
+    T --> R1{"确定性 Triage Router"}
     R1 -->|信息不足| PU["pending_user"]
     R1 -->|高风险| ES["escalated"]
     R1 -->|可诊断| D["Diagnosis Agent<br/>证据检索与方案生成"]
     D --> K["只读 Tools<br/>知识 / 档案 / 保修 / 链状态"]
     K --> D
-    D --> R2{"确定性 Router"}
+    D --> R2{"确定性 Diagnosis Router"}
+    R2 -->|信息仍不足| PU
     R2 -->|需要人工动作| ES
     R2 -->|可审查| RV["Review Agent<br/>证据、安全、可执行性"]
-    RV --> PG["Policy Guard<br/>最终确定性校验"]
-    PG -->|一次返工| D
+    RV --> R3{"确定性 Review Router"}
+    R3 -->|一次返工| D
+    R3 -->|升级人工| ES
+    R3 -->|审查通过| PG["Policy Guard<br/>最终确定性校验"]
     PG -->|通过| OK["resolved"]
     PG -->|阻断| ES
     PU -->|用户补充后重新分诊| T
@@ -75,7 +78,7 @@ stateDiagram-v2
     diagnosing --> escalated: 需要人工动作
     diagnosing --> reviewing: 形成带证据方案
     reviewing --> diagnosing: Review 要求返工（最多一次）
-    reviewing --> escalated: Policy Guard 阻断
+    reviewing --> escalated: Review 或 Policy Guard 阻断
     reviewing --> resolved: 审查通过
     pending_user --> triaged: 用户补充信息
     escalated --> pending_user: 操作员追问

@@ -167,6 +167,26 @@ class DemoReadinessTest(unittest.TestCase):
 
         self.assertFalse(changed_markdown - allowed_docs)
 
+    def test_readme_separates_diagnosis_review_and_policy_routes(self):
+        readme = read_text("README.md")
+
+        for edge in (
+            'R2 -->|信息仍不足| PU',
+            'RV --> R3{"确定性 Review Router"}',
+            'R3 -->|一次返工| D',
+            'R3 -->|升级人工| ES',
+            'R3 -->|审查通过| PG',
+            'PG -->|通过| OK',
+            'PG -->|阻断| ES',
+        ):
+            self.assertIn(edge, readme)
+        self.assertNotIn('PG -->|一次返工| D', readme)
+        self.assertNotIn('RV --> PG', readme)
+        self.assertIn(
+            'reviewing --> escalated: Review 或 Policy Guard 阻断',
+            readme,
+        )
+
     def test_deployment_documents_v2_secrets_and_ephemeral_storage(self):
         deployment = read_text("DEPLOYMENT.md")
 
@@ -193,6 +213,14 @@ class DemoReadinessTest(unittest.TestCase):
         self.assertIn("Streamlit Cloud", deployment)
         self.assertIn("易失", deployment)
         self.assertIn("不能视为生产持久化", deployment)
+        for persistence_boundary in (
+            "TicketRepository",
+            "SQLite checkpoint",
+            "创建或重建空表",
+            "不能恢复已丢失的历史",
+            "Chroma 知识库初始化",
+        ):
+            self.assertIn(persistence_boundary, deployment)
 
     def test_five_minute_demo_script_has_honest_fixed_sections(self):
         script = read_text("docs/DEMO_SCRIPT.md")

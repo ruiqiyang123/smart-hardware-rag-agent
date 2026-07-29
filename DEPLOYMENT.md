@@ -71,6 +71,10 @@ LANGGRAPH_STRICT_MSGPACK = "true"
 
 Streamlit Cloud 的本地文件系统是**易失**环境，实例休眠、迁移或重新部署后，SQLite 工单、checkpoint 和向量缓存都可能丢失。因此这种文件持久化只适合 Demo，**不能视为生产持久化**。
 
+应用启动时，`TicketRepository` 和 `SQLite checkpoint` 初始化器会检查表结构；数据库文件不存在时，它们可以**创建或重建空表**。这只是 schema 初始化，不是备份恢复，**不能恢复已丢失的历史**。Cloud 重启或重部署导致文件消失后，旧工单、审计事件和执行位置都不可恢复。
+
+`python scripts/init_knowledge_base.py` 执行的是 **Chroma 知识库初始化**：它根据仓库内的 source-backed 文档重建检索索引，与工单数据库和 checkpoint 的业务历史不是同一类数据。知识索引可以从版本化文本重新生成，不代表历史工单也能重新生成。
+
 生产化至少需要把工单、checkpoint 和审计事件迁移到受控的外部数据库，增加备份恢复、并发控制、密钥轮换、企业身份认证、最小权限和数据保留策略。本项目没有实现这些能力。
 
 ## 部署前检查
