@@ -29,7 +29,9 @@ from utils.model_config import DEFAULT_MIMO_BASE_URL, DEFAULT_MIMO_CHAT_MODEL, b
 from utils.session_context import set_location, set_user_id
 from utils.ui_command_state import (
     ACTION_ID_SESSION_PREFIX,
+    EDITOR_SESSION_PREFIX,
     REQUEST_ID_SESSION_KEY,
+    clear_editor_state,
     clear_frozen_action,
     clear_frozen_actions,
     clear_frozen_request,
@@ -122,6 +124,7 @@ def _clear_customer_workflow_state() -> None:
     st.session_state.pop("active_ticket_id", None)
     clear_frozen_request(st.session_state)
     clear_frozen_actions(st.session_state)
+    clear_editor_state(st.session_state)
     st.session_state.pop(RECOVERY_NOTICE_SESSION_KEY, None)
     st.session_state.pop("pending_prompt", None)
 
@@ -870,6 +873,7 @@ def _render_operator_gate() -> bool:
     if not configured_token:
         st.session_state.pop(OPERATOR_AUTH_SESSION_KEY, None)
         clear_frozen_actions(st.session_state)
+        clear_editor_state(st.session_state)
         st.warning("工单工作台未启用：服务端未配置独立操作员令牌。")
         return False
 
@@ -878,6 +882,7 @@ def _render_operator_gate() -> bool:
         if st.button("退出工作台", key="operator_logout"):
             st.session_state.pop(OPERATOR_AUTH_SESSION_KEY, None)
             clear_frozen_actions(st.session_state)
+            clear_editor_state(st.session_state)
             st.rerun()
         return True
 
@@ -966,12 +971,6 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
             if draft_answer:
                 st.markdown("**Repository 安全投影草稿**")
                 st.text(draft_answer)
-            edited = st.text_area(
-                "编辑后回复",
-                value=draft_answer or "",
-                placeholder="输入审核后可直接发送给客户的安全回复",
-                key=f"edit_{ticket_id}",
-            )
             missing_fields = st.multiselect(
                 "需要客户补充的字段",
                 ASK_USER_FIELDS,
@@ -988,12 +987,23 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
                 ):
                     _run_human_action(orchestrator, ticket_id, "approve")
             with edit_col:
-                if st.button(
-                    "Edit & Send",
-                    key=f"edit_send_{ticket_id}",
-                    disabled=not bool(edited.strip()),
-                    use_container_width=True,
+                with st.form(
+                    f"edit_send_form_{ticket_id}",
+                    clear_on_submit=True,
+                    border=False,
                 ):
+                    edited = st.text_area(
+                        "编辑后回复",
+                        value=draft_answer or "",
+                        placeholder="输入审核后可直接发送给客户的安全回复",
+                        key=f"{EDITOR_SESSION_PREFIX}{ticket_id}",
+                    )
+                    edit_submitted = st.form_submit_button(
+                        "Edit & Send",
+                        disabled=not bool(edited.strip()),
+                        use_container_width=True,
+                    )
+                if edit_submitted:
                     _run_human_action(
                         orchestrator,
                         ticket_id,

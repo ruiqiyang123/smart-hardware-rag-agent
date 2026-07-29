@@ -209,6 +209,21 @@ class AppV2ContractTest(unittest.TestCase):
         self.assertIn("st.text(draft_answer)", source)
         self.assertIn("value=draft_answer or", source)
 
+    def test_editor_uses_clear_on_submit_form_and_safe_prefix_cleanup(self):
+        workbench = self.function_source("_render_workbench")
+        workflow_cleanup = self.function_source("_clear_customer_workflow_state")
+        operator_gate = self.function_source("_render_operator_gate")
+
+        self.assertIn("with st.form(", workbench)
+        self.assertIn("clear_on_submit=True", workbench)
+        self.assertIn("st.form_submit_button(", workbench)
+        self.assertIn("EDITOR_SESSION_PREFIX", workbench)
+        self.assertNotIn("st.session_state.pop", workbench)
+        self.assertIn("clear_editor_state(st.session_state)", workflow_cleanup)
+        self.assertEqual(
+            operator_gate.count("clear_editor_state(st.session_state)"), 2
+        )
+
     def test_profiles_are_read_and_saved_by_user_id_without_module_global(self):
         self.assertNotIn("utils.user_profile", self.source)
         self.assertIn("profile_db.get_profile(uid)", self.source)

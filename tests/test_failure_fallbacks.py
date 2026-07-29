@@ -439,11 +439,23 @@ class FailureFallbackTest(unittest.TestCase):
         self.assertEqual(self.repo.list_tickets(), [])
 
         object.__setattr__(prepared, "risk_level", "low")
-        with self.assertRaisesRegex(ValueError, "risk"):
+        with self.assertRaisesRegex(ValueError, "签名"):
             issuer_runtime.submit_prepared(
                 prepared,
                 "1001",
                 request_id="tampered-prepared",
+            )
+        self.assertEqual(self.repo.list_tickets(), [])
+
+        self_consistent = issuer_runtime.prepare_user_input("蓝牙连不上")
+        object.__setattr__(
+            self_consistent, "sanitized_input", "我遇到钓鱼网站"
+        )
+        with self.assertRaisesRegex(ValueError, "签名"):
+            issuer_runtime.submit_prepared(
+                self_consistent,
+                "1001",
+                request_id="self-consistent-tamper",
             )
         self.assertEqual(self.repo.list_tickets(), [])
 
@@ -775,6 +787,24 @@ class FailureFallbackTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "签发者"):
             other_runtime.human_action_prepared(
                 "KG-DOES-NOT-EXIST", prepared, action_id="foreign-action"
+            )
+
+        edited = issuer_runtime.prepare_human_action(
+            "edit_send", edited_answer="原安全回复"
+        )
+        object.__setattr__(edited, "edited_answer", "篡改后的安全回复")
+        with self.assertRaisesRegex(ValueError, "签名"):
+            issuer_runtime.human_action_prepared(
+                "KG-DOES-NOT-EXIST", edited, action_id="tampered-edit"
+            )
+
+        asked = issuer_runtime.prepare_human_action(
+            "ask_user", missing_fields=["device_model"]
+        )
+        object.__setattr__(asked, "missing_fields", ("chain_name",))
+        with self.assertRaisesRegex(ValueError, "签名"):
+            issuer_runtime.human_action_prepared(
+                "KG-DOES-NOT-EXIST", asked, action_id="tampered-ask"
             )
 
     def test_expired_resume_continues_only_from_consistent_checkpoint(self):

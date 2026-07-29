@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import hmac
 import json
 import math
 import re
+import secrets
 import sqlite3
 import uuid
 from collections.abc import Mapping
@@ -140,15 +142,22 @@ class PreparedUserInput:
     risk_flags: tuple[str, ...]
     critical_notice: str
     _issuer: object = field(repr=False, compare=False)
+    signature: bytes = field(repr=False, compare=False)
 
     @classmethod
-    def _issue(cls, value: _ValidatedIngress, issuer: object) -> "PreparedUserInput":
+    def _issue(
+        cls,
+        value: _ValidatedIngress,
+        issuer: object,
+        signature: bytes,
+    ) -> "PreparedUserInput":
         prepared = object.__new__(cls)
         object.__setattr__(prepared, "sanitized_input", value.sanitized_input)
         object.__setattr__(prepared, "risk_level", value.risk_level)
         object.__setattr__(prepared, "risk_flags", tuple(value.risk_flags))
         object.__setattr__(prepared, "critical_notice", value.critical_notice)
         object.__setattr__(prepared, "_issuer", issuer)
+        object.__setattr__(prepared, "signature", signature)
         return prepared
 
 
@@ -160,6 +169,7 @@ class PreparedHumanAction:
     edited_answer: str
     missing_fields: tuple[str, ...]
     _issuer: object = field(repr=False, compare=False)
+    signature: bytes = field(repr=False, compare=False)
 
     @classmethod
     def _issue(
@@ -169,12 +179,14 @@ class PreparedHumanAction:
         edited_answer: str,
         missing_fields: tuple[str, ...],
         issuer: object,
+        signature: bytes,
     ) -> "PreparedHumanAction":
         prepared = object.__new__(cls)
         object.__setattr__(prepared, "action", action)
         object.__setattr__(prepared, "edited_answer", edited_answer)
         object.__setattr__(prepared, "missing_fields", missing_fields)
         object.__setattr__(prepared, "_issuer", issuer)
+        object.__setattr__(prepared, "signature", signature)
         return prepared
 
 
@@ -688,6 +700,7 @@ class SupportOrchestrator:
         self.lease_seconds = lease_seconds
         self.graph_timeout_seconds = float(graph_timeout_seconds)
         self._prepared_issuer = object()
+        self._prepared_signing_key = secrets.token_bytes(32)
         self.trusted_sources = trusted_source_policy or TrustedSourcePolicy()
         if not callable(getattr(self.trusted_sources, "is_trusted", None)):
             raise TypeError("trusted_source_policy 接口非法")
@@ -1352,11 +1365,58 @@ class SupportOrchestrator:
             raise CommandFailedError("command 已进入失败终态")
         return None
 
+    def _sign_prepared_payload(self, kind: str, payload: dict) -> bytes:
+        fingerprint = _payload_fingerprint(
+            {"kind": kind, "payload": payload}
+        )
+        return hmac.new(
+            self._prepared_signing_key,
+            bytes.fromhex(fingerprint),
+            hashlib.sha256,
+        ).digest()
+
+    @staticmethod
+    def _prepared_user_fields(value: object) -> dict:
+        risk_flags = getattr(value, "risk_flags")
+        return {
+            "sanitized_input": getattr(value, "sanitized_input"),
+            "risk_level": getattr(value, "risk_level"),
+            "risk_flags": (
+                list(risk_flags)
+                if isinstance(risk_flags, (list, tuple))
+                else risk_flags
+            ),
+            "critical_notice": getattr(value, "critical_notice"),
+        }
+
+    @staticmethod
+    def _prepared_human_fields(value: object) -> dict:
+        missing_fields = getattr(value, "missing_fields")
+        return {
+            "action": getattr(value, "action"),
+            "edited_answer": getattr(value, "edited_answer"),
+            "missing_fields": (
+                list(missing_fields)
+                if isinstance(missing_fields, (list, tuple))
+                else missing_fields
+            ),
+        }
+
     def prepare_user_input(self, raw_input: str) -> PreparedUserInput:
         """Sanitize caller text once, then issue a runtime-bound safe payload."""
         # This must remain the first operation involving caller-controlled text.
         validated = _validated_ingress(self.ingress_guard.sanitize(raw_input))
-        return PreparedUserInput._issue(validated, self._prepared_issuer)
+        fields = {
+            "sanitized_input": validated.sanitized_input,
+            "risk_level": validated.risk_level,
+            "risk_flags": list(validated.risk_flags),
+            "critical_notice": validated.critical_notice,
+        }
+        return PreparedUserInput._issue(
+            validated,
+            self._prepared_issuer,
+            self._sign_prepared_payload("user_input", fields),
+        )
 
     def _validated_prepared_user_input(
         self, value: object
@@ -1365,6 +1425,17 @@ class SupportOrchestrator:
             raise TypeError("prepared user input 类型非法")
         if getattr(value, "_issuer", None) is not self._prepared_issuer:
             raise ValueError("prepared user input 签发者非法")
+        try:
+            expected_signature = self._sign_prepared_payload(
+                "user_input", self._prepared_user_fields(value)
+            )
+        except Exception:
+            raise ValueError("prepared user input 签名载荷非法") from None
+        signature = getattr(value, "signature", None)
+        if not isinstance(signature, bytes) or not hmac.compare_digest(
+            signature, expected_signature
+        ):
+            raise ValueError("prepared user input 签名非法")
         if not isinstance(value.risk_flags, tuple):
             raise TypeError("prepared risk_flags 类型非法")
         validated = _validated_ingress(
@@ -1607,6 +1678,14 @@ class SupportOrchestrator:
             edited_answer=safe_edited_answer,
             missing_fields=safe_missing_fields,
             issuer=self._prepared_issuer,
+            signature=self._sign_prepared_payload(
+                "human_action",
+                {
+                    "action": action,
+                    "edited_answer": safe_edited_answer,
+                    "missing_fields": list(safe_missing_fields),
+                },
+            ),
         )
 
     def _validated_prepared_human_action(
@@ -1616,6 +1695,17 @@ class SupportOrchestrator:
             raise TypeError("prepared human action 类型非法")
         if getattr(value, "_issuer", None) is not self._prepared_issuer:
             raise ValueError("prepared human action 签发者非法")
+        try:
+            expected_signature = self._sign_prepared_payload(
+                "human_action", self._prepared_human_fields(value)
+            )
+        except Exception:
+            raise ValueError("prepared human action 签名载荷非法") from None
+        signature = getattr(value, "signature", None)
+        if not isinstance(signature, bytes) or not hmac.compare_digest(
+            signature, expected_signature
+        ):
+            raise ValueError("prepared human action 签名非法")
         if not isinstance(value.action, str) or value.action not in _HUMAN_COMMAND_TYPES:
             raise ValueError("prepared human action 非法")
         if not isinstance(value.edited_answer, str):

@@ -3,10 +3,12 @@ import unittest
 from utils.ui_command_state import (
     ACTION_ID_SESSION_PREFIX,
     ACTION_PAYLOAD_SESSION_PREFIX,
+    EDITOR_SESSION_PREFIX,
     REQUEST_HISTORY_ID_SESSION_KEY,
     REQUEST_HISTORY_SESSION_KEY,
     REQUEST_ID_SESSION_KEY,
     REQUEST_PAYLOAD_SESSION_KEY,
+    clear_editor_state,
     clear_frozen_action,
     clear_frozen_actions,
     clear_frozen_request,
@@ -142,6 +144,23 @@ class UICommandStateTest(unittest.TestCase):
         clear_frozen_actions(state)
 
         self.assertEqual(state, {"unrelated": "keep"})
+
+    def test_clear_editor_state_removes_only_editor_widget_keys(self):
+        state = {
+            f"{EDITOR_SESSION_PREFIX}KG-1": "未脱敏编辑内容",
+            f"{ACTION_ID_SESSION_PREFIX}KG-1:edit_send": "action-a",
+            "unrelated": "keep",
+        }
+
+        clear_editor_state(state)
+
+        self.assertEqual(
+            state,
+            {
+                f"{ACTION_ID_SESSION_PREFIX}KG-1:edit_send": "action-a",
+                "unrelated": "keep",
+            },
+        )
 
 
 if __name__ == "__main__":

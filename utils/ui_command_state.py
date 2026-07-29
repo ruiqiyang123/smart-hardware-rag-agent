@@ -9,6 +9,7 @@ REQUEST_HISTORY_SESSION_KEY = "keyguard_v2_request_history"
 REQUEST_PAYLOAD_SESSION_KEY = "keyguard_v2_request_payload"
 ACTION_ID_SESSION_PREFIX = "keyguard_v2_action_id:"
 ACTION_PAYLOAD_SESSION_PREFIX = "keyguard_v2_action_payload:"
+EDITOR_SESSION_PREFIX = "keyguard_v2_editor:"
 _MISSING = object()
 
 
@@ -86,4 +87,11 @@ def clear_frozen_actions(state: MutableMapping[str, object]) -> None:
             key.startswith(ACTION_ID_SESSION_PREFIX)
             or key.startswith(ACTION_PAYLOAD_SESSION_PREFIX)
         ):
+            state.pop(key, None)
+
+
+def clear_editor_state(state: MutableMapping[str, object]) -> None:
+    """Clear editor widgets only before their next instantiation."""
+    for key in list(state):
+        if isinstance(key, str) and key.startswith(EDITOR_SESSION_PREFIX):
             state.pop(key, None)
