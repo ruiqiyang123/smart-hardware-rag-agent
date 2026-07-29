@@ -67,12 +67,14 @@ class AppV2ContractTest(unittest.TestCase):
         self.assertTrue(prompt_calls)
         self.assertTrue(
             all(
-                "orchestrator.submit(" in call
-                or "orchestrator.resume_user(" in call
+                "orchestrator.prepare_user_input(" in call
+                or "get_or_freeze_request_command(" in call
                 for call in prompt_calls
             ),
             prompt_calls,
         )
+        self.assertIn("orchestrator.submit_prepared(", source)
+        self.assertIn("orchestrator.resume_user_prepared(", source)
         self.assertIn('"content": result.sanitized_input', source)
         self.assertNotIn('"content": prompt', source)
         self.assertNotIn("st.markdown(prompt", source)
@@ -113,7 +115,7 @@ class AppV2ContractTest(unittest.TestCase):
             self.assertIn(label, source)
         self.assertIn("orchestrator.get_verified_citations(", source)
         self.assertNotIn("orchestrator.get_state(", source)
-        self.assertIn("orchestrator.human_action(", self.source)
+        self.assertIn("orchestrator.human_action_prepared(", self.source)
         for forbidden in (
             "metadata_json",
             "draft_prompt",
@@ -152,20 +154,44 @@ class AppV2ContractTest(unittest.TestCase):
         action = self.function_source("_run_human_action")
         self.assertIn("_stable_request_id()", submit)
         self.assertEqual(submit.count("request_id=request_id"), 2)
-        self.assertIn("get_or_freeze_safe_history(", submit)
+        self.assertIn("get_or_freeze_request_command(", submit)
+        self.assertIn("orchestrator.prepare_user_input(prompt)", submit)
+        self.assertIn("orchestrator.submit_prepared(", submit)
+        self.assertIn("orchestrator.resume_user_prepared(", submit)
         self.assertIn("safe_history=safe_history", submit)
         self.assertIn("clear_frozen_request(st.session_state)", submit)
         self.assertIn("CommandInProgressError", submit)
         self.assertIn("IdempotencyConflictError", submit)
         self.assertIn("_stable_action_id(", action)
+        self.assertIn("get_or_freeze_action_command(", action)
+        self.assertIn("orchestrator.prepare_human_action(", action)
+        self.assertIn("orchestrator.human_action_prepared(", action)
         self.assertIn("action_id=action_id", action)
-        self.assertIn("st.session_state.pop(action_key, None)", action)
+        self.assertIn("clear_frozen_action(st.session_state, action_key)", action)
         self.assertIn("CommandInProgressError", action)
         self.assertIn("IdempotencyConflictError", action)
+        conflict_handler = submit.split("except IdempotencyConflictError", 1)[1].split(
+            "except", 1
+        )[0]
+        action_conflict_handler = action.split(
+            "except IdempotencyConflictError", 1
+        )[1].split("except", 1)[0]
+        self.assertNotIn("clear_frozen_request", conflict_handler)
+        self.assertNotIn("clear_frozen_action", action_conflict_handler)
+        self.assertIn("RECOVERING_REQUEST_NOTICE", submit)
+        self.assertIn("RECOVERED_REQUEST_NOTICE", submit)
+        terminal_handler = submit.split(
+            "except (CommandFailedError, CheckpointRestoreError)", 1
+        )[1].split("except", 1)[0]
+        self.assertIn(
+            "st.session_state.pop(RECOVERY_NOTICE_SESSION_KEY, None)",
+            terminal_handler,
+        )
+        self.assertIn("RECOVERING_REQUEST_NOTICE", action)
         for cleanup in (
             'st.session_state.pop("active_ticket_id", None)',
             "clear_frozen_request(st.session_state)",
-            "ACTION_ID_SESSION_PREFIX",
+            "clear_frozen_actions(st.session_state)",
         ):
             self.assertIn(cleanup, self.function_source("_clear_customer_workflow_state"))
 

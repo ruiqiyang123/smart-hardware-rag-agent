@@ -28,9 +28,13 @@ from utils.logger_handler import logger
 from utils.model_config import DEFAULT_MIMO_BASE_URL, DEFAULT_MIMO_CHAT_MODEL, build_chat_config
 from utils.session_context import set_location, set_user_id
 from utils.ui_command_state import (
+    ACTION_ID_SESSION_PREFIX,
     REQUEST_ID_SESSION_KEY,
+    clear_frozen_action,
+    clear_frozen_actions,
     clear_frozen_request,
-    get_or_freeze_safe_history,
+    get_or_freeze_action_command,
+    get_or_freeze_request_command,
 )
 
 
@@ -85,7 +89,13 @@ USE_V1_AGENT = AGENT_VERSION == "v1"
 SAFE_FAILURE_NOTICE = "⚠️ 当前请求未能安全完成，请稍后重试或联系人工客服。"
 PENDING_USER_NOTICE = "为了继续处理，请补充工单中标记的必要信息。"
 ESCALATED_NOTICE = "工单已进入人工审核，自动流程不会关闭该问题。"
-ACTION_ID_SESSION_PREFIX = "keyguard_v2_action_id:"
+RECOVERING_REQUEST_NOTICE = (
+    "正在恢复上次请求；本次输入不会作为一个新问题处理。"
+)
+RECOVERED_REQUEST_NOTICE = (
+    "已按原内容恢复上次请求；本次输入未作为新问题处理。"
+)
+RECOVERY_NOTICE_SESSION_KEY = "keyguard_v2_recovery_notice"
 OPERATOR_AUTH_SESSION_KEY = "keyguard_operator_auth"
 _UI_ID_PATTERN = re.compile(r"[0-9a-f]{32}", re.ASCII)
 _MARKDOWN_SPECIALS = frozenset(r"\`*_{}[]()#+-.!|<>")
@@ -111,10 +121,9 @@ def _stable_action_id(ticket_id: str, action: str) -> tuple[str, str]:
 def _clear_customer_workflow_state() -> None:
     st.session_state.pop("active_ticket_id", None)
     clear_frozen_request(st.session_state)
+    clear_frozen_actions(st.session_state)
+    st.session_state.pop(RECOVERY_NOTICE_SESSION_KEY, None)
     st.session_state.pop("pending_prompt", None)
-    for key in list(st.session_state):
-        if isinstance(key, str) and key.startswith(ACTION_ID_SESSION_PREFIX):
-            st.session_state.pop(key, None)
 
 
 def _operator_token_fingerprint(token: str) -> str:
@@ -594,6 +603,7 @@ def _answer_with_citations(result) -> str:
 
 def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str) -> None:
     active_ticket_id = st.session_state.get("active_ticket_id")
+    restoring = False
     try:
         active_ticket = (
             orchestrator.repository.get_ticket(active_ticket_id)
@@ -607,30 +617,60 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
             active_ticket_id = None
             active_ticket = None
         request_id = _stable_request_id()
-        safe_history = get_or_freeze_safe_history(
+        request_route = (
+            ("resume_user", active_ticket_id)
+            if active_ticket and active_ticket.get("status") == "pending_user"
+            else ("submit", None)
+        )
+        frozen_command, safe_history, restoring = get_or_freeze_request_command(
             st.session_state,
             request_id,
             st.session_state.get("messages", []),
+            lambda: (request_route, orchestrator.prepare_user_input(prompt)),
         )
-        if active_ticket and active_ticket.get("status") == "pending_user":
-            result = orchestrator.resume_user(
-                active_ticket_id,
-                prompt,
+        if (
+            not isinstance(frozen_command, tuple)
+            or len(frozen_command) != 2
+            or not isinstance(frozen_command[0], tuple)
+            or len(frozen_command[0]) != 2
+        ):
+            raise ValueError("冻结请求结构非法")
+        frozen_route, prepared = frozen_command
+        route_kind, route_ticket_id = frozen_route
+        if route_kind == "resume_user":
+            if route_ticket_id != active_ticket_id:
+                raise ValueError("冻结请求工单不一致")
+            result = orchestrator.resume_user_prepared(
+                route_ticket_id,
+                prepared,
                 request_id=request_id,
             )
-        else:
-            result = orchestrator.submit(
-                prompt,
+        elif route_kind == "submit" and route_ticket_id is None:
+            result = orchestrator.submit_prepared(
+                prepared,
                 user_id=user_id,
                 request_id=request_id,
                 safe_history=safe_history,
             )
-    except (
-        IdempotencyConflictError,
-        CommandFailedError,
-        CheckpointRestoreError,
-    ) as error:
+        else:
+            raise ValueError("冻结请求路由非法")
+    except IdempotencyConflictError as error:
+        if restoring:
+            st.session_state[RECOVERY_NOTICE_SESSION_KEY] = (
+                RECOVERING_REQUEST_NOTICE
+            )
+        logger.error(
+            "[app]V2 恢复状态异常 stage=runtime error_type=%s",
+            type(error).__name__,
+        )
+        st.session_state["messages"].append(
+            {"role": "assistant", "content": SAFE_FAILURE_NOTICE}
+        )
+        st.rerun()
+        return
+    except (CommandFailedError, CheckpointRestoreError) as error:
         clear_frozen_request(st.session_state)
+        st.session_state.pop(RECOVERY_NOTICE_SESSION_KEY, None)
         logger.error(
             "[app]V2 请求终止 stage=runtime error_type=%s",
             type(error).__name__,
@@ -641,6 +681,10 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
         st.rerun()
         return
     except (CommandInProgressError, TimeoutError) as error:
+        if restoring:
+            st.session_state[RECOVERY_NOTICE_SESSION_KEY] = (
+                RECOVERING_REQUEST_NOTICE
+            )
         logger.error(
             "[app]V2 请求待恢复 stage=runtime error_type=%s",
             type(error).__name__,
@@ -651,6 +695,10 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
         st.rerun()
         return
     except Exception as error:
+        if restoring:
+            st.session_state[RECOVERY_NOTICE_SESSION_KEY] = (
+                RECOVERING_REQUEST_NOTICE
+            )
         logger.error(
             "[app]V2 请求失败 stage=runtime error_type=%s",
             type(error).__name__,
@@ -662,6 +710,8 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
         return
 
     clear_frozen_request(st.session_state)
+    if restoring:
+        st.session_state[RECOVERY_NOTICE_SESSION_KEY] = RECOVERED_REQUEST_NOTICE
     st.session_state["active_ticket_id"] = result.ticket_id
     st.session_state["messages"].append(
         {"role": "user", "content": result.sanitized_input}
@@ -731,19 +781,32 @@ def _run_human_action(
         return
     action_key, action_id = _stable_action_id(ticket_id, action)
     try:
-        orchestrator.human_action(
+        prepared, restoring = get_or_freeze_action_command(
+            st.session_state,
+            action_key,
+            action_id,
+            lambda: orchestrator.prepare_human_action(
+                action,
+                edited_answer=edited_answer,
+                missing_fields=missing_fields,
+            ),
+        )
+        if restoring:
+            st.info(RECOVERING_REQUEST_NOTICE)
+        orchestrator.human_action_prepared(
             ticket_id,
-            action,
-            edited_answer=edited_answer,
-            missing_fields=missing_fields,
+            prepared,
             action_id=action_id,
         )
-    except (
-        IdempotencyConflictError,
-        CommandFailedError,
-        CheckpointRestoreError,
-    ) as error:
-        st.session_state.pop(action_key, None)
+    except IdempotencyConflictError as error:
+        logger.error(
+            "[app]人工操作恢复状态异常 stage=human_action error_type=%s",
+            type(error).__name__,
+        )
+        st.error(SAFE_FAILURE_NOTICE)
+        return
+    except (CommandFailedError, CheckpointRestoreError) as error:
+        clear_frozen_action(st.session_state, action_key)
         logger.error(
             "[app]人工操作终止 stage=human_action error_type=%s",
             type(error).__name__,
@@ -764,7 +827,7 @@ def _run_human_action(
         )
         st.error(SAFE_FAILURE_NOTICE)
         return
-    st.session_state.pop(action_key, None)
+    clear_frozen_action(st.session_state, action_key)
     st.success("操作已安全提交。")
     st.rerun()
 
@@ -806,9 +869,7 @@ def _render_operator_gate() -> bool:
     configured_token = _runtime_secret("KEYGUARD_OPERATOR_TOKEN")
     if not configured_token:
         st.session_state.pop(OPERATOR_AUTH_SESSION_KEY, None)
-        for key in list(st.session_state):
-            if isinstance(key, str) and key.startswith(ACTION_ID_SESSION_PREFIX):
-                st.session_state.pop(key, None)
+        clear_frozen_actions(st.session_state)
         st.warning("工单工作台未启用：服务端未配置独立操作员令牌。")
         return False
 
@@ -816,9 +877,7 @@ def _render_operator_gate() -> bool:
         st.success("操作员已授权。")
         if st.button("退出工作台", key="operator_logout"):
             st.session_state.pop(OPERATOR_AUTH_SESSION_KEY, None)
-            for key in list(st.session_state):
-                if isinstance(key, str) and key.startswith(ACTION_ID_SESSION_PREFIX):
-                    st.session_state.pop(key, None)
+            clear_frozen_actions(st.session_state)
             st.rerun()
         return True
 
@@ -994,6 +1053,9 @@ else:
 customer_tab, workbench_tab = st.tabs(["客户对话", "工单工作台"])
 
 with customer_tab:
+    recovery_notice = st.session_state.pop(RECOVERY_NOTICE_SESSION_KEY, None)
+    if recovery_notice in {RECOVERING_REQUEST_NOTICE, RECOVERED_REQUEST_NOTICE}:
+        st.info(recovery_notice)
     if not st.session_state["messages"]:
         with st.chat_message("assistant", avatar="🔐"):
             st.markdown(

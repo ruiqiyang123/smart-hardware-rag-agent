@@ -15,7 +15,7 @@ import re
 import sqlite3
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
@@ -129,6 +129,53 @@ class CommandInProgressError(RuntimeError):
 
 class CommandFailedError(RuntimeError):
     """The same idempotent command already reached a failed terminal state."""
+
+
+@dataclass(frozen=True, init=False, slots=True)
+class PreparedUserInput:
+    """Ingress-validated, secret-free user command payload."""
+
+    sanitized_input: str
+    risk_level: str
+    risk_flags: tuple[str, ...]
+    critical_notice: str
+    _issuer: object = field(repr=False, compare=False)
+
+    @classmethod
+    def _issue(cls, value: _ValidatedIngress, issuer: object) -> "PreparedUserInput":
+        prepared = object.__new__(cls)
+        object.__setattr__(prepared, "sanitized_input", value.sanitized_input)
+        object.__setattr__(prepared, "risk_level", value.risk_level)
+        object.__setattr__(prepared, "risk_flags", tuple(value.risk_flags))
+        object.__setattr__(prepared, "critical_notice", value.critical_notice)
+        object.__setattr__(prepared, "_issuer", issuer)
+        return prepared
+
+
+@dataclass(frozen=True, init=False, slots=True)
+class PreparedHumanAction:
+    """Strictly projected, secret-free human action payload."""
+
+    action: str
+    edited_answer: str
+    missing_fields: tuple[str, ...]
+    _issuer: object = field(repr=False, compare=False)
+
+    @classmethod
+    def _issue(
+        cls,
+        *,
+        action: str,
+        edited_answer: str,
+        missing_fields: tuple[str, ...],
+        issuer: object,
+    ) -> "PreparedHumanAction":
+        prepared = object.__new__(cls)
+        object.__setattr__(prepared, "action", action)
+        object.__setattr__(prepared, "edited_answer", edited_answer)
+        object.__setattr__(prepared, "missing_fields", missing_fields)
+        object.__setattr__(prepared, "_issuer", issuer)
+        return prepared
 
 
 class _NoCheckpointWritesSafety:
@@ -640,6 +687,7 @@ class SupportOrchestrator:
         self.recursion_limit = recursion_limit
         self.lease_seconds = lease_seconds
         self.graph_timeout_seconds = float(graph_timeout_seconds)
+        self._prepared_issuer = object()
         self.trusted_sources = trusted_source_policy or TrustedSourcePolicy()
         if not callable(getattr(self.trusted_sources, "is_trusted", None)):
             raise TypeError("trusted_source_policy 接口非法")
@@ -1304,6 +1352,42 @@ class SupportOrchestrator:
             raise CommandFailedError("command 已进入失败终态")
         return None
 
+    def prepare_user_input(self, raw_input: str) -> PreparedUserInput:
+        """Sanitize caller text once, then issue a runtime-bound safe payload."""
+        # This must remain the first operation involving caller-controlled text.
+        validated = _validated_ingress(self.ingress_guard.sanitize(raw_input))
+        return PreparedUserInput._issue(validated, self._prepared_issuer)
+
+    def _validated_prepared_user_input(
+        self, value: object
+    ) -> _ValidatedIngress:
+        if type(value) is not PreparedUserInput:
+            raise TypeError("prepared user input 类型非法")
+        if getattr(value, "_issuer", None) is not self._prepared_issuer:
+            raise ValueError("prepared user input 签发者非法")
+        if not isinstance(value.risk_flags, tuple):
+            raise TypeError("prepared risk_flags 类型非法")
+        validated = _validated_ingress(
+            _ValidatedIngress(
+                sanitized_input=value.sanitized_input,
+                risk_level=value.risk_level,
+                risk_flags=list(value.risk_flags),
+                critical_notice=value.critical_notice,
+            )
+        )
+        flags = set(validated.risk_flags)
+        if flags & _CRITICAL_FLAGS:
+            expected_level = RiskLevel.CRITICAL.value
+        elif flags & _HIGH_FLAGS:
+            expected_level = RiskLevel.HIGH.value
+        else:
+            expected_level = RiskLevel.LOW.value
+        if validated.risk_level != expected_level:
+            raise ValueError("prepared risk_level 与 risk_flags 不一致")
+        if expected_level != RiskLevel.CRITICAL.value and validated.critical_notice:
+            raise ValueError("非 critical prepared input 不得包含安全提示")
+        return validated
+
     def submit(
         self,
         raw_input: str,
@@ -1311,8 +1395,21 @@ class SupportOrchestrator:
         request_id: Optional[str] = None,
         safe_history: Optional[List[dict]] = None,
     ) -> OrchestrationResult:
-        # This must remain the first operation involving caller-controlled text.
-        sanitized = _validated_ingress(self.ingress_guard.sanitize(raw_input))
+        return self.submit_prepared(
+            self.prepare_user_input(raw_input),
+            user_id=user_id,
+            request_id=request_id,
+            safe_history=safe_history,
+        )
+
+    def submit_prepared(
+        self,
+        prepared: PreparedUserInput,
+        user_id: str,
+        request_id: Optional[str] = None,
+        safe_history: Optional[List[dict]] = None,
+    ) -> OrchestrationResult:
+        sanitized = self._validated_prepared_user_input(prepared)
         history = _safe_history(safe_history)
         request_id = uuid.uuid4().hex if request_id is None else request_id
         request_id = _identifier(request_id, "request_id", 120)
@@ -1392,7 +1489,19 @@ class SupportOrchestrator:
         raw_input: str,
         request_id: Optional[str] = None,
     ) -> OrchestrationResult:
-        sanitized = _validated_ingress(self.ingress_guard.sanitize(raw_input))
+        return self.resume_user_prepared(
+            ticket_id,
+            self.prepare_user_input(raw_input),
+            request_id=request_id,
+        )
+
+    def resume_user_prepared(
+        self,
+        ticket_id: str,
+        prepared: PreparedUserInput,
+        request_id: Optional[str] = None,
+    ) -> OrchestrationResult:
+        sanitized = self._validated_prepared_user_input(prepared)
         ticket_id = _identifier(ticket_id, "ticket_id")
         request_id = uuid.uuid4().hex if request_id is None else request_id
         request_id = _identifier(request_id, "request_id", 120)
@@ -1456,8 +1565,93 @@ class SupportOrchestrator:
         missing_fields: Optional[List[str]] = None,
         action_id: Optional[str] = None,
     ) -> OrchestrationResult:
+        return self.human_action_prepared(
+            ticket_id,
+            self.prepare_human_action(
+                action,
+                edited_answer=edited_answer,
+                missing_fields=missing_fields,
+            ),
+            action_id=action_id,
+        )
+
+    def prepare_human_action(
+        self,
+        action: str,
+        edited_answer: str = "",
+        missing_fields: Optional[List[str]] = None,
+    ) -> PreparedHumanAction:
         if not isinstance(action, str) or action not in _HUMAN_COMMAND_TYPES:
             raise ValueError("human action 非法")
+        safe_edited_answer = ""
+        if action == "edit_send":
+            sanitized_answer = _validated_ingress(
+                self.ingress_guard.sanitize(edited_answer)
+            )
+            safe_edited_answer = _safe_text(
+                sanitized_answer.sanitized_input, "edited_answer", 2_000
+            )
+        elif edited_answer != "":
+            raise ValueError("该 human action 不接受 edited_answer")
+
+        safe_missing_fields: tuple[str, ...] = ()
+        if action == "ask_user":
+            fields = _string_list(missing_fields, "missing_fields", 16)
+            if not fields or any(field not in _MISSING_FIELDS for field in fields):
+                raise ValueError("missing_fields 非法")
+            safe_missing_fields = tuple(fields)
+        elif missing_fields not in (None, []):
+            raise ValueError("该 human action 不接受 missing_fields")
+        return PreparedHumanAction._issue(
+            action=action,
+            edited_answer=safe_edited_answer,
+            missing_fields=safe_missing_fields,
+            issuer=self._prepared_issuer,
+        )
+
+    def _validated_prepared_human_action(
+        self, value: object
+    ) -> PreparedHumanAction:
+        if type(value) is not PreparedHumanAction:
+            raise TypeError("prepared human action 类型非法")
+        if getattr(value, "_issuer", None) is not self._prepared_issuer:
+            raise ValueError("prepared human action 签发者非法")
+        if not isinstance(value.action, str) or value.action not in _HUMAN_COMMAND_TYPES:
+            raise ValueError("prepared human action 非法")
+        if not isinstance(value.edited_answer, str):
+            raise TypeError("prepared edited_answer 类型非法")
+        if not isinstance(value.missing_fields, tuple):
+            raise TypeError("prepared missing_fields 类型非法")
+        if value.action == "edit_send":
+            safe_answer = _safe_text(
+                value.edited_answer, "edited_answer", 2_000
+            )
+            if safe_answer != value.edited_answer:
+                raise ValueError("prepared edited_answer 非规范化")
+            if value.missing_fields:
+                raise ValueError("edit_send 不接受 missing_fields")
+        elif value.edited_answer:
+            raise ValueError("该 prepared action 不接受 edited_answer")
+        if value.action == "ask_user":
+            fields = _string_list(
+                list(value.missing_fields), "missing_fields", 16
+            )
+            if not fields or any(field not in _MISSING_FIELDS for field in fields):
+                raise ValueError("prepared missing_fields 非法")
+            if tuple(fields) != value.missing_fields:
+                raise ValueError("prepared missing_fields 非规范化")
+        elif value.missing_fields:
+            raise ValueError("该 prepared action 不接受 missing_fields")
+        return value
+
+    def human_action_prepared(
+        self,
+        ticket_id: str,
+        prepared: PreparedHumanAction,
+        action_id: Optional[str] = None,
+    ) -> OrchestrationResult:
+        prepared = self._validated_prepared_human_action(prepared)
+        action = prepared.action
         ticket_id = _identifier(ticket_id, "ticket_id")
         action_id = uuid.uuid4().hex if action_id is None else action_id
         action_id = _identifier(action_id, "action_id", 120)
@@ -1466,25 +1660,11 @@ class SupportOrchestrator:
 
         if action == "approve":
             expected_final_answer = self._approved_checkpoint_answer(ticket_id)
-
-        if action == "edit_send":
-            sanitized_answer = _validated_ingress(
-                self.ingress_guard.sanitize(edited_answer)
-            )
-            resume_payload["edited_answer"] = _safe_text(
-                sanitized_answer.sanitized_input, "edited_answer", 2_000
-            )
-            expected_final_answer = resume_payload["edited_answer"]
-        elif edited_answer != "":
-            raise ValueError("该 human action 不接受 edited_answer")
-
-        if action == "ask_user":
-            fields = _string_list(missing_fields, "missing_fields", 16)
-            if not fields or any(field not in _MISSING_FIELDS for field in fields):
-                raise ValueError("missing_fields 非法")
-            resume_payload["missing_fields"] = fields
-        elif missing_fields not in (None, []):
-            raise ValueError("该 human action 不接受 missing_fields")
+        elif action == "edit_send":
+            resume_payload["edited_answer"] = prepared.edited_answer
+            expected_final_answer = prepared.edited_answer
+        elif action == "ask_user":
+            resume_payload["missing_fields"] = list(prepared.missing_fields)
 
         command_id = _identifier(resume_payload["command_id"], "command_id")
         fingerprint = _payload_fingerprint(

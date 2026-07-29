@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,12 @@ from agent.orchestration.state import TicketState
 from agent.policies.security import IngressGuard, PolicyGuard
 from agent.security.trusted_sources import TrustedSourcePolicy
 from database.ticket_db import TicketRepository
+from utils.ui_command_state import (
+    ACTION_ID_SESSION_PREFIX,
+    REQUEST_ID_SESSION_KEY,
+    get_or_freeze_action_command,
+    get_or_freeze_request_command,
+)
 
 
 MNEMONIC = (
@@ -412,6 +419,49 @@ class FailureFallbackTest(unittest.TestCase):
         self.assertEqual(graph.calls, 0)
         self.assertNotIn(MNEMONIC.encode(), self.db_path.read_bytes())
 
+    def test_prepared_user_input_is_immutable_runtime_bound_and_not_forgeable(self):
+        issuer_runtime = self.runtime(FakeGraph())
+        prepared = issuer_runtime.prepare_user_input(
+            f"疑似泄露：{MNEMONIC}"
+        )
+
+        self.assertNotIn(MNEMONIC, repr(prepared))
+        with self.assertRaises(FrozenInstanceError):
+            prepared.risk_level = "low"
+
+        other_runtime = self.runtime(FakeGraph())
+        with self.assertRaisesRegex(ValueError, "签发者"):
+            other_runtime.submit_prepared(
+                prepared,
+                "1001",
+                request_id="foreign-prepared",
+            )
+        self.assertEqual(self.repo.list_tickets(), [])
+
+        object.__setattr__(prepared, "risk_level", "low")
+        with self.assertRaisesRegex(ValueError, "risk"):
+            issuer_runtime.submit_prepared(
+                prepared,
+                "1001",
+                request_id="tampered-prepared",
+            )
+        self.assertEqual(self.repo.list_tickets(), [])
+
+    def test_frozen_prepared_request_session_contains_no_raw_secret(self):
+        runtime = self.runtime(FakeGraph())
+        state = {REQUEST_ID_SESSION_KEY: "secret-request"}
+        frozen, history, restoring = get_or_freeze_request_command(
+            state,
+            "secret-request",
+            [{"role": "assistant", "content": "此前安全回复"}],
+            lambda: runtime.prepare_user_input(MNEMONIC),
+        )
+
+        self.assertNotIn(MNEMONIC, repr(state))
+        self.assertIn("[REDACTED_SECRET]", frozen.sanitized_input)
+        self.assertEqual(history[0]["content"], "此前安全回复")
+        self.assertFalse(restoring)
+
     def test_duplicate_request_invokes_graph_once(self):
         graph = FakeGraph()
         runtime = self.runtime(graph)
@@ -618,6 +668,115 @@ class FailureFallbackTest(unittest.TestCase):
                     self.assertTrue(duplicate.duplicate)
                     self.assertEqual(graph.calls, 1)
 
+    def test_frozen_edit_and_ask_retries_replay_original_safe_payload(self):
+        cases = (
+            (
+                "edit_send",
+                {"edited_answer": "请按原官方步骤处理"},
+                {"edited_answer": "改变后的回复"},
+                "edited_answer",
+                "请按原官方步骤处理",
+            ),
+            (
+                "ask_user",
+                {"missing_fields": ["device_model"]},
+                {"missing_fields": ["chain_name"]},
+                "missing_fields",
+                ["device_model"],
+            ),
+        )
+        for index, (action, original_args, changed_args, field, expected) in enumerate(
+            cases
+        ):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
+                repo = TicketRepository(Path(directory) / "tickets.db")
+                graph = FakeGraph()
+                runtime = SupportOrchestrator(
+                    repository=repo,
+                    graph=graph,
+                    ingress_guard=IngressGuard(POLICY),
+                    recursion_limit=16,
+                    lease_seconds=130,
+                    graph_timeout_seconds=120,
+                    trusted_source_policy=self.trusted_sources,
+                    final_policy_guard=self.final_policy_guard,
+                    checkpoint_safety=NO_CHECKPOINT_WRITES,
+                )
+                original_repo = self.repo
+                self.repo = repo
+                try:
+                    ticket, checkpoint = self.seed_paused_ticket("escalated")
+                finally:
+                    self.repo = original_repo
+                graph.checkpoint_values = checkpoint
+                action_id = f"frozen-action-{index}"
+                action_key = (
+                    f"{ACTION_ID_SESSION_PREFIX}{ticket['ticket_id']}:{action}"
+                )
+                state = {action_key: action_id}
+                prepared, restoring = get_or_freeze_action_command(
+                    state,
+                    action_key,
+                    action_id,
+                    lambda: runtime.prepare_human_action(action, **original_args),
+                )
+                runtime.human_action_prepared(
+                    ticket["ticket_id"], prepared, action_id=action_id
+                )
+                changed_calls = 0
+
+                def prepare_changed():
+                    nonlocal changed_calls
+                    changed_calls += 1
+                    return runtime.prepare_human_action(action, **changed_args)
+
+                retry, restoring_retry = get_or_freeze_action_command(
+                    state,
+                    action_key,
+                    action_id,
+                    prepare_changed,
+                )
+                duplicate = runtime.human_action_prepared(
+                    ticket["ticket_id"], retry, action_id=action_id
+                )
+
+                self.assertFalse(restoring)
+                self.assertTrue(restoring_retry)
+                self.assertEqual(changed_calls, 0)
+                self.assertEqual(graph.inputs[0].resume[field], expected)
+                self.assertTrue(duplicate.duplicate)
+                self.assertEqual(graph.calls, 1)
+
+    def test_frozen_edited_answer_session_never_contains_raw_secret(self):
+        runtime = self.runtime(FakeGraph())
+        action_key = f"{ACTION_ID_SESSION_PREFIX}KG-1:edit_send"
+        state = {action_key: "secret-edit"}
+        prepared, _ = get_or_freeze_action_command(
+            state,
+            action_key,
+            "secret-edit",
+            lambda: runtime.prepare_human_action(
+                "edit_send", edited_answer=MNEMONIC
+            ),
+        )
+
+        self.assertNotIn(MNEMONIC, repr(state))
+        self.assertIn("[REDACTED_SECRET]", prepared.edited_answer)
+
+    def test_prepared_human_action_is_immutable_and_runtime_bound(self):
+        issuer_runtime = self.runtime(FakeGraph())
+        prepared = issuer_runtime.prepare_human_action(
+            "ask_user", missing_fields=["device_model"]
+        )
+        with self.assertRaises(FrozenInstanceError):
+            prepared.missing_fields = ("chain_name",)
+
+        other_runtime = self.runtime(FakeGraph())
+        with self.assertRaisesRegex(ValueError, "签发者"):
+            other_runtime.human_action_prepared(
+                "KG-DOES-NOT-EXIST", prepared, action_id="foreign-action"
+            )
+
     def test_expired_resume_continues_only_from_consistent_checkpoint(self):
         ticket, checkpoint = self.seed_paused_ticket("pending_user")
         command_id = "request:resume-consistent"
@@ -639,17 +798,48 @@ class FailureFallbackTest(unittest.TestCase):
         graph = FakeGraph([TimeoutError("first worker stopped"), resumed_output])
         graph.checkpoint_values = checkpoint
         runtime = self.runtime(graph)
+        original = runtime.prepare_user_input("设备型号 Mini")
+        changed = runtime.prepare_user_input("设备型号 Pro")
+        session = {REQUEST_ID_SESSION_KEY: "resume-consistent"}
+        frozen, original_history, restoring = get_or_freeze_request_command(
+            session,
+            "resume-consistent",
+            [{"role": "assistant", "content": "请补充设备型号"}],
+            lambda: (("resume_user", ticket["ticket_id"]), original),
+        )
         with self.assertRaises(TimeoutError):
-            runtime.resume_user(
-                ticket["ticket_id"], "设备型号 Mini", request_id="resume-consistent"
+            runtime.resume_user_prepared(
+                ticket["ticket_id"], frozen[1], request_id="resume-consistent"
             )
         self.expire(command_id)
+        changed_calls = 0
 
-        result = runtime.resume_user(
-            ticket["ticket_id"], "设备型号 Mini", request_id="resume-consistent"
+        def changed_prompt():
+            nonlocal changed_calls
+            changed_calls += 1
+            return (("resume_user", ticket["ticket_id"]), changed)
+
+        retry, retry_history, restoring_retry = get_or_freeze_request_command(
+            session,
+            "resume-consistent",
+            [
+                {"role": "assistant", "content": "请补充设备型号"},
+                {"role": "assistant", "content": "安全失败提示"},
+            ],
+            changed_prompt,
+        )
+
+        result = runtime.resume_user_prepared(
+            ticket["ticket_id"], retry[1], request_id="resume-consistent"
         )
 
         self.assertEqual(result.status, "escalated")
+        self.assertFalse(restoring)
+        self.assertTrue(restoring_retry)
+        self.assertEqual(changed_calls, 0)
+        self.assertEqual(retry_history, original_history)
+        self.assertEqual(result.sanitized_input, original.sanitized_input)
+        self.assertNotEqual(result.sanitized_input, changed.sanitized_input)
         self.assertIsNone(graph.inputs[1])
         self.assertEqual(self.command_row(command_id)["lease_version"], 2)
         self.assertEqual(self.command_row(command_id)["status"], "completed")
