@@ -150,6 +150,10 @@ class WalletSafetyGuardTest(unittest.TestCase):
             f"PIN reference transaction hash: {TRANSACTION_HASH}",
             f"密码如下 transaction hash: {TRANSACTION_HASH}",
             f"口令如下 transaction hash: {TRANSACTION_HASH}",
+            f"private key. transaction hash: {TRANSACTION_HASH}",
+            f"交易哈希: {TRANSACTION_HASH}；这是我的私钥",
+            f"private key {'x' * 300} transaction hash: {TRANSACTION_HASH}",
+            f"私钥\n\n\n交易哈希：{TRANSACTION_HASH}",
         )
         for index, raw_input in enumerate(dangerous_inputs):
             with self.subTest(case=index):
@@ -162,26 +166,33 @@ class WalletSafetyGuardTest(unittest.TestCase):
                 self.assertFalse(output.passed)
                 self.assertEqual(output.reason_codes, ["secret_exposure"])
 
-    def test_transaction_hash_whitelist_is_per_candidate_not_global(self):
-        mixed_inputs = (
-            (
-                "0x" + "b" * 64,
-                "my private key is transaction hash: {unsafe_hash}",
-            ),
-            ("0x" + "c" * 64, "另一个未标记值是 {unsafe_hash}"),
+    def test_dangerous_context_revokes_all_labeled_hash_exemptions(self):
+        unsafe_hash = "0x" + "b" * 64
+        raw_input = (
+            f"请查询交易哈希: {TRANSACTION_HASH} 的状态。"
+            f"my private key is transaction hash: {unsafe_hash}"
         )
-        for index, (unsafe_hash, unsafe_template) in enumerate(mixed_inputs):
-            raw_input = (
-                f"请查询交易哈希: {TRANSACTION_HASH} 的状态。"
-                + unsafe_template.format(unsafe_hash=unsafe_hash)
-            )
-            with self.subTest(case=index):
-                result = self.ingress.sanitize(raw_input)
 
-                self.assertEqual(result.risk_level, "critical")
-                self.assertIn(TRANSACTION_HASH, result.sanitized_input)
-                self.assertNotIn(unsafe_hash, result.sanitized_input)
-                self.assertEqual(result.sanitized_input.count("[REDACTED_SECRET]"), 1)
+        result = self.ingress.sanitize(raw_input)
+
+        self.assertEqual(result.risk_level, "critical")
+        self.assertNotIn(TRANSACTION_HASH, result.sanitized_input)
+        self.assertNotIn(unsafe_hash, result.sanitized_input)
+        self.assertEqual(result.sanitized_input.count("[REDACTED_SECRET]"), 2)
+
+    def test_labeled_hash_does_not_whitelist_a_separate_bare_hash(self):
+        unsafe_hash = "0x" + "c" * 64
+        raw_input = (
+            f"请查询交易哈希: {TRANSACTION_HASH} 的状态。"
+            f"另一个未标记值是 {unsafe_hash}"
+        )
+
+        result = self.ingress.sanitize(raw_input)
+
+        self.assertEqual(result.risk_level, "critical")
+        self.assertIn(TRANSACTION_HASH, result.sanitized_input)
+        self.assertNotIn(unsafe_hash, result.sanitized_input)
+        self.assertEqual(result.sanitized_input.count("[REDACTED_SECRET]"), 1)
 
     def test_policy_allows_labeled_transaction_hash_in_normal_answer(self):
         text = f"交易哈希：{TRANSACTION_HASH}，可在官方浏览器中查询。"

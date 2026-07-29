@@ -16,13 +16,11 @@ _LABELED_TRANSACTION_HASH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _DANGEROUS_SECRET_CONTEXT_PATTERN = re.compile(
-    r"\b(?:private[ _-]?key|seed[ _-]?phrase|mnemonic|pass[ _-]?phrase|"
+    r"\b(?:private[ _-]*key|seed[ _-]*phrase|mnemonic|pass[ _-]*phrase|"
     r"pin|password)\b|"
     r"私钥|助记词|密码|口令",
     re.IGNORECASE,
 )
-_SENTENCE_BOUNDARY_PATTERN = re.compile(r"[.!?。！？;；]")
-_TRANSACTION_CONTEXT_RADIUS = 128
 _WIF_PATTERN = re.compile(
     r"(?<![1-9A-HJ-NP-Za-km-z])[5KL][1-9A-HJ-NP-Za-km-z]{50,51}"
     r"(?![1-9A-HJ-NP-Za-km-z])"
@@ -139,37 +137,6 @@ def _mask_spans(value: str, spans: Iterable[Tuple[int, int]]) -> str:
     return "".join(characters)
 
 
-def _limit_local_context(value: str, start: int, end: int) -> str:
-    """Bound context to 128 chars, one sentence, and at most one newline per side."""
-    left = value[max(0, start - _TRANSACTION_CONTEXT_RADIUS) : start]
-    right = value[end : min(len(value), end + _TRANSACTION_CONTEXT_RADIUS)]
-
-    left_boundaries = list(_SENTENCE_BOUNDARY_PATTERN.finditer(left))
-    if left_boundaries:
-        left = left[left_boundaries[-1].end() :]
-    right_boundary = _SENTENCE_BOUNDARY_PATTERN.search(right)
-    if right_boundary:
-        right = right[: right_boundary.start()]
-
-    left_newlines = [index for index, character in enumerate(left) if character == "\n"]
-    if len(left_newlines) > 1:
-        left = left[left_newlines[-2] + 1 :]
-    right_newlines = [
-        index for index, character in enumerate(right) if character == "\n"
-    ]
-    if len(right_newlines) > 1:
-        right = right[: right_newlines[1]]
-    return left + value[start:end] + right
-
-
-def _has_dangerous_transaction_context(
-    value: str,
-    span: Tuple[int, int],
-) -> bool:
-    context = _limit_local_context(value, *span)
-    return _DANGEROUS_SECRET_CONTEXT_PATTERN.search(context) is not None
-
-
 def _secret_spans(value: str) -> List[Tuple[int, int]]:
     candidate = _REDACTED_PATTERN.sub(
         lambda match: "\x00" * len(match.group(0)), value
@@ -191,11 +158,14 @@ def _secret_spans(value: str) -> List[Tuple[int, int]]:
         (match.start(), match.end())
         for match in _LABELED_TRANSACTION_HASH_PATTERN.finditer(candidate)
     ]
+    has_dangerous_secret_context = (
+        _DANGEROUS_SECRET_CONTEXT_PATTERN.search(candidate) is not None
+    )
     safe_hash_spans: List[Tuple[int, int]] = []
     for labeled_hash_span in labeled_hash_spans:
-        if _has_dangerous_transaction_context(
-            candidate, labeled_hash_span
-        ) or any(_spans_overlap(labeled_hash_span, span) for span in spans):
+        if has_dangerous_secret_context or any(
+            _spans_overlap(labeled_hash_span, span) for span in spans
+        ):
             spans.append(labeled_hash_span)
         else:
             safe_hash_spans.append(labeled_hash_span)
