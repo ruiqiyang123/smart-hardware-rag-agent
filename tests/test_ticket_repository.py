@@ -889,6 +889,52 @@ class TicketRepositoryTest(unittest.TestCase):
         self.assertEqual(self.repo.list_events(ticket["ticket_id"]), events_before)
         self.assertEqual(self._command_row(command_id), command_before)
 
+    def test_workbench_projection_revalidates_and_limits_ticket_fields(self):
+        ticket = self._ticket("workbench-projection")
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                UPDATE tickets
+                SET status = 'escalated', category = 'other', priority = 'P1',
+                    risk_level = 'high', summary = ?, draft_answer = ?
+                WHERE ticket_id = ?
+                """,
+                ("设备连接问题", "请使用官方应用重新配对。", ticket["ticket_id"]),
+            )
+
+        projected = self.repo.list_workbench_tickets()
+        self.assertEqual(len(projected), 1)
+        self.assertEqual(
+            set(projected[0]),
+            {
+                "ticket_id",
+                "user_id",
+                "status",
+                "sanitized_input",
+                "summary",
+                "category",
+                "priority",
+                "risk_level",
+                "draft_answer",
+            },
+        )
+        self.assertEqual(projected[0]["draft_answer"], "请使用官方应用重新配对。")
+
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                "UPDATE tickets SET draft_answer = '' WHERE ticket_id = ?",
+                (ticket["ticket_id"],),
+            )
+        self.assertIsNone(self.repo.list_workbench_tickets()[0]["draft_answer"])
+
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                "UPDATE tickets SET draft_answer = ? WHERE ticket_id = ?",
+                (MNEMONIC, ticket["ticket_id"]),
+            )
+        with self.assertRaisesRegex(ValueError, "未脱敏"):
+            self.repo.list_workbench_tickets()
+
 
 if __name__ == "__main__":
     unittest.main()

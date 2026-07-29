@@ -72,6 +72,7 @@ CATEGORY_VALUES = {
 SCHEMA_VERSION = 4
 _EMPTY_PAYLOAD_FINGERPRINT = "0" * 64
 _PAYLOAD_FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}", re.ASCII)
+_WORKBENCH_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}", re.ASCII)
 
 
 SCHEMA = """
@@ -226,6 +227,17 @@ class TicketRepository:
         "summary",
         "metadata",
     }
+    _WORKBENCH_TICKET_FIELDS = (
+        "ticket_id",
+        "user_id",
+        "status",
+        "sanitized_input",
+        "summary",
+        "category",
+        "priority",
+        "risk_level",
+        "draft_answer",
+    )
 
     def __init__(self, db_path: str = "data/keyguard_v2.db"):
         self.db_path = db_path
@@ -317,6 +329,65 @@ class TicketRepository:
     def _assert_no_secret(text: str) -> None:
         if contains_unredacted_secret(text):
             raise ValueError("检测到未脱敏的敏感信息")
+
+    @classmethod
+    def _project_workbench_text(
+        cls,
+        value: object,
+        field_name: str,
+        maximum: int,
+        *,
+        optional: bool = False,
+    ) -> Optional[str]:
+        if optional and (value is None or value == ""):
+            return None
+        text = cls._nonempty_text(value, field_name)
+        if len(text) > maximum or any(
+            ord(character) < 32 and character not in {"\n", "\t"}
+            for character in text
+        ):
+            raise ValueError(f"{field_name} 不可安全展示")
+        cls._assert_no_secret(text)
+        return text
+
+    @classmethod
+    def _project_workbench_identifier(cls, value: object, field_name: str) -> str:
+        text = cls._nonempty_text(value, field_name)
+        if _WORKBENCH_IDENTIFIER_PATTERN.fullmatch(text) is None:
+            raise ValueError(f"{field_name} 不可安全展示")
+        return text
+
+    @classmethod
+    def _project_workbench_ticket(cls, row: Dict[str, object]) -> Dict[str, object]:
+        if not isinstance(row, dict):
+            raise TypeError("workbench ticket 必须是对象")
+        status = cls._enum_value(row.get("status"), "status", STATUS_VALUES, False)
+        category = cls._enum_value(row.get("category"), "category", CATEGORY_VALUES)
+        priority = cls._enum_value(row.get("priority"), "priority", PRIORITY_VALUES)
+        risk_level = cls._enum_value(
+            row.get("risk_level"), "risk_level", RISK_LEVEL_VALUES
+        )
+        return {
+            "ticket_id": cls._project_workbench_identifier(
+                row.get("ticket_id"), "ticket_id"
+            ),
+            "user_id": cls._project_workbench_identifier(
+                row.get("user_id"), "user_id"
+            ),
+            "status": status,
+            "sanitized_input": cls._project_workbench_text(
+                row.get("sanitized_input"), "sanitized_input", 10_000
+            ),
+            "summary": cls._project_workbench_text(
+                row.get("summary"), "summary", 300, optional=True
+            ),
+            "category": category,
+            "priority": priority,
+            "risk_level": risk_level,
+            "draft_answer": cls._project_workbench_text(
+                row.get("draft_answer"), "draft_answer", 2_000, optional=True
+            ),
+        }
 
     @classmethod
     def _prepare_safe_metadata(
@@ -568,6 +639,19 @@ class TicketRepository:
                 """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_workbench_tickets(self) -> List[Dict[str, object]]:
+        """Return a narrow, revalidated projection safe for the operator UI."""
+        columns = ", ".join(self._WORKBENCH_TICKET_FIELDS)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {columns} FROM tickets
+                ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 ELSE 2 END,
+                         updated_at DESC
+                """
+            ).fetchall()
+        return [self._project_workbench_ticket(dict(row)) for row in rows]
 
     def begin_command(
         self,

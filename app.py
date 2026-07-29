@@ -1,6 +1,11 @@
+import hashlib
+import hmac
 import os
+import re
+import uuid
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import streamlit as st
 
@@ -17,7 +22,6 @@ from utils.config_handler import load_orchestration_config, load_security_policy
 from utils.logger_handler import logger
 from utils.model_config import DEFAULT_MIMO_BASE_URL, DEFAULT_MIMO_CHAT_MODEL, build_chat_config
 from utils.session_context import set_location, set_user_id
-from utils.user_profile import load_user_profile, save_user_profile
 
 
 st.set_page_config(
@@ -71,6 +75,62 @@ USE_V1_AGENT = AGENT_VERSION == "v1"
 SAFE_FAILURE_NOTICE = "⚠️ 当前请求未能安全完成，请稍后重试或联系人工客服。"
 PENDING_USER_NOTICE = "为了继续处理，请补充工单中标记的必要信息。"
 ESCALATED_NOTICE = "工单已进入人工审核，自动流程不会关闭该问题。"
+REQUEST_ID_SESSION_KEY = "keyguard_v2_request_id"
+ACTION_ID_SESSION_PREFIX = "keyguard_v2_action_id:"
+OPERATOR_AUTH_SESSION_KEY = "keyguard_operator_auth"
+_UI_ID_PATTERN = re.compile(r"[0-9a-f]{32}", re.ASCII)
+_MARKDOWN_SPECIALS = frozenset(r"\`*_{}[]()#+-.!|<>")
+
+
+def _stable_session_id(key: str) -> str:
+    value = st.session_state.get(key)
+    if not isinstance(value, str) or _UI_ID_PATTERN.fullmatch(value) is None:
+        value = uuid.uuid4().hex
+        st.session_state[key] = value
+    return value
+
+
+def _stable_request_id() -> str:
+    return _stable_session_id(REQUEST_ID_SESSION_KEY)
+
+
+def _stable_action_id(ticket_id: str, action: str) -> tuple[str, str]:
+    key = f"{ACTION_ID_SESSION_PREFIX}{ticket_id}:{action}"
+    return key, _stable_session_id(key)
+
+
+def _clear_customer_workflow_state() -> None:
+    st.session_state.pop("active_ticket_id", None)
+    st.session_state.pop(REQUEST_ID_SESSION_KEY, None)
+    st.session_state.pop("pending_prompt", None)
+    for key in list(st.session_state):
+        if isinstance(key, str) and key.startswith(ACTION_ID_SESSION_PREFIX):
+            st.session_state.pop(key, None)
+
+
+def _operator_token_fingerprint(token: str) -> str:
+    return hmac.new(
+        token.encode("utf-8"),
+        b"keyguard-operator-session-v1",
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _operator_is_authorized() -> bool:
+    configured_token = _runtime_secret("KEYGUARD_OPERATOR_TOKEN")
+    proof = st.session_state.get(OPERATOR_AUTH_SESSION_KEY)
+    if not configured_token or not isinstance(proof, str):
+        return False
+    expected = _operator_token_fingerprint(configured_token)
+    return hmac.compare_digest(proof, expected)
+
+
+def _escape_markdown_text(value: str) -> str:
+    return "".join(f"\\{char}" if char in _MARKDOWN_SPECIALS else char for char in value)
+
+
+def _escape_markdown_url(value: str) -> str:
+    return quote(value, safe=":/?#@!$&'*+,;=%")
 
 env_mimo_key = _runtime_secret("MIMO_API_KEY")
 env_mimo_base_url = _runtime_secret("MIMO_BASE_URL") or DEFAULT_MIMO_BASE_URL
@@ -336,20 +396,17 @@ with st.sidebar:
     if st.session_state.get("active_user") != selected:
         st.session_state["active_user"] = selected
         st.session_state["messages"] = list(PREBUILT_HISTORY_1005) if uid == MEMORY_DEMO_USER_ID else []
-        st.session_state.pop("active_ticket_id", None)
-        load_user_profile(uid)
+        _clear_customer_workflow_state()
 
     if st.button("🗑️ 清空对话", use_container_width=True):
         st.session_state["messages"] = []
-        st.session_state.pop("active_ticket_id", None)
+        _clear_customer_workflow_state()
         st.rerun()
 
     with st.expander("📝 用户档案（可选）", expanded=False):
         st.caption("填写后可获得个性化安全建议")
-
-        from utils.user_profile import current_profile
-
-        profile = current_profile() or UserProfile(user_id=uid)
+        profile_db = ProfileDatabase()
+        profile = profile_db.get_profile(uid) or UserProfile(user_id=uid)
 
         col1, col2 = st.columns(2)
         with col1:
@@ -362,12 +419,12 @@ with st.sidebar:
                 "使用经验",
                 EXPERIENCE_LEVELS,
                 index=experience_default,
-                key="profile_experience_level",
+                key=f"profile_experience_level_{uid}",
             )
             passphrase_enabled = st.checkbox(
                 "已开启 Passphrase",
                 value=profile.passphrase_enabled if profile.passphrase_enabled is not None else False,
-                key="profile_passphrase_enabled",
+                key=f"profile_passphrase_enabled_{uid}",
             )
         with col2:
             connection_default = (
@@ -379,34 +436,38 @@ with st.sidebar:
                 "常用连接方式",
                 CONNECTION_METHODS,
                 index=connection_default,
-                key="profile_connection_method",
+                key=f"profile_connection_method_{uid}",
             )
             backup_verified = st.checkbox(
                 "已完成备份验证",
                 value=profile.backup_verified if profile.backup_verified is not None else False,
-                key="profile_backup_verified",
+                key=f"profile_backup_verified_{uid}",
             )
 
         region = st.text_input(
             "地区",
             value=profile.region or loc,
-            key="profile_region",
+            key=f"profile_region_{uid}",
             placeholder="例如：深圳",
         )
         device_model = st.text_input(
             "设备型号",
             value=profile.device_model or "",
-            key="profile_device",
+            key=f"profile_device_{uid}",
             placeholder="例如：KeyGuard Pro",
         )
         preferred_chains = st.text_input(
             "常用链",
             value=profile.preferred_chains or "",
-            key="profile_chains",
+            key=f"profile_chains_{uid}",
             placeholder="例如：BTC, ETH, SOL",
         )
 
-        if st.button("💾 保存档案", use_container_width=True):
+        if st.button(
+            "💾 保存档案",
+            key=f"save_profile_{uid}",
+            use_container_width=True,
+        ):
             new_profile = UserProfile(
                 user_id=uid,
                 experience_level=experience_level,
@@ -417,17 +478,14 @@ with st.sidebar:
                 passphrase_enabled=passphrase_enabled,
                 backup_verified=backup_verified,
             )
-            if save_user_profile(new_profile):
-                load_user_profile(uid)
+            if profile_db.save_profile(new_profile):
                 st.success("✅ 档案已保存")
                 st.rerun()
             else:
                 st.error("❌ 保存失败，请重试")
 
     with st.expander("🧠 记忆状态", expanded=True):
-        from utils.user_profile import current_profile as _get_profile
-
-        _profile = _get_profile()
+        _profile = ProfileDatabase().get_profile(uid)
         st.markdown("**📝 用户档案**")
         if _profile:
             _parts = []
@@ -516,7 +574,9 @@ def _answer_with_citations(result) -> str:
         answer = "工单已记录，我们会继续安全处理。"
     if result.citations:
         source_lines = [
-            f"- {item['source_title']}：{item['source_url']}"
+            "- "
+            f"[{_escape_markdown_text(item['source_title'])}]"
+            f"({_escape_markdown_url(item['source_url'])})"
             for item in result.citations
         ]
         answer += "\n\n📚 已验证参考来源：\n" + "\n".join(source_lines)
@@ -531,12 +591,24 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
             if active_ticket_id
             else None
         )
+        if active_ticket_id and (
+            active_ticket is None or active_ticket.get("user_id") != user_id
+        ):
+            _clear_customer_workflow_state()
+            active_ticket_id = None
+            active_ticket = None
+        request_id = _stable_request_id()
         if active_ticket and active_ticket.get("status") == "pending_user":
-            result = orchestrator.resume_user(active_ticket_id, prompt)
+            result = orchestrator.resume_user(
+                active_ticket_id,
+                prompt,
+                request_id=request_id,
+            )
         else:
             result = orchestrator.submit(
                 prompt,
                 user_id=user_id,
+                request_id=request_id,
                 safe_history=st.session_state.get("messages", []),
             )
     except Exception as error:
@@ -550,6 +622,7 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
         st.rerun()
         return
 
+    st.session_state.pop(REQUEST_ID_SESSION_KEY, None)
     st.session_state["active_ticket_id"] = result.ticket_id
     st.session_state["messages"].append(
         {"role": "user", "content": result.sanitized_input}
@@ -614,12 +687,17 @@ def _run_human_action(
     edited_answer: str = "",
     missing_fields: Optional[list[str]] = None,
 ) -> None:
+    if not _operator_is_authorized():
+        st.error("工单工作台未授权，操作已拒绝。")
+        return
+    action_key, action_id = _stable_action_id(ticket_id, action)
     try:
         orchestrator.human_action(
             ticket_id,
             action,
             edited_answer=edited_answer,
             missing_fields=missing_fields,
+            action_id=action_id,
         )
     except Exception as error:
         logger.error(
@@ -628,17 +706,24 @@ def _run_human_action(
         )
         st.error(SAFE_FAILURE_NOTICE)
         return
+    st.session_state.pop(action_key, None)
     st.success("操作已安全提交。")
     st.rerun()
 
 
-def _render_active_ticket(orchestrator: SupportOrchestrator) -> None:
+def _render_active_ticket(
+    orchestrator: SupportOrchestrator,
+    user_id: str,
+) -> None:
     ticket_id = st.session_state.get("active_ticket_id")
     if not ticket_id:
         return
     try:
         ticket = orchestrator.repository.get_ticket(ticket_id)
-        events = orchestrator.repository.list_events(ticket_id) if ticket else []
+        if ticket is None or ticket.get("user_id") != user_id:
+            _clear_customer_workflow_state()
+            return
+        events = orchestrator.repository.list_events(ticket_id)
     except Exception as error:
         logger.error(
             "[app]活动工单读取失败 stage=customer_view error_type=%s",
@@ -646,10 +731,6 @@ def _render_active_ticket(orchestrator: SupportOrchestrator) -> None:
         )
         st.warning(SAFE_FAILURE_NOTICE)
         return
-    if not ticket:
-        st.session_state.pop("active_ticket_id", None)
-        return
-
     st.caption(
         f"当前工单 `{ticket_id}` · 状态 `{ticket.get('status') or '-'}` · "
         f"优先级 `{ticket.get('priority') or 'P2'}` · 风险 `{ticket.get('risk_level') or '-'}`"
@@ -663,9 +744,54 @@ def _render_active_ticket(orchestrator: SupportOrchestrator) -> None:
         st.caption(" · ".join(dict.fromkeys(completed_phases)))
 
 
+def _render_operator_gate() -> bool:
+    configured_token = _runtime_secret("KEYGUARD_OPERATOR_TOKEN")
+    if not configured_token:
+        st.session_state.pop(OPERATOR_AUTH_SESSION_KEY, None)
+        for key in list(st.session_state):
+            if isinstance(key, str) and key.startswith(ACTION_ID_SESSION_PREFIX):
+                st.session_state.pop(key, None)
+        st.warning("工单工作台未启用：服务端未配置独立操作员令牌。")
+        return False
+
+    if _operator_is_authorized():
+        st.success("操作员已授权。")
+        if st.button("退出工作台", key="operator_logout"):
+            st.session_state.pop(OPERATOR_AUTH_SESSION_KEY, None)
+            for key in list(st.session_state):
+                if isinstance(key, str) and key.startswith(ACTION_ID_SESSION_PREFIX):
+                    st.session_state.pop(key, None)
+            st.rerun()
+        return True
+
+    with st.form("operator_login", clear_on_submit=True):
+        candidate = st.text_input(
+            "操作员令牌",
+            type="password",
+            autocomplete="off",
+        )
+        submitted = st.form_submit_button("进入工作台")
+    if submitted:
+        token_matches = bool(candidate) and hmac.compare_digest(
+            candidate.encode("utf-8"),
+            configured_token.encode("utf-8"),
+        )
+        if token_matches:
+            st.session_state[OPERATOR_AUTH_SESSION_KEY] = (
+                _operator_token_fingerprint(configured_token)
+            )
+            st.rerun()
+        else:
+            st.error("操作员令牌无效。")
+    return False
+
+
 def _render_workbench(orchestrator: SupportOrchestrator) -> None:
+    if not _operator_is_authorized():
+        st.error("工单工作台未授权。")
+        return
     try:
-        tickets = orchestrator.repository.list_tickets()
+        tickets = orchestrator.repository.list_workbench_tickets()
     except Exception as error:
         logger.error(
             "[app]工单队列读取失败 stage=workbench error_type=%s",
@@ -685,7 +811,7 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
             f"{ticket.get('status') or '-'}"
         )
         with st.expander(label):
-            st.write(ticket.get("summary") or ticket.get("sanitized_input") or "-")
+            st.text(ticket.get("summary") or ticket.get("sanitized_input") or "-")
             st.caption(
                 f"类别 `{ticket.get('category') or '-'}` · "
                 f"优先级 `{ticket.get('priority') or 'P2'}` · "
@@ -694,7 +820,7 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
             try:
                 events = orchestrator.repository.list_events(ticket_id)
                 for event in events:
-                    st.caption(
+                    st.text(
                         f"{event.get('event_type') or '-'} · "
                         f"{event.get('summary') or '-'} · "
                         f"{event.get('from_status') or '-'} → "
@@ -710,8 +836,8 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
                 citations = []
             for citation in citations:
                 st.link_button(
-                    f"📚 {citation['source_title']}",
-                    citation["source_url"],
+                    f"📚 {_escape_markdown_text(citation['source_title'])}",
+                    _escape_markdown_url(citation["source_url"]),
                     key=f"source_{ticket_id}_{citation['source_id']}",
                 )
 
@@ -719,9 +845,13 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
                 continue
 
             st.caption("人工审核区不会展示模型内部提示、工具参数或未审核的原始输出。")
+            draft_answer = ticket.get("draft_answer")
+            if draft_answer:
+                st.markdown("**Repository 安全投影草稿**")
+                st.text(draft_answer)
             edited = st.text_area(
                 "编辑后回复",
-                value="",
+                value=draft_answer or "",
                 placeholder="输入审核后可直接发送给客户的安全回复",
                 key=f"edit_{ticket_id}",
             )
@@ -736,7 +866,7 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
                 if st.button(
                     "Approve",
                     key=f"approve_{ticket_id}",
-                    disabled=not bool(ticket.get("draft_answer")),
+                    disabled=not bool(draft_answer),
                     use_container_width=True,
                 ):
                     _run_human_action(orchestrator, ticket_id, "approve")
@@ -827,7 +957,7 @@ with customer_tab:
             st.markdown(message["content"])
 
     if orchestrator is not None:
-        _render_active_ticket(orchestrator)
+        _render_active_ticket(orchestrator, uid)
 
     prompt = st.chat_input(
         "输入你的问题，例如：硬件钱包开不了机或蓝牙连不上怎么办？"
@@ -852,5 +982,5 @@ with workbench_tab:
         st.info("当前为显式 V1 兼容模式；工单工作台仅在 V2 Runtime 中启用。")
     elif orchestrator is None:
         st.error(SAFE_FAILURE_NOTICE)
-    else:
+    elif _render_operator_gate():
         _render_workbench(orchestrator)

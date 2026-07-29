@@ -122,6 +122,81 @@ class AppV2ContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
+    def test_workbench_is_closed_without_independent_operator_auth(self):
+        gate = self.function_source("_render_operator_gate")
+        workbench = self.function_source("_render_workbench")
+        action = self.function_source("_run_human_action")
+        self.assertIn("KEYGUARD_OPERATOR_TOKEN", self.source)
+        self.assertIn("hmac.compare_digest", gate)
+        self.assertIn("工作台未启用", gate)
+        self.assertIn("退出工作台", gate)
+        self.assertLess(
+            workbench.index("_operator_is_authorized"),
+            workbench.index("list_workbench_tickets"),
+        )
+        self.assertLess(
+            action.index("_operator_is_authorized"),
+            action.index("orchestrator.human_action"),
+        )
+
+    def test_customer_ticket_ownership_is_checked_on_submit_and_render(self):
+        submit = self.function_source("_run_v2_prompt")
+        render = self.function_source("_render_active_ticket")
+        self.assertIn('active_ticket.get("user_id") != user_id', submit)
+        self.assertIn('ticket.get("user_id") != user_id', render)
+        self.assertIn("_clear_customer_workflow_state()", submit)
+        self.assertIn("_clear_customer_workflow_state()", render)
+
+    def test_ui_persists_and_passes_stable_idempotency_ids(self):
+        submit = self.function_source("_run_v2_prompt")
+        action = self.function_source("_run_human_action")
+        self.assertIn("_stable_request_id()", submit)
+        self.assertEqual(submit.count("request_id=request_id"), 2)
+        self.assertIn('st.session_state.pop(REQUEST_ID_SESSION_KEY, None)', submit)
+        self.assertIn("_stable_action_id(", action)
+        self.assertIn("action_id=action_id", action)
+        self.assertIn("st.session_state.pop(action_key, None)", action)
+        for cleanup in (
+            'st.session_state.pop("active_ticket_id", None)',
+            "REQUEST_ID_SESSION_KEY",
+            "ACTION_ID_SESSION_PREFIX",
+        ):
+            self.assertIn(cleanup, self.function_source("_clear_customer_workflow_state"))
+
+    def test_citation_markdown_fields_are_escaped(self):
+        source = self.function_source("_answer_with_citations")
+        self.assertIn("_escape_markdown_text", source)
+        self.assertIn("_escape_markdown_url", source)
+        self.assertIn("[", source)
+
+    def test_workbench_displays_only_repository_projected_draft(self):
+        source = self.function_source("_render_workbench")
+        self.assertIn("list_workbench_tickets", source)
+        self.assertNotIn("repository.list_tickets", source)
+        self.assertIn('draft_answer = ticket.get("draft_answer")', source)
+        self.assertIn("st.text(draft_answer)", source)
+        self.assertIn("value=draft_answer or", source)
+
+    def test_profiles_are_read_and_saved_by_user_id_without_module_global(self):
+        self.assertNotIn("utils.user_profile", self.source)
+        self.assertIn("profile_db.get_profile(uid)", self.source)
+        self.assertIn("profile_db.save_profile(new_profile)", self.source)
+        for key in (
+            "profile_experience_level_{uid}",
+            "profile_passphrase_enabled_{uid}",
+            "profile_connection_method_{uid}",
+            "profile_backup_verified_{uid}",
+            "profile_region_{uid}",
+            "profile_device_{uid}",
+            "profile_chains_{uid}",
+            "save_profile_{uid}",
+        ):
+            self.assertIn(key, self.source)
+
+    def test_env_example_documents_operator_token(self):
+        env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("KEYGUARD_OPERATOR_TOKEN=", env_example)
+
     def test_customer_phase_labels_match_graph_event_types(self):
         for event_type in (
             "entry_checked",
