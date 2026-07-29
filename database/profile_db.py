@@ -5,10 +5,14 @@
 是否开启 Passphrase、是否完成备份验证），用于个性化安全建议和故障排查。
 """
 
+import re
 import sqlite3
-from typing import Optional
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
+
+from agent.security.secrets import contains_unredacted_secret
 from utils.logger_handler import logger
 
 
@@ -27,6 +31,15 @@ class UserProfile:
 
 class ProfileDatabase:
     """硬件钱包用户档案数据库服务"""
+
+    _TEXT_LIMITS = {
+        "experience_level": 16,
+        "region": 100,
+        "device_model": 100,
+        "preferred_chains": 500,
+        "connection_method": 50,
+    }
+    _USER_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}", re.ASCII)
 
     def __init__(self, db_path: str = "data/profiles.db"):
         """
@@ -80,7 +93,80 @@ class ProfileDatabase:
 
         conn.commit()
         conn.close()
-        logger.info(f"[ProfileDB] 数据库初始化完成: {self.db_path}")
+        logger.info("[ProfileDB] 数据库初始化完成")
+
+    @classmethod
+    def _safe_user_id(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise TypeError("user_id 类型非法")
+        normalized = value.strip()
+        if (
+            not normalized
+            or cls._USER_ID_PATTERN.fullmatch(normalized) is None
+            or any(unicodedata.category(char).startswith("C") for char in normalized)
+            or contains_unredacted_secret(normalized)
+        ):
+            raise ValueError("user_id 非法")
+        return normalized
+
+    @classmethod
+    def _safe_optional_text(cls, value: object, field: str) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise TypeError(f"{field} 类型非法")
+        normalized = value.strip()
+        if (
+            not normalized
+            or len(normalized) > cls._TEXT_LIMITS[field]
+            or any(unicodedata.category(char).startswith("C") for char in normalized)
+            or contains_unredacted_secret(normalized)
+        ):
+            raise ValueError(f"{field} 非法")
+        return normalized
+
+    @staticmethod
+    def _safe_optional_bool(value: object, field: str) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        raise TypeError(f"{field} 类型非法")
+
+    @staticmethod
+    def _database_optional_bool(value: object, field: str) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, int) and value in {0, 1}:
+            return bool(value)
+        raise TypeError(f"{field} 类型非法")
+
+    @classmethod
+    def _project_profile(cls, profile: object) -> UserProfile:
+        if not isinstance(profile, UserProfile):
+            raise TypeError("profile 类型非法")
+        return UserProfile(
+            user_id=cls._safe_user_id(profile.user_id),
+            experience_level=cls._safe_optional_text(
+                profile.experience_level, "experience_level"
+            ),
+            region=cls._safe_optional_text(profile.region, "region"),
+            device_model=cls._safe_optional_text(
+                profile.device_model, "device_model"
+            ),
+            preferred_chains=cls._safe_optional_text(
+                profile.preferred_chains, "preferred_chains"
+            ),
+            connection_method=cls._safe_optional_text(
+                profile.connection_method, "connection_method"
+            ),
+            passphrase_enabled=cls._safe_optional_bool(
+                profile.passphrase_enabled, "passphrase_enabled"
+            ),
+            backup_verified=cls._safe_optional_bool(
+                profile.backup_verified, "backup_verified"
+            ),
+        )
 
     def save_profile(self, profile: UserProfile) -> bool:
         """保存或更新用户档案
@@ -92,31 +178,30 @@ class ProfileDatabase:
             是否保存成功
         """
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-
-            cursor.execute("""
-                INSERT OR REPLACE INTO user_profiles
-                (user_id, experience_level, region, device_model,
-                 preferred_chains, connection_method, passphrase_enabled, backup_verified)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                profile.user_id,
-                profile.experience_level,
-                profile.region,
-                profile.device_model,
-                profile.preferred_chains,
-                profile.connection_method,
-                profile.passphrase_enabled,
-                profile.backup_verified,
-            ))
-
-            conn.commit()
-            conn.close()
-            logger.info(f"[ProfileDB] 用户档案已保存: {profile.user_id}")
+            projected = self._project_profile(profile)
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO user_profiles
+                    (user_id, experience_level, region, device_model,
+                     preferred_chains, connection_method, passphrase_enabled, backup_verified)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    projected.user_id,
+                    projected.experience_level,
+                    projected.region,
+                    projected.device_model,
+                    projected.preferred_chains,
+                    projected.connection_method,
+                    projected.passphrase_enabled,
+                    projected.backup_verified,
+                ))
+            logger.info("[ProfileDB] 用户档案已保存")
             return True
-        except Exception as e:
-            logger.error(f"[ProfileDB] 保存失败: {e}")
+        except Exception as error:
+            logger.error(
+                "[ProfileDB] 保存失败 error_type=%s",
+                type(error).__name__,
+            )
             return False
 
     def get_profile(self, user_id: str) -> Optional[UserProfile]:
@@ -129,30 +214,33 @@ class ProfileDatabase:
             用户档案对象，不存在则返回 None
         """
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-
-            cursor.execute("""
-                SELECT user_id, experience_level, region, device_model,
-                       preferred_chains, connection_method, passphrase_enabled, backup_verified
-                FROM user_profiles WHERE user_id = ?
-            """, (user_id,))
-
-            row = cursor.fetchone()
-            conn.close()
+            safe_user_id = self._safe_user_id(user_id)
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute("""
+                    SELECT user_id, experience_level, region, device_model,
+                           preferred_chains, connection_method, passphrase_enabled, backup_verified
+                    FROM user_profiles WHERE user_id = ?
+                """, (safe_user_id,)).fetchone()
 
             if row:
-                return UserProfile(
+                return self._project_profile(UserProfile(
                     user_id=row[0],
                     experience_level=row[1],
                     region=row[2],
                     device_model=row[3],
                     preferred_chains=row[4],
                     connection_method=row[5],
-                    passphrase_enabled=bool(row[6]) if row[6] is not None else None,
-                    backup_verified=bool(row[7]) if row[7] is not None else None,
-                )
+                    passphrase_enabled=self._database_optional_bool(
+                        row[6], "passphrase_enabled"
+                    ),
+                    backup_verified=self._database_optional_bool(
+                        row[7], "backup_verified"
+                    ),
+                ))
             return None
-        except Exception as e:
-            logger.error(f"[ProfileDB] 查询失败: {e}")
+        except Exception as error:
+            logger.error(
+                "[ProfileDB] 查询失败 error_type=%s",
+                type(error).__name__,
+            )
             return None

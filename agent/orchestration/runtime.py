@@ -123,6 +123,14 @@ class CheckpointRestoreError(RuntimeError):
     """A leased command could not safely continue from its checkpoint."""
 
 
+class CommandInProgressError(RuntimeError):
+    """The same idempotent command is still running."""
+
+
+class CommandFailedError(RuntimeError):
+    """The same idempotent command already reached a failed terminal state."""
+
+
 class _NoCheckpointWritesSafety:
     """Explicit test-only assertion that a graph never writes checkpoints."""
 
@@ -446,7 +454,8 @@ def _assert_separate_checkpoint_database(
         raise ValueError("ticket repository 与 SQLite checkpointer 不得共用数据库")
 
 
-def _safe_history(value: object) -> list[dict[str, str]]:
+def project_safe_history(value: object) -> list[dict[str, str]]:
+    """Return the exact bounded, secret-free history accepted by the runtime."""
     if value is None:
         return []
     if not isinstance(value, list) or len(value) > 24:
@@ -465,6 +474,10 @@ def _safe_history(value: object) -> list[dict[str, str]]:
             raise ValueError("safe_history 总长度超限")
         projected.append({"role": role, "content": content})
     return projected
+
+
+def _safe_history(value: object) -> list[dict[str, str]]:
+    return project_safe_history(value)
 
 
 def _validated_ingress(value: object) -> _ValidatedIngress:
@@ -762,11 +775,12 @@ class SupportOrchestrator:
 
     def _fail_command_safely(
         self, command_id: str, lease_version: int, error_code: str
-    ) -> None:
+    ) -> bool:
         try:
             self.repository.fail_command(command_id, lease_version, error_code)
+            return True
         except Exception:
-            pass
+            return False
 
     def _execute(
         self,
@@ -811,12 +825,14 @@ class SupportOrchestrator:
             raise
         except CheckpointRestoreError:
             raise
-        except Exception:
-            self._fail_command_safely(
+        except Exception as error:
+            failed = self._fail_command_safely(
                 command_id,
                 decision.lease_version,
                 "GRAPH_EXECUTION_FAILED",
             )
+            if failed:
+                raise CommandFailedError("command 执行失败") from error
             raise
 
     def _persist_graph_result(
@@ -1275,18 +1291,17 @@ class SupportOrchestrator:
         sanitized_input: str,
         user_notice: str,
     ) -> Optional[OrchestrationResult]:
-        if decision.disposition in {
-            CommandDisposition.COMPLETED,
-            CommandDisposition.IN_PROGRESS,
-        }:
+        if decision.disposition == CommandDisposition.COMPLETED:
             return self._result(
                 ticket_id,
                 sanitized_input,
                 user_notice,
                 duplicate=True,
             )
+        if decision.disposition == CommandDisposition.IN_PROGRESS:
+            raise CommandInProgressError("command 仍在执行")
         if decision.disposition == CommandDisposition.FAILED:
-            raise RuntimeError("该 command 已安全失败，请使用新的幂等 ID")
+            raise CommandFailedError("command 已进入失败终态")
         return None
 
     def submit(

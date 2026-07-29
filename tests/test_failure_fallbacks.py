@@ -14,6 +14,8 @@ from langgraph.graph import END, StateGraph
 from langgraph.types import Command, Interrupt, interrupt
 
 from agent.orchestration.runtime import (
+    CommandFailedError,
+    CommandInProgressError,
     NO_CHECKPOINT_WRITES,
     LeaseFencedCheckpointer,
     SupportOrchestrator,
@@ -420,6 +422,80 @@ class FailureFallbackTest(unittest.TestCase):
         self.assertTrue(duplicate.duplicate)
         self.assertEqual(graph.calls, 1)
 
+    def test_duplicate_request_in_progress_raises_typed_recoverable_error(self):
+        class BlockingGraph(FakeGraph):
+            def __init__(self):
+                super().__init__()
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def invoke(self, graph_input, config):
+                self.started.set()
+                if not self.release.wait(timeout=5):
+                    raise TimeoutError("test release timeout")
+                return super().invoke(graph_input, config)
+
+        graph = BlockingGraph()
+        runtime = self.runtime(graph)
+        results = []
+        errors = []
+
+        def first_submit():
+            try:
+                results.append(
+                    runtime.submit(
+                        "蓝牙连不上", "1001", request_id="req-in-progress"
+                    )
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        worker = threading.Thread(target=first_submit)
+        worker.start()
+        self.assertTrue(graph.started.wait(timeout=2))
+        with self.assertRaises(CommandInProgressError):
+            runtime.submit("蓝牙连不上", "1001", request_id="req-in-progress")
+        self.assertEqual(graph.calls, 0)
+
+        graph.release.set()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(graph.calls, 1)
+
+    def test_confirmed_command_failure_raises_typed_error_and_does_not_rerun(self):
+        graph = FakeGraph([ValueError("provider detail")])
+        runtime = self.runtime(graph)
+
+        with self.assertRaises(CommandFailedError) as raised:
+            runtime.submit("蓝牙连不上", "1001", request_id="req-failed")
+
+        self.assertIsInstance(raised.exception.__cause__, ValueError)
+        self.assertEqual(
+            self.command_row("request:req-failed")["status"], "failed"
+        )
+        with self.assertRaises(CommandFailedError) as duplicate:
+            runtime.submit("蓝牙连不上", "1001", request_id="req-failed")
+        self.assertIsNone(duplicate.exception.__cause__)
+        self.assertEqual(graph.calls, 1)
+
+    def test_unconfirmed_failure_preserves_original_error(self):
+        graph = FakeGraph([ValueError("provider detail")])
+        runtime = self.runtime(graph)
+
+        with patch.object(
+            self.repo,
+            "fail_command",
+            side_effect=RuntimeError("database status unknown"),
+        ), self.assertRaises(ValueError) as raised:
+            runtime.submit("蓝牙连不上", "1001", request_id="req-uncertain")
+
+        self.assertNotIsInstance(raised.exception, CommandFailedError)
+        self.assertEqual(
+            self.command_row("request:req-uncertain")["status"], "in_progress"
+        )
+
     def test_runtime_serializes_distinct_actions_for_one_ticket(self):
         class BlockingGraph(FakeGraph):
             def __init__(self):
@@ -678,7 +754,7 @@ class FailureFallbackTest(unittest.TestCase):
                         final_policy_guard=self.final_policy_guard,
                         checkpoint_safety=NO_CHECKPOINT_WRITES,
                     )
-                    with self.assertRaises((TypeError, ValueError)):
+                    with self.assertRaises(CommandFailedError):
                         runtime.submit(
                             "连接失败", "1001", request_id=f"invalid-{kind}"
                         )
@@ -743,7 +819,7 @@ class FailureFallbackTest(unittest.TestCase):
                         final_policy_guard=self.final_policy_guard,
                         checkpoint_safety=NO_CHECKPOINT_WRITES,
                     )
-                    with self.assertRaises(ValueError):
+                    with self.assertRaises(CommandFailedError):
                         runtime.submit(
                             "连接失败", "1001", request_id=f"terminal-{name}"
                         )
@@ -761,10 +837,11 @@ class FailureFallbackTest(unittest.TestCase):
                 )
             ]
         )
-        with self.assertRaisesRegex(ValueError, "Policy Guard"):
+        with self.assertRaises(CommandFailedError) as raised:
             self.runtime(graph).submit(
                 "连接失败", "1001", request_id="unsafe-final-answer"
             )
+        self.assertIn("Policy Guard", str(raised.exception.__cause__))
         ticket = self.repo.list_tickets()[0]
         self.assertEqual(ticket["status"], "new")
         self.assertIsNone(ticket["final_answer"])
@@ -843,10 +920,11 @@ class FailureFallbackTest(unittest.TestCase):
                         final_policy_guard=self.final_policy_guard,
                         checkpoint_safety=NO_CHECKPOINT_WRITES,
                     )
-                    with self.assertRaisesRegex(ValueError, "citation"):
+                    with self.assertRaises(CommandFailedError) as raised:
                         runtime.submit(
                             "连接失败", "1001", request_id=f"citation-{index}"
                         )
+                    self.assertIn("citation", str(raised.exception.__cause__))
                     self.assertEqual(repo.list_tickets()[0]["status"], "new")
 
     def test_runtime_rejects_illegal_graph_transition_before_commit(self):
@@ -860,10 +938,11 @@ class FailureFallbackTest(unittest.TestCase):
             output["event_step"] = 1
             return output
 
-        with self.assertRaisesRegex(ValueError, "非法状态转移"):
+        with self.assertRaises(CommandFailedError) as raised:
             self.runtime(FakeGraph([illegal])).submit(
                 "连接失败", "1001", request_id="illegal-transition"
             )
+        self.assertIn("非法状态转移", str(raised.exception.__cause__))
         self.assertEqual(self.repo.list_tickets()[0]["status"], "new")
 
     def test_human_ask_or_reject_cannot_forge_resolved(self):
@@ -919,13 +998,14 @@ class FailureFallbackTest(unittest.TestCase):
                         if action == "ask_user"
                         else {}
                     )
-                    with self.assertRaisesRegex(ValueError, "不得 resolved"):
+                    with self.assertRaises(CommandFailedError) as raised:
                         runtime.human_action(
                             ticket["ticket_id"],
                             action,
                             action_id=f"forged-{action}",
                             **kwargs,
                         )
+                    self.assertIn("不得 resolved", str(raised.exception.__cause__))
                     self.assertEqual(
                         repo.get_ticket(ticket["ticket_id"])["status"], "escalated"
                     )
@@ -984,13 +1064,14 @@ class FailureFallbackTest(unittest.TestCase):
                         final_policy_guard=self.final_policy_guard,
                         checkpoint_safety=NO_CHECKPOINT_WRITES,
                     )
-                    with self.assertRaisesRegex(ValueError, "人工审核文本"):
+                    with self.assertRaises(CommandFailedError) as raised:
                         runtime.human_action(
                             ticket["ticket_id"],
                             action,
                             action_id=f"replace-{action}",
                             **kwargs,
                         )
+                    self.assertIn("人工审核文本", str(raised.exception.__cause__))
                     stored = repo.get_ticket(ticket["ticket_id"])
                     self.assertEqual(stored["status"], "escalated")
                     self.assertIsNone(stored["final_answer"])
@@ -1017,7 +1098,7 @@ class FailureFallbackTest(unittest.TestCase):
 
     def test_malformed_interrupt_output_is_rejected(self):
         graph = FakeGraph([{"__interrupt__": object()}])
-        with self.assertRaises((TypeError, ValueError)):
+        with self.assertRaises(CommandFailedError):
             self.runtime(graph).submit(
                 "连接失败", "1001", request_id="invalid-interrupt"
             )
@@ -1082,10 +1163,11 @@ class FailureFallbackTest(unittest.TestCase):
             return state
 
         graph = FakeGraph([output])
-        with self.assertRaisesRegex(ValueError, "不可信"):
+        with self.assertRaises(CommandFailedError) as raised:
             self.runtime(graph).submit(
                 "连接失败", "1001", request_id="untrusted-citation"
             )
+        self.assertIn("不可信", str(raised.exception.__cause__))
         self.assertNotIn(b"evil.example", self.db_path.read_bytes())
 
     def test_database_rejects_non_hex_payload_fingerprint(self):
@@ -1282,7 +1364,7 @@ class FailureFallbackTest(unittest.TestCase):
                         final_policy_guard=self.final_policy_guard,
                     )
 
-                    with self.assertRaises((TypeError, ValueError)):
+                    with self.assertRaises(CommandFailedError):
                         runtime.submit(
                             "连接失败",
                             "1001",

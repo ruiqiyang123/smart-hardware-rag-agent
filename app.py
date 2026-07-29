@@ -10,18 +10,28 @@ from urllib.parse import quote
 import streamlit as st
 
 from agent.orchestration.graph import build_configured_graph, sqlite_checkpointer
-from agent.orchestration.runtime import SupportOrchestrator
+from agent.orchestration.runtime import (
+    CheckpointRestoreError,
+    CommandFailedError,
+    CommandInProgressError,
+    SupportOrchestrator,
+)
 from agent.policies.security import IngressGuard, PolicyGuard
 from agent.react_agent import ReactAgent
 from agent.security.trusted_sources import TrustedSourcePolicy
 from agent.tools.agent_tools import configure_rag_model
 from database.profile_db import ProfileDatabase, UserProfile
-from database.ticket_db import TicketRepository
+from database.ticket_db import IdempotencyConflictError, TicketRepository
 from model.factory import build_chat_model
 from utils.config_handler import load_orchestration_config, load_security_policy
 from utils.logger_handler import logger
 from utils.model_config import DEFAULT_MIMO_BASE_URL, DEFAULT_MIMO_CHAT_MODEL, build_chat_config
 from utils.session_context import set_location, set_user_id
+from utils.ui_command_state import (
+    REQUEST_ID_SESSION_KEY,
+    clear_frozen_request,
+    get_or_freeze_safe_history,
+)
 
 
 st.set_page_config(
@@ -75,7 +85,6 @@ USE_V1_AGENT = AGENT_VERSION == "v1"
 SAFE_FAILURE_NOTICE = "⚠️ 当前请求未能安全完成，请稍后重试或联系人工客服。"
 PENDING_USER_NOTICE = "为了继续处理，请补充工单中标记的必要信息。"
 ESCALATED_NOTICE = "工单已进入人工审核，自动流程不会关闭该问题。"
-REQUEST_ID_SESSION_KEY = "keyguard_v2_request_id"
 ACTION_ID_SESSION_PREFIX = "keyguard_v2_action_id:"
 OPERATOR_AUTH_SESSION_KEY = "keyguard_operator_auth"
 _UI_ID_PATTERN = re.compile(r"[0-9a-f]{32}", re.ASCII)
@@ -101,7 +110,7 @@ def _stable_action_id(ticket_id: str, action: str) -> tuple[str, str]:
 
 def _clear_customer_workflow_state() -> None:
     st.session_state.pop("active_ticket_id", None)
-    st.session_state.pop(REQUEST_ID_SESSION_KEY, None)
+    clear_frozen_request(st.session_state)
     st.session_state.pop("pending_prompt", None)
     for key in list(st.session_state):
         if isinstance(key, str) and key.startswith(ACTION_ID_SESSION_PREFIX):
@@ -598,6 +607,11 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
             active_ticket_id = None
             active_ticket = None
         request_id = _stable_request_id()
+        safe_history = get_or_freeze_safe_history(
+            st.session_state,
+            request_id,
+            st.session_state.get("messages", []),
+        )
         if active_ticket and active_ticket.get("status") == "pending_user":
             result = orchestrator.resume_user(
                 active_ticket_id,
@@ -609,8 +623,33 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
                 prompt,
                 user_id=user_id,
                 request_id=request_id,
-                safe_history=st.session_state.get("messages", []),
+                safe_history=safe_history,
             )
+    except (
+        IdempotencyConflictError,
+        CommandFailedError,
+        CheckpointRestoreError,
+    ) as error:
+        clear_frozen_request(st.session_state)
+        logger.error(
+            "[app]V2 请求终止 stage=runtime error_type=%s",
+            type(error).__name__,
+        )
+        st.session_state["messages"].append(
+            {"role": "assistant", "content": SAFE_FAILURE_NOTICE}
+        )
+        st.rerun()
+        return
+    except (CommandInProgressError, TimeoutError) as error:
+        logger.error(
+            "[app]V2 请求待恢复 stage=runtime error_type=%s",
+            type(error).__name__,
+        )
+        st.session_state["messages"].append(
+            {"role": "assistant", "content": SAFE_FAILURE_NOTICE}
+        )
+        st.rerun()
+        return
     except Exception as error:
         logger.error(
             "[app]V2 请求失败 stage=runtime error_type=%s",
@@ -622,7 +661,7 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
         st.rerun()
         return
 
-    st.session_state.pop(REQUEST_ID_SESSION_KEY, None)
+    clear_frozen_request(st.session_state)
     st.session_state["active_ticket_id"] = result.ticket_id
     st.session_state["messages"].append(
         {"role": "user", "content": result.sanitized_input}
@@ -699,6 +738,25 @@ def _run_human_action(
             missing_fields=missing_fields,
             action_id=action_id,
         )
+    except (
+        IdempotencyConflictError,
+        CommandFailedError,
+        CheckpointRestoreError,
+    ) as error:
+        st.session_state.pop(action_key, None)
+        logger.error(
+            "[app]人工操作终止 stage=human_action error_type=%s",
+            type(error).__name__,
+        )
+        st.error(SAFE_FAILURE_NOTICE)
+        return
+    except (CommandInProgressError, TimeoutError) as error:
+        logger.error(
+            "[app]人工操作待恢复 stage=human_action error_type=%s",
+            type(error).__name__,
+        )
+        st.error(SAFE_FAILURE_NOTICE)
+        return
     except Exception as error:
         logger.error(
             "[app]人工操作失败 stage=human_action error_type=%s",

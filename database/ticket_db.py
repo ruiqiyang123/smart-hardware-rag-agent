@@ -33,6 +33,10 @@ class CommandType(str, Enum):
     HUMAN_REJECT = "human_reject"
 
 
+class IdempotencyConflictError(ValueError):
+    """An idempotency key was reused for a different owner or payload."""
+
+
 @dataclass(frozen=True)
 class CommandDecision:
     disposition: CommandDisposition
@@ -534,7 +538,7 @@ class TicketRepository:
         require_active: bool = False,
     ) -> None:
         if ticket_id is not None and command["ticket_id"] != ticket_id:
-            raise ValueError("command 不属于指定工单")
+            raise IdempotencyConflictError("command 不属于指定工单")
         if command["lease_version"] != lease_version:
             raise ValueError("lease_version 已过期")
         if require_active:
@@ -594,7 +598,7 @@ class TicketRepository:
                     or existing["sanitized_input"] != sanitized_input
                     or json.loads(existing["risk_flags_json"]) != normalized_flags
                 ):
-                    raise ValueError(
+                    raise IdempotencyConflictError(
                         "request_id 已绑定到不同的 user_id、sanitized_input 或 risk_flags"
                     )
                 return dict(existing)
@@ -691,7 +695,7 @@ class TicketRepository:
                     or existing["command_type"] != command_type
                     or existing["payload_fingerprint"] != payload_fingerprint
                 ):
-                    raise ValueError(
+                    raise IdempotencyConflictError(
                         "command_id 已绑定到不同的 ticket_id、command_type 或 payload"
                     )
                 version = int(existing["lease_version"])
@@ -1215,7 +1219,9 @@ class TicketRepository:
                     connection, command, prepared_updates, prepared_events
                 )
                 if not matches:
-                    raise ValueError("completed command 的结果 payload 冲突")
+                    raise IdempotencyConflictError(
+                        "completed command 的结果 payload 冲突"
+                    )
                 return CommandDecision(
                     CommandDisposition.COMPLETED,
                     lease_version,

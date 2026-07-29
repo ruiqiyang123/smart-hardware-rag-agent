@@ -11,7 +11,12 @@ from agent.security.secrets import (
     TransactionHash,
     contains_unredacted_secret,
 )
-from database.ticket_db import CommandDisposition, CommandType, TicketRepository
+from database.ticket_db import (
+    CommandDisposition,
+    CommandType,
+    IdempotencyConflictError,
+    TicketRepository,
+)
 
 
 MNEMONIC = (
@@ -84,7 +89,7 @@ class TicketRepositoryTest(unittest.TestCase):
                 user_id=user_id,
                 sanitized_input=sanitized_input,
                 risk_flags=risk_flags,
-            ), self.assertRaises(ValueError):
+            ), self.assertRaises(IdempotencyConflictError):
                 self.repo.create_ticket(
                     "req-1", user_id, sanitized_input, risk_flags
                 )
@@ -262,15 +267,20 @@ class TicketRepositoryTest(unittest.TestCase):
             first["ticket_id"], "request:shared", "user_input", 130
         )
         conflicts = [
-            (second["ticket_id"], "user_input"),
-            (first["ticket_id"], "human_action"),
+            (second["ticket_id"], "user_input", None),
+            (first["ticket_id"], "human_approve", None),
+            (first["ticket_id"], "user_input", "a" * 64),
         ]
-        for ticket_id, command_type in conflicts:
+        for ticket_id, command_type, payload_fingerprint in conflicts:
             with self.subTest(
                 ticket_id=ticket_id, command_type=command_type
-            ), self.assertRaises(ValueError):
+            ), self.assertRaises(IdempotencyConflictError):
                 self.repo.begin_command(
-                    ticket_id, "request:shared", command_type, 130
+                    ticket_id,
+                    "request:shared",
+                    command_type,
+                    130,
+                    payload_fingerprint=payload_fingerprint,
                 )
 
     def test_expired_command_renews_once_and_fences_old_worker(self):
@@ -459,11 +469,11 @@ class TicketRepositoryTest(unittest.TestCase):
     def test_events_and_result_event_must_belong_to_command_and_ticket(self):
         first, first_command, first_decision = self._started("first")
         second, second_command, second_decision = self._started("second")
-        with self.assertRaises(ValueError):
+        with self.assertRaises(IdempotencyConflictError):
             self.repo.append_event(
                 **self._event(second, first_command, first_decision.lease_version)
             )
-        with self.assertRaises(ValueError):
+        with self.assertRaises(IdempotencyConflictError):
             self.repo.append_event(
                 **self._event(
                     second,

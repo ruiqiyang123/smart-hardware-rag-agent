@@ -152,13 +152,19 @@ class AppV2ContractTest(unittest.TestCase):
         action = self.function_source("_run_human_action")
         self.assertIn("_stable_request_id()", submit)
         self.assertEqual(submit.count("request_id=request_id"), 2)
-        self.assertIn('st.session_state.pop(REQUEST_ID_SESSION_KEY, None)', submit)
+        self.assertIn("get_or_freeze_safe_history(", submit)
+        self.assertIn("safe_history=safe_history", submit)
+        self.assertIn("clear_frozen_request(st.session_state)", submit)
+        self.assertIn("CommandInProgressError", submit)
+        self.assertIn("IdempotencyConflictError", submit)
         self.assertIn("_stable_action_id(", action)
         self.assertIn("action_id=action_id", action)
         self.assertIn("st.session_state.pop(action_key, None)", action)
+        self.assertIn("CommandInProgressError", action)
+        self.assertIn("IdempotencyConflictError", action)
         for cleanup in (
             'st.session_state.pop("active_ticket_id", None)',
-            "REQUEST_ID_SESSION_KEY",
+            "clear_frozen_request(st.session_state)",
             "ACTION_ID_SESSION_PREFIX",
         ):
             self.assertIn(cleanup, self.function_source("_clear_customer_workflow_state"))

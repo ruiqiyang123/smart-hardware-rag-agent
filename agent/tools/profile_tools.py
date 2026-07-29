@@ -9,7 +9,6 @@ from typing import Optional
 
 from langchain_core.tools import tool
 from utils.user_profile import current_profile
-from utils.logger_handler import logger
 from database.profile_db import UserProfile
 
 
@@ -34,9 +33,7 @@ def format_user_profile(profile: Optional[UserProfile]) -> str:
     if profile.backup_verified is not None:
         parts.append(f"备份验证：{'已完成' if profile.backup_verified else '未完成'}")
 
-    profile_str = "；".join(parts) if parts else "用户档案未填写详细信息"
-    logger.info(f"[get_user_profile] 获取到档案: {profile_str}")
-    return profile_str
+    return "；".join(parts) if parts else "用户档案未填写详细信息"
 
 
 @tool(description="获取当前用户的档案信息（经验等级、地区、设备型号、常用链、连接方式、是否开启 Passphrase、是否完成备份验证），返回结构化字符串")
