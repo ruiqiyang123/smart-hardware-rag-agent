@@ -676,6 +676,11 @@ class SupportOrchestrator:
         values = self._checkpoint_values(ticket_id)
         return self._validated_graph_output(values) if values else {}
 
+    def get_verified_citations(self, ticket_id: str) -> list[dict]:
+        """Return citations only after revalidating their complete evidence bundle."""
+        state = self.get_state(ticket_id)
+        return self._validated_evidence_bundle(state) if state else []
+
     def _invoke_graph(
         self,
         graph_input,

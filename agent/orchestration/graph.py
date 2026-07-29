@@ -1071,6 +1071,8 @@ def build_configured_graph(
     profile_db: object | None = None,
     warranty_repository: object | None = None,
     chain_fetcher: object | None = None,
+    trusted_source_policy: object | None = None,
+    policy_guard: object | None = None,
 ):
     """Build the production graph while keeping all four read-only adapters injectable.
 
@@ -1110,11 +1112,29 @@ def build_configured_graph(
     if not isinstance(required_fields, dict) or not required_fields:
         raise ValueError("required_fields 非法")
 
-    trusted = TrustedSourcePolicy(
-        policy.get("trusted_evidence_domains"),
-        policy.get("trusted_evidence_url_prefixes"),
-    )
-    guard = PolicyGuard(policy, trusted_source_policy=trusted)
+    if trusted_source_policy is None:
+        if policy_guard is None:
+            trusted = TrustedSourcePolicy(
+                policy.get("trusted_evidence_domains"),
+                policy.get("trusted_evidence_url_prefixes"),
+            )
+        else:
+            trusted = getattr(policy_guard, "trusted_sources", None)
+            if not isinstance(trusted, TrustedSourcePolicy):
+                raise TypeError("policy_guard 的 trusted_source_policy 非法")
+    else:
+        if not isinstance(trusted_source_policy, TrustedSourcePolicy):
+            raise TypeError("trusted_source_policy 类型非法")
+        trusted = trusted_source_policy
+
+    if policy_guard is None:
+        guard = PolicyGuard(policy, trusted_source_policy=trusted)
+    else:
+        if not isinstance(policy_guard, PolicyGuard):
+            raise TypeError("policy_guard 类型非法")
+        if policy_guard.trusted_sources is not trusted:
+            raise ValueError("policy_guard 必须共享 trusted_source_policy")
+        guard = policy_guard
 
     if rag_service is None:
         from rag.rag_service import RagSummarizeService

@@ -1,13 +1,19 @@
 import os
+from pathlib import Path
 from typing import Optional
 
 import streamlit as st
 
+from agent.orchestration.graph import build_configured_graph, sqlite_checkpointer
+from agent.orchestration.runtime import SupportOrchestrator
+from agent.policies.security import IngressGuard, PolicyGuard
 from agent.react_agent import ReactAgent
+from agent.security.trusted_sources import TrustedSourcePolicy
 from agent.tools.agent_tools import configure_rag_model
 from database.profile_db import ProfileDatabase, UserProfile
+from database.ticket_db import TicketRepository
 from model.factory import build_chat_model
-from utils.error_messages import format_agent_error
+from utils.config_handler import load_orchestration_config, load_security_policy
 from utils.logger_handler import logger
 from utils.model_config import DEFAULT_MIMO_BASE_URL, DEFAULT_MIMO_CHAT_MODEL, build_chat_config
 from utils.session_context import set_location, set_user_id
@@ -15,7 +21,7 @@ from utils.user_profile import load_user_profile, save_user_profile
 
 
 st.set_page_config(
-    page_title="KeyGuard · 硬件钱包客服",
+    page_title="KeyGuard 2.0 · 多 Agent 工单客服",
     page_icon="🔐",
     layout="centered",
     initial_sidebar_state="expanded",
@@ -43,8 +49,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🔐 KeyGuard 硬件钱包智能客服")
-st.caption("LangGraph ReAct Agent + RAG 检索增强 · 硬件钱包售后与安全自助服务")
+st.title("🔐 KeyGuard 硬件钱包智能客服 2.0")
+st.caption("LangGraph 多 Agent 工单协同 · 安全分诊、证据诊断、复核与人工接管")
 
 
 def _runtime_secret(name: str) -> Optional[str]:
@@ -59,6 +65,12 @@ def _runtime_secret(name: str) -> Optional[str]:
         return None
     return str(secret_value) if secret_value else None
 
+
+AGENT_VERSION = (_runtime_secret("KEYGUARD_AGENT_VERSION") or "v2").strip().lower()
+USE_V1_AGENT = AGENT_VERSION == "v1"
+SAFE_FAILURE_NOTICE = "⚠️ 当前请求未能安全完成，请稍后重试或联系人工客服。"
+PENDING_USER_NOTICE = "为了继续处理，请补充工单中标记的必要信息。"
+ESCALATED_NOTICE = "工单已进入人工审核，自动流程不会关闭该问题。"
 
 env_mimo_key = _runtime_secret("MIMO_API_KEY")
 env_mimo_base_url = _runtime_secret("MIMO_BASE_URL") or DEFAULT_MIMO_BASE_URL
@@ -229,11 +241,66 @@ def get_or_build_agent() -> ReactAgent | None:
         _ensure_knowledge_base_loaded()
         st.session_state["agent"] = ReactAgent(chat_model=chat_model)
         st.session_state["agent_config_sig"] = sig
-        logger.info(f"[app]重建 Agent，配置签名={sig}")
+        logger.info("[app]V1 兼容 Agent 已初始化")
         return st.session_state["agent"]
-    except ValueError as e:
-        st.error(f"模型服务配置错误：{e}")
+    except Exception as error:
+        logger.error(
+            "[app]V1 初始化失败 stage=builder error_type=%s",
+            type(error).__name__,
+        )
+        st.error(SAFE_FAILURE_NOTICE)
         return None
+
+
+@st.cache_resource(show_spinner=False)
+def get_or_build_orchestrator(model_signature: str) -> SupportOrchestrator | None:
+    """构建 V2 Runtime；安全策略对象在 Graph 与 Runtime 间按身份共享。"""
+    kwargs, signature = resolve_chat_config()
+    if signature == "default" or signature != model_signature:
+        return None
+
+    ticket_db_path = _runtime_secret("KEYGUARD_TICKET_DB") or "data/keyguard_v2.db"
+    checkpoint_db_path = (
+        _runtime_secret("KEYGUARD_CHECKPOINT_DB")
+        or "data/keyguard_v2_checkpoints.sqlite3"
+    )
+    if Path(ticket_db_path).resolve() == Path(checkpoint_db_path).resolve():
+        raise ValueError("工单数据库与 checkpoint 数据库必须使用不同路径")
+
+    chat_model = build_chat_model(**kwargs)
+    configure_rag_model(chat_model)
+    _ensure_knowledge_base_loaded()
+    policy = load_security_policy()
+    orchestration = load_orchestration_config()
+    trusted_sources = TrustedSourcePolicy(
+        policy.get("trusted_evidence_domains"),
+        policy.get("trusted_evidence_url_prefixes"),
+    )
+    policy_guard = PolicyGuard(policy, trusted_source_policy=trusted_sources)
+    repository = TicketRepository(ticket_db_path)
+    checkpointer = sqlite_checkpointer(checkpoint_db_path)
+    try:
+        graph = build_configured_graph(
+            chat_model,
+            policy,
+            orchestration,
+            checkpointer,
+            trusted_source_policy=trusted_sources,
+            policy_guard=policy_guard,
+        )
+        return SupportOrchestrator(
+            repository=repository,
+            graph=graph,
+            ingress_guard=IngressGuard(policy),
+            recursion_limit=orchestration["recursion_limit"],
+            lease_seconds=orchestration["command_lease_seconds"],
+            graph_timeout_seconds=orchestration["timeouts"]["graph_seconds"],
+            trusted_source_policy=trusted_sources,
+            final_policy_guard=policy_guard,
+        )
+    except Exception:
+        checkpointer.close()
+        raise
 
 
 USER_OPTIONS = {
@@ -269,10 +336,12 @@ with st.sidebar:
     if st.session_state.get("active_user") != selected:
         st.session_state["active_user"] = selected
         st.session_state["messages"] = list(PREBUILT_HISTORY_1005) if uid == MEMORY_DEMO_USER_ID else []
+        st.session_state.pop("active_ticket_id", None)
         load_user_profile(uid)
 
     if st.button("🗑️ 清空对话", use_container_width=True):
         st.session_state["messages"] = []
+        st.session_state.pop("active_ticket_id", None)
         st.rerun()
 
     with st.expander("📝 用户档案（可选）", expanded=False):
@@ -415,15 +484,332 @@ with st.sidebar:
             st.rerun()
 
 
-agent = get_or_build_agent()
+PHASE_LABELS = {
+    "entry_checked": "🛡️ 安全检查完成",
+    "triage_completed": "🧭 问题分诊完成",
+    "diagnosis_completed": "📚 诊断取证完成",
+    "review_completed": "✅ 安全复核完成",
+    "escalated": "👩‍💼 已转人工审核",
+    "response_finalized": "📨 安全回复已完成",
+    "ingress_guard.redacted": "🛡️ 安全检查完成",
+    "triage.completed": "🧭 问题分诊完成",
+    "diagnosis.evidence_loaded": "📚 诊断取证完成",
+    "review.completed": "✅ 安全复核完成",
+    "routing.escalated": "👩‍💼 已转人工审核",
+}
+ASK_USER_FIELDS = [
+    "device_model",
+    "error_state",
+    "serial_last4",
+    "transaction_hash",
+    "chain_name",
+]
+
+
+def _answer_with_citations(result) -> str:
+    answer = result.user_notice or result.final_answer
+    if not answer and result.status == "pending_user":
+        answer = PENDING_USER_NOTICE
+    if not answer and result.status == "escalated":
+        answer = ESCALATED_NOTICE
+    if not answer:
+        answer = "工单已记录，我们会继续安全处理。"
+    if result.citations:
+        source_lines = [
+            f"- {item['source_title']}：{item['source_url']}"
+            for item in result.citations
+        ]
+        answer += "\n\n📚 已验证参考来源：\n" + "\n".join(source_lines)
+    return answer
+
+
+def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str) -> None:
+    active_ticket_id = st.session_state.get("active_ticket_id")
+    try:
+        active_ticket = (
+            orchestrator.repository.get_ticket(active_ticket_id)
+            if active_ticket_id
+            else None
+        )
+        if active_ticket and active_ticket.get("status") == "pending_user":
+            result = orchestrator.resume_user(active_ticket_id, prompt)
+        else:
+            result = orchestrator.submit(
+                prompt,
+                user_id=user_id,
+                safe_history=st.session_state.get("messages", []),
+            )
+    except Exception as error:
+        logger.error(
+            "[app]V2 请求失败 stage=runtime error_type=%s",
+            type(error).__name__,
+        )
+        st.session_state["messages"].append(
+            {"role": "assistant", "content": SAFE_FAILURE_NOTICE}
+        )
+        st.rerun()
+        return
+
+    st.session_state["active_ticket_id"] = result.ticket_id
+    st.session_state["messages"].append(
+        {"role": "user", "content": result.sanitized_input}
+    )
+    st.session_state["messages"].append(
+        {"role": "assistant", "content": _answer_with_citations(result)}
+    )
+    st.rerun()
+
+
+def _run_v1_prompt(
+    agent: ReactAgent,
+    ingress_guard: IngressGuard,
+    prompt: str,
+    user_id: str,
+    location: str,
+) -> None:
+    """显式 v1 兼容路径；输入仍先脱敏，且不展示内部流事件。"""
+    try:
+        sanitized = ingress_guard.sanitize(prompt)
+        safe_prompt = sanitized.sanitized_input
+        if sanitized.critical_notice:
+            answer_text = sanitized.critical_notice
+        else:
+            active_profile = ProfileDatabase().get_profile(user_id)
+            answer_text = "".join(
+                content
+                for event_name, content in agent.execute_stream(
+                    safe_prompt,
+                    st.session_state.get("messages", []),
+                    user_id=user_id,
+                    location=location,
+                    user_profile=active_profile,
+                )
+                if event_name == "answer"
+            )
+            if not answer_text:
+                answer_text = SAFE_FAILURE_NOTICE
+    except Exception as error:
+        logger.error(
+            "[app]V1 请求失败 stage=compat_runtime error_type=%s",
+            type(error).__name__,
+        )
+        st.session_state["messages"].append(
+            {"role": "assistant", "content": SAFE_FAILURE_NOTICE}
+        )
+        st.rerun()
+        return
+
+    st.session_state["messages"].append({"role": "user", "content": safe_prompt})
+    st.session_state["messages"].append(
+        {"role": "assistant", "content": answer_text}
+    )
+    st.rerun()
+
+
+def _run_human_action(
+    orchestrator: SupportOrchestrator,
+    ticket_id: str,
+    action: str,
+    *,
+    edited_answer: str = "",
+    missing_fields: Optional[list[str]] = None,
+) -> None:
+    try:
+        orchestrator.human_action(
+            ticket_id,
+            action,
+            edited_answer=edited_answer,
+            missing_fields=missing_fields,
+        )
+    except Exception as error:
+        logger.error(
+            "[app]人工操作失败 stage=human_action error_type=%s",
+            type(error).__name__,
+        )
+        st.error(SAFE_FAILURE_NOTICE)
+        return
+    st.success("操作已安全提交。")
+    st.rerun()
+
+
+def _render_active_ticket(orchestrator: SupportOrchestrator) -> None:
+    ticket_id = st.session_state.get("active_ticket_id")
+    if not ticket_id:
+        return
+    try:
+        ticket = orchestrator.repository.get_ticket(ticket_id)
+        events = orchestrator.repository.list_events(ticket_id) if ticket else []
+    except Exception as error:
+        logger.error(
+            "[app]活动工单读取失败 stage=customer_view error_type=%s",
+            type(error).__name__,
+        )
+        st.warning(SAFE_FAILURE_NOTICE)
+        return
+    if not ticket:
+        st.session_state.pop("active_ticket_id", None)
+        return
+
+    st.caption(
+        f"当前工单 `{ticket_id}` · 状态 `{ticket.get('status') or '-'}` · "
+        f"优先级 `{ticket.get('priority') or 'P2'}` · 风险 `{ticket.get('risk_level') or '-'}`"
+    )
+    completed_phases = [
+        PHASE_LABELS[event.get("event_type")]
+        for event in events
+        if event.get("event_type") in PHASE_LABELS
+    ]
+    if completed_phases:
+        st.caption(" · ".join(dict.fromkeys(completed_phases)))
+
+
+def _render_workbench(orchestrator: SupportOrchestrator) -> None:
+    try:
+        tickets = orchestrator.repository.list_tickets()
+    except Exception as error:
+        logger.error(
+            "[app]工单队列读取失败 stage=workbench error_type=%s",
+            type(error).__name__,
+        )
+        st.error(SAFE_FAILURE_NOTICE)
+        return
+
+    if not tickets:
+        st.info("暂无工单。先在“客户对话”中提交一个问题。")
+        return
+
+    for ticket in tickets:
+        ticket_id = ticket["ticket_id"]
+        label = (
+            f"{ticket.get('priority') or 'P2'} · {ticket_id} · "
+            f"{ticket.get('status') or '-'}"
+        )
+        with st.expander(label):
+            st.write(ticket.get("summary") or ticket.get("sanitized_input") or "-")
+            st.caption(
+                f"类别 `{ticket.get('category') or '-'}` · "
+                f"优先级 `{ticket.get('priority') or 'P2'}` · "
+                f"风险 `{ticket.get('risk_level') or '-'}`"
+            )
+            try:
+                events = orchestrator.repository.list_events(ticket_id)
+                for event in events:
+                    st.caption(
+                        f"{event.get('event_type') or '-'} · "
+                        f"{event.get('summary') or '-'} · "
+                        f"{event.get('from_status') or '-'} → "
+                        f"{event.get('to_status') or '-'}"
+                    )
+                citations = orchestrator.get_verified_citations(ticket_id)
+            except Exception as error:
+                logger.error(
+                    "[app]工单详情读取失败 stage=workbench_detail error_type=%s",
+                    type(error).__name__,
+                )
+                st.warning(SAFE_FAILURE_NOTICE)
+                citations = []
+            for citation in citations:
+                st.link_button(
+                    f"📚 {citation['source_title']}",
+                    citation["source_url"],
+                    key=f"source_{ticket_id}_{citation['source_id']}",
+                )
+
+            if ticket.get("status") != "escalated":
+                continue
+
+            st.caption("人工审核区不会展示模型内部提示、工具参数或未审核的原始输出。")
+            edited = st.text_area(
+                "编辑后回复",
+                value="",
+                placeholder="输入审核后可直接发送给客户的安全回复",
+                key=f"edit_{ticket_id}",
+            )
+            missing_fields = st.multiselect(
+                "需要客户补充的字段",
+                ASK_USER_FIELDS,
+                default=["error_state"],
+                key=f"missing_{ticket_id}",
+            )
+            approve_col, edit_col = st.columns(2)
+            with approve_col:
+                if st.button(
+                    "Approve",
+                    key=f"approve_{ticket_id}",
+                    disabled=not bool(ticket.get("draft_answer")),
+                    use_container_width=True,
+                ):
+                    _run_human_action(orchestrator, ticket_id, "approve")
+            with edit_col:
+                if st.button(
+                    "Edit & Send",
+                    key=f"edit_send_{ticket_id}",
+                    disabled=not bool(edited.strip()),
+                    use_container_width=True,
+                ):
+                    _run_human_action(
+                        orchestrator,
+                        ticket_id,
+                        "edit_send",
+                        edited_answer=edited,
+                    )
+            ask_col, reject_col = st.columns(2)
+            with ask_col:
+                if st.button(
+                    "Ask User",
+                    key=f"ask_{ticket_id}",
+                    disabled=not bool(missing_fields),
+                    use_container_width=True,
+                ):
+                    _run_human_action(
+                        orchestrator,
+                        ticket_id,
+                        "ask_user",
+                        missing_fields=missing_fields,
+                    )
+            with reject_col:
+                if st.button(
+                    "Reject",
+                    key=f"reject_{ticket_id}",
+                    use_container_width=True,
+                ):
+                    _run_human_action(orchestrator, ticket_id, "reject")
+
 
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 
-if not st.session_state["messages"]:
-    with st.chat_message("assistant", avatar="🔐"):
-        st.markdown(
-            f"""你好，我是 **KeyGuard 硬件钱包智能客服**。我可以帮你：
+orchestrator = None
+agent = None
+v1_ingress_guard = None
+if USE_V1_AGENT:
+    agent = get_or_build_agent()
+    try:
+        v1_ingress_guard = IngressGuard(load_security_policy())
+    except Exception as error:
+        logger.error(
+            "[app]V1 安全配置失败 stage=compat_builder error_type=%s",
+            type(error).__name__,
+        )
+        st.error(SAFE_FAILURE_NOTICE)
+else:
+    _, current_model_signature = resolve_chat_config()
+    try:
+        orchestrator = get_or_build_orchestrator(current_model_signature)
+    except Exception as error:
+        logger.error(
+            "[app]V2 初始化失败 stage=builder error_type=%s",
+            type(error).__name__,
+        )
+        st.error(SAFE_FAILURE_NOTICE)
+
+customer_tab, workbench_tab = st.tabs(["客户对话", "工单工作台"])
+
+with customer_tab:
+    if not st.session_state["messages"]:
+        with st.chat_message("assistant", avatar="🔐"):
+            st.markdown(
+                f"""你好，我是 **KeyGuard 硬件钱包智能客服**。我可以帮你：
 
 - 🔋 **设备故障**：开不了机、屏幕不亮、按键卡死、设备锁定
 - 🔌 **连接排查**：USB-C、蓝牙、App 识别不到设备等问题
@@ -433,71 +819,38 @@ if not st.session_state["messages"]:
 - 📊 **安全报告**：基于模拟使用记录生成月度风险建议
 
 > 当前登录身份：**{selected}**，切换用户会自动开新对话。"""
-        )
+            )
 
-for msg in st.session_state["messages"]:
-    with st.chat_message(msg["role"], avatar="🔐" if msg["role"] == "assistant" else "🧑"):
-        st.markdown(msg["content"])
+    for message in st.session_state["messages"]:
+        avatar = "🔐" if message["role"] == "assistant" else "🧑"
+        with st.chat_message(message["role"], avatar=avatar):
+            st.markdown(message["content"])
 
-prompt = st.chat_input("输入你的问题，例如：硬件钱包开不了机或蓝牙连不上怎么办？")
-if not prompt and st.session_state.get("pending_prompt"):
-    prompt = st.session_state["pending_prompt"]
-    st.session_state["pending_prompt"] = None
+    if orchestrator is not None:
+        _render_active_ticket(orchestrator)
 
-if prompt:
-    if agent is None:
-        st.error("⚠️ 模型服务暂不可用，请联系项目作者")
+    prompt = st.chat_input(
+        "输入你的问题，例如：硬件钱包开不了机或蓝牙连不上怎么办？"
+    )
+    if not prompt and st.session_state.get("pending_prompt"):
+        prompt = st.session_state["pending_prompt"]
+        st.session_state["pending_prompt"] = None
+
+    if prompt:
+        if USE_V1_AGENT:
+            if agent is None or v1_ingress_guard is None:
+                st.error(SAFE_FAILURE_NOTICE)
+            else:
+                _run_v1_prompt(agent, v1_ingress_guard, prompt, uid, loc)
+        elif orchestrator is None:
+            st.error(SAFE_FAILURE_NOTICE)
+        else:
+            _run_v2_prompt(orchestrator, prompt, uid)
+
+with workbench_tab:
+    if USE_V1_AGENT:
+        st.info("当前为显式 V1 兼容模式；工单工作台仅在 V2 Runtime 中启用。")
+    elif orchestrator is None:
+        st.error(SAFE_FAILURE_NOTICE)
     else:
-        with st.chat_message("user", avatar="🧑"):
-            st.markdown(prompt)
-        st.session_state["messages"].append({"role": "user", "content": prompt})
-
-        with st.chat_message("assistant", avatar="🔐"):
-            status = st.status("🤔 正在分析...", expanded=True)
-            answer_placeholder = st.empty()
-
-            answer_text = ""
-            step_idx = 0
-            status_finalized = False
-
-            try:
-                active_profile = ProfileDatabase().get_profile(uid)
-                for kind, content in agent.execute_stream(
-                    prompt,
-                    st.session_state.get("messages", []),
-                    user_id=uid,
-                    location=loc,
-                    user_profile=active_profile,
-                ):
-                    if kind == "answer":
-                        if not status_finalized:
-                            status.update(label="✅ 分析完成", state="complete", expanded=False)
-                            status_finalized = True
-                        answer_text += content
-                        answer_placeholder.markdown(answer_text)
-                    else:
-                        step_idx += 1
-                        if kind == "thought":
-                            status.update(label=f"💭 正在判断问题类型（第 {step_idx} 步）...")
-                            status.markdown(f"**💭 思考**：{content}")
-                        elif kind == "tool_call":
-                            status.update(label=f"🔧 正在调用工具（第 {step_idx} 步）...")
-                            status.markdown(content)
-                        elif kind == "tool_result":
-                            status.update(label=f"📥 获取到信息（第 {step_idx} 步）...")
-                            status.markdown(content)
-            except Exception as e:
-                logger.error(f"[app]Agent 响应失败：{e}", exc_info=True)
-                answer_text = format_agent_error(e)
-                answer_placeholder.markdown(answer_text)
-                status.update(label="⚠️ 生成失败", state="error", expanded=False)
-                status_finalized = True
-
-            if not answer_text:
-                answer_text = "⚠️ 未能生成有效回答，请重试或换一种问法。"
-                answer_placeholder.markdown(answer_text)
-                status.update(label="⚠️ 未能生成有效回答", state="error", expanded=False)
-            elif not status_finalized:
-                status.update(label="✅ 分析完成", state="complete", expanded=False)
-
-        st.session_state["messages"].append({"role": "assistant", "content": answer_text})
+        _render_workbench(orchestrator)
