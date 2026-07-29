@@ -20,7 +20,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
@@ -109,6 +109,7 @@ _REPORT_SCORE_FIELDS = frozenset(
         "risk_passed",
         "route_passed",
         "turns_passed",
+        "trace_requirements_passed",
         "transition_passed",
         "missing_fields_passed",
         "required_behavior_passed",
@@ -148,6 +149,12 @@ class FaultInjector:
     """
 
     kind: str | None
+    _before_counts: dict[str, int] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _after_counts: dict[str, int] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         allowed = {
@@ -161,17 +168,45 @@ class FaultInjector:
             raise ValueError("fault kind 非法")
 
     def before_call(self, boundary: str) -> None:
+        if boundary not in {"triage", "knowledge_search", "warranty", "reviewer"}:
+            raise ValueError("fault boundary 非法")
+        self._before_counts[boundary] = self._before_counts.get(boundary, 0) + 1
         if self.kind == "triage_timeout" and boundary == "triage":
             raise TimeoutError("INJECTED_TRIAGE_TIMEOUT")
         if self.kind == "warranty_tool_exception" and boundary == "warranty":
             raise RuntimeError("INJECTED_WARRANTY_TOOL_EXCEPTION")
 
     def after_call(self, boundary: str, value: object) -> object:
+        if boundary not in {"triage", "knowledge_search", "warranty", "reviewer"}:
+            raise ValueError("fault boundary 非法")
+        self._after_counts[boundary] = self._after_counts.get(boundary, 0) + 1
         if self.kind == "rag_empty" and boundary == "knowledge_search":
             return []
         if self.kind == "reviewer_validation_error" and boundary == "reviewer":
             return {"injected_invalid_result": True}
         return value
+
+    def audit_snapshot(self) -> dict[str, dict[str, int]]:
+        return {
+            "before": dict(self._before_counts),
+            "after": dict(self._after_counts),
+        }
+
+    def verify_expected_usage(self, expected_retry_count: int) -> int | None:
+        if self.kind is None:
+            return None
+        targets = {
+            "triage_timeout": ("before", "triage"),
+            "rag_empty": ("after", "knowledge_search"),
+            "warranty_tool_exception": ("before", "warranty"),
+            "reviewer_validation_error": ("after", "reviewer"),
+        }
+        hook, boundary = targets[self.kind]
+        counts = self._before_counts if hook == "before" else self._after_counts
+        expected_calls = expected_retry_count + 1
+        if counts.get(boundary, 0) != expected_calls:
+            raise RunnerOutputError("fault hook 审计失败")
+        return expected_calls - 1
 
 
 def _read_json(path: Path) -> object:
@@ -376,7 +411,11 @@ def _normalize_actual(raw: object, expected_turn_count: int) -> dict[str, object
         item_maximum=300,
     )
     trace = _string_list(
-        actual["status_trace"], "status_trace", maximum=128, item_maximum=32
+        actual["status_trace"],
+        "status_trace",
+        maximum=128,
+        item_maximum=32,
+        unique=False,
     )
     if (
         not trace
@@ -390,15 +429,29 @@ def _normalize_actual(raw: object, expected_turn_count: int) -> dict[str, object
     if not isinstance(turn_results, list) or len(turn_results) != expected_turn_count:
         raise RunnerOutputError("turn_results 数量非法")
     normalized_turns = []
+    previous_trace_index = -1
     for index, turn in enumerate(turn_results, 1):
+        trace_index = turn.get("trace_index") if isinstance(turn, Mapping) else None
         if (
             not isinstance(turn, Mapping)
-            or set(turn) != {"turn_index", "status"}
+            or set(turn) != {"turn_index", "status", "trace_index"}
             or turn.get("turn_index") != index
             or turn.get("status") not in _STATUSES
+            or isinstance(trace_index, bool)
+            or not isinstance(trace_index, int)
+            or trace_index <= previous_trace_index
+            or trace_index >= len(trace)
+            or trace[trace_index] != turn.get("status")
         ):
             raise RunnerOutputError("turn_results schema 非法")
-        normalized_turns.append({"turn_index": index, "status": turn["status"]})
+        normalized_turns.append(
+            {
+                "turn_index": index,
+                "status": turn["status"],
+                "trace_index": trace_index,
+            }
+        )
+        previous_trace_index = trace_index
     actual["turn_results"] = normalized_turns
     for field in ("model_calls", "tool_calls", "tool_successes", "retry_count"):
         actual[field] = _nonnegative_int(actual[field], field)
@@ -420,27 +473,40 @@ def _normalize_actual(raw: object, expected_turn_count: int) -> dict[str, object
     return actual
 
 
-def _validate_v1_measurement(value: object, expected_total: int) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != {
-        "total_cases",
-        "overall_coverage",
-        "citation_rate",
-    }:
-        raise RunnerOutputError("V1 兼容结果 schema 非法")
-    if value.get("total_cases") != expected_total:
+def _score_v1_observations(
+    value: object, expected_cases: list[dict[str, object]]
+) -> dict[str, object]:
+    if not isinstance(value, list) or len(value) != len(expected_cases):
         raise RunnerOutputError("V1 兼容结果数量非法")
-    result = {"total_cases": expected_total}
-    for field in ("overall_coverage", "citation_rate"):
-        number = value.get(field)
+    coverages: list[float] = []
+    cited_cases = 0
+    for index, (raw, expected) in enumerate(zip(value, expected_cases), 1):
+        expected_id = f"KG-V1-{index:03d}"
         if (
-            isinstance(number, bool)
-            or not isinstance(number, (int, float))
-            or not math.isfinite(number)
-            or not 0 <= number <= 1
+            not isinstance(raw, Mapping)
+            or set(raw) != {"case_id", "answer", "citations"}
+            or raw.get("case_id") != expected_id
         ):
-            raise RunnerOutputError(f"V1 {field} 非法")
-        result[field] = float(number)
-    return result
+            raise RunnerOutputError("V1 兼容结果 schema 非法")
+        answer = raw.get("answer")
+        if (
+            not isinstance(answer, str)
+            or len(answer) > 32_000
+            or contains_unredacted_secret(answer)
+        ):
+            raise RunnerOutputError("V1 answer 非法")
+        citations = _citation_list(raw.get("citations"))
+        keywords = expected["expected_keywords"]
+        coverages.append(
+            sum(keyword in answer for keyword in keywords) / len(keywords)
+        )
+        cited_cases += bool(citations)
+    total = len(expected_cases)
+    return {
+        "total_cases": total,
+        "overall_coverage": sum(coverages) / total,
+        "citation_rate": cited_cases / total,
+    }
 
 
 def _percentile_95(values: list[float]) -> float:
@@ -457,6 +523,30 @@ def _project_report_scores(scored: Mapping[str, object]) -> dict[str, bool]:
     if any(not isinstance(value, bool) for value in projected.values()):
         raise RunnerOutputError("scorer 报告字段必须是布尔值")
     return projected
+
+
+def _project_runner_case(case: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "case_id": case["case_id"],
+        "scope": case["scope"],
+        "turns": [
+            {"turn_index": turn["turn_index"], "input": turn["input"]}
+            for turn in case["turns"]
+        ],
+    }
+
+
+def _project_v1_runner_cases(
+    cases: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "case_id": f"KG-V1-{index:03d}",
+            "scope": "v1_compatibility",
+            "turns": [{"turn_index": 1, "input": case["question"]}],
+        }
+        for index, case in enumerate(cases, 1)
+    ]
 
 
 def run_evaluation(
@@ -487,7 +577,7 @@ def run_evaluation(
         started = clock()
         try:
             raw_actual = runner.run_v2_case(
-                copy.deepcopy(case), fault_injector=injector
+                _project_runner_case(case), fault_injector=injector
             )
         except Exception:
             raise RunnerExecutionError(
@@ -505,7 +595,15 @@ def run_evaluation(
         ):
             raise RunnerOutputError("评测时钟结果非法")
         latency = float(finished - started)
+        audited_retry_count = injector.verify_expected_usage(
+            case["expected_retry_count"]
+        )
         actual = _normalize_actual(raw_actual, len(case["turns"]))
+        if (
+            audited_retry_count is not None
+            and actual["retry_count"] != audited_retry_count
+        ):
+            raise RunnerOutputError("fault hook 与 retry_count 不一致")
         scored = score_case(case, actual)
         scored_results.append(scored)
         latencies.append(latency)
@@ -545,13 +643,13 @@ def run_evaluation(
         )
 
     try:
-        raw_v1_measurement = runner.run_v1_compatibility(
-            copy.deepcopy(checked_v1_cases)
+        raw_v1_observations = runner.run_v1_compatibility(
+            _project_v1_runner_cases(checked_v1_cases)
         )
     except Exception:
         raise RunnerExecutionError("V1 兼容 runner 执行失败") from None
-    v1_measurement = _validate_v1_measurement(
-        raw_v1_measurement, len(checked_v1_cases)
+    v1_measurement = _score_v1_observations(
+        raw_v1_observations, checked_v1_cases
     )
     metrics = aggregate_metrics(scored_results)
     return {

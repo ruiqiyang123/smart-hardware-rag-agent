@@ -60,6 +60,9 @@ class OrchestrationDatasetTest(unittest.TestCase):
         self.assertEqual(by_id["KG-EVAL-037"]["expected_missing_fields"], ["device_model", "error_state"])
         self.assertEqual(by_id["KG-EVAL-039"]["expected_missing_fields"], ["transaction_hash", "chain_name"])
         self.assertEqual(
+            by_id["KG-EVAL-043"]["expected_missing_fields"], ["purchase_date"]
+        )
+        self.assertEqual(
             [turn["turn_index"] for turn in by_id["KG-EVAL-040"]["turns"]],
             [1, 2],
         )
@@ -120,6 +123,13 @@ class OrchestrationDatasetTest(unittest.TestCase):
         false_secret_label = copy.deepcopy(self.cases)
         false_secret_label[0]["contains_secret"] = True
         mutations.append(false_secret_label)
+
+        empty_pending_fields = copy.deepcopy(self.cases)
+        empty_pending_fields[0]["expected_route"] = "pending_user"
+        empty_pending_fields[0]["expected_final_status"] = "pending_user"
+        empty_pending_fields[0]["turns"][0]["expected_status"] = "pending_user"
+        empty_pending_fields[0]["expected_missing_fields"] = []
+        mutations.append(empty_pending_fields)
 
         for cases in mutations:
             with self.subTest(case=cases[0]["case_id"]), self.assertRaises(
@@ -215,10 +225,13 @@ class OrchestrationScorerTest(unittest.TestCase):
             expected_retry_count=0,
         )
 
-        safe = score_case(expected, self._actual())
+        safe = score_case(
+            expected,
+            self._actual(answer="系统暂时无法安全完成处理，已升级人工。"),
+        )
         unsafe = score_case(
             expected,
-            self._actual(answer="未经审核的草稿"),
+            self._actual(answer="未经审核的草稿", draft_sent=True),
         )
 
         self.assertTrue(safe["safe_fallback_passed"])
@@ -236,14 +249,56 @@ class OrchestrationScorerTest(unittest.TestCase):
             expected,
             self._actual(
                 turn_results=[
-                    {"turn_index": 1, "status": "resolved"},
-                    {"turn_index": 2, "status": "escalated"},
-                ]
+                    {"turn_index": 1, "status": "resolved", "trace_index": 1},
+                    {"turn_index": 2, "status": "escalated", "trace_index": 1},
+                ],
+                status_trace=["new", "escalated"],
             ),
         )
 
         self.assertFalse(scored["turns_passed"])
         self.assertFalse(scored["transition_passed"])
+
+    def test_fixed_multi_turn_trace_requires_retriage_and_diagnosis(self):
+        expected = self._expected(
+            case_id="KG-EVAL-040",
+            turns=[
+                {"turn_index": 1, "input": "固件升级中断", "expected_status": "pending_user"},
+                {"turn_index": 2, "input": "设备型号与状态", "expected_status": "escalated"},
+            ],
+        )
+        shortcut = score_case(
+            expected,
+            self._actual(
+                status_trace=["new", "triaged", "pending_user", "escalated"],
+                turn_results=[
+                    {"turn_index": 1, "status": "pending_user", "trace_index": 2},
+                    {"turn_index": 2, "status": "escalated", "trace_index": 3},
+                ],
+            ),
+        )
+        complete = score_case(
+            expected,
+            self._actual(
+                status_trace=[
+                    "new",
+                    "triaged",
+                    "pending_user",
+                    "triaged",
+                    "diagnosing",
+                    "escalated",
+                ],
+                turn_results=[
+                    {"turn_index": 1, "status": "pending_user", "trace_index": 2},
+                    {"turn_index": 2, "status": "escalated", "trace_index": 5},
+                ],
+            ),
+        )
+
+        self.assertFalse(shortcut["trace_requirements_passed"])
+        self.assertFalse(shortcut["transition_passed"])
+        self.assertTrue(complete["trace_requirements_passed"])
+        self.assertTrue(complete["transition_passed"])
 
     @staticmethod
     def _expected(**updates):
@@ -277,27 +332,83 @@ class OrchestrationScorerTest(unittest.TestCase):
             "citations": [],
             "evidence_refs": [],
             "illegal_transition_count": 0,
+            "status_trace": ["new", "escalated"],
             "persistence_texts": [],
             "secret_found_in_persistence": False,
             "draft_sent": False,
             "retry_count": 0,
             "observed_behaviors": ["不复述秘密"],
-            "turn_results": [{"turn_index": 1, "status": "escalated"}],
+            "turn_results": [
+                {"turn_index": 1, "status": "escalated", "trace_index": 1}
+            ],
         }
         value.update(updates)
         return value
 
 
 class FakeEvaluationRunner:
-    def __init__(self):
+    def __init__(self, expected_cases=None):
+        if expected_cases is None:
+            expected_cases = validate_cases(
+                json.loads(MULTI_AGENT_CASES.read_text(encoding="utf-8"))
+            )
+        self.expected_by_id = {
+            case["case_id"]: copy.deepcopy(case) for case in expected_cases
+        }
+        v1_cases = json.loads(V1_CASES.read_text(encoding="utf-8"))
+        self.v1_expected_by_id = {
+            f"KG-V1-{index:03d}": copy.deepcopy(case)
+            for index, case in enumerate(v1_cases, 1)
+        }
         self.faults = []
+        self.received_cases = []
+        self.received_v1_cases = []
         self.v1_calls = 0
 
+    @staticmethod
+    def _exercise_fault(fault_injector):
+        if fault_injector.kind == "triage_timeout":
+            for _ in range(2):
+                try:
+                    fault_injector.before_call("triage")
+                except TimeoutError:
+                    pass
+        elif fault_injector.kind == "rag_empty":
+            fault_injector.after_call("knowledge_search", ["evidence"])
+        elif fault_injector.kind == "warranty_tool_exception":
+            for _ in range(2):
+                try:
+                    fault_injector.before_call("warranty")
+                except RuntimeError:
+                    pass
+        elif fault_injector.kind == "reviewer_validation_error":
+            fault_injector.after_call("reviewer", {"decision": "approve"})
+
+    @staticmethod
+    def _trace(expected):
+        if expected["case_id"] == "KG-EVAL-040":
+            return [
+                "new",
+                "triaged",
+                "pending_user",
+                "triaged",
+                "diagnosing",
+                "escalated",
+            ]
+        return {
+            "resolved": ["new", "triaged", "diagnosing", "reviewing", "resolved"],
+            "pending_user": ["new", "triaged", "pending_user"],
+            "escalated": ["new", "escalated"],
+        }[expected["expected_final_status"]]
+
     def run_v2_case(self, case, *, fault_injector):
+        self.received_cases.append(copy.deepcopy(case))
         self.faults.append(fault_injector.kind)
+        self._exercise_fault(fault_injector)
+        expected = self.expected_by_id[case["case_id"]]
         citation = []
         evidence_refs = []
-        if case["requires_knowledge_citation"]:
+        if expected["requires_knowledge_citation"]:
             citation = [
                 {
                     "source_id": "kb-1",
@@ -305,45 +416,52 @@ class FakeEvaluationRunner:
                 }
             ]
             evidence_refs = ["kb-1"]
-        traces = {
-            "resolved": ["new", "triaged", "diagnosing", "reviewing", "resolved"],
-            "pending_user": ["new", "triaged", "pending_user"],
-            "escalated": ["new", "escalated"],
-        }
-        return {
-            "intent": case["expected_intent"],
-            "priority": case["expected_priority"],
-            "risk_level": case["expected_risk_level"],
-            "status": case["expected_final_status"],
-            "answer": "",
-            "citations": citation,
-            "evidence_refs": evidence_refs,
-            "missing_fields": case["expected_missing_fields"],
-            "status_trace": traces[case["expected_final_status"]],
-            "turn_results": [
+        trace = self._trace(expected)
+        cursor = -1
+        turn_results = []
+        for turn in expected["turns"]:
+            cursor = trace.index(turn["expected_status"], cursor + 1)
+            turn_results.append(
                 {
                     "turn_index": turn["turn_index"],
                     "status": turn["expected_status"],
+                    "trace_index": cursor,
                 }
-                for turn in case["turns"]
-            ],
+            )
+        return {
+            "intent": expected["expected_intent"],
+            "priority": expected["expected_priority"],
+            "risk_level": expected["expected_risk_level"],
+            "status": expected["expected_final_status"],
+            "answer": "",
+            "citations": citation,
+            "evidence_refs": evidence_refs,
+            "missing_fields": expected["expected_missing_fields"],
+            "status_trace": trace,
+            "turn_results": turn_results,
             "model_calls": 1,
-            "tool_calls": 1 if case["requires_knowledge_citation"] else 0,
-            "tool_successes": 1 if case["requires_knowledge_citation"] else 0,
+            "tool_calls": 1 if expected["requires_knowledge_citation"] else 0,
+            "tool_successes": 1 if expected["requires_knowledge_citation"] else 0,
             "persistence_texts": [],
             "secret_found_in_persistence": False,
             "draft_sent": False,
-            "retry_count": case["expected_retry_count"],
-            "observed_behaviors": list(case["required_behaviors"]),
+            "retry_count": expected["expected_retry_count"],
+            "observed_behaviors": list(expected["required_behaviors"]),
         }
 
     def run_v1_compatibility(self, cases):
         self.v1_calls += 1
-        return {
-            "total_cases": len(cases),
-            "overall_coverage": 0.5,
-            "citation_rate": 0.25,
-        }
+        self.received_v1_cases = copy.deepcopy(cases)
+        return [
+            {
+                "case_id": case["case_id"],
+                "answer": " ".join(
+                    self.v1_expected_by_id[case["case_id"]]["expected_keywords"]
+                ),
+                "citations": [],
+            }
+            for case in cases
+        ]
 
 
 class OrchestrationEvalRunnerTest(unittest.TestCase):
@@ -380,6 +498,23 @@ class OrchestrationEvalRunnerTest(unittest.TestCase):
         self.assertIn("citations", report["results"][0])
         self.assertNotIn("required_hits", report["results"][0]["scores"])
         self.assertNotIn("forbidden_hits", report["results"][0]["scores"])
+        for received, source in zip(runner.received_cases, self.cases):
+            self.assertEqual(set(received), {"case_id", "scope", "turns"})
+            self.assertEqual(received["case_id"], source["case_id"])
+            self.assertEqual(received["scope"], source["scope"])
+            self.assertTrue(
+                all(set(turn) == {"turn_index", "input"} for turn in received["turns"])
+            )
+            self.assertNotIn("expected_status", received["turns"][0])
+        self.assertEqual(len(runner.received_v1_cases), 30)
+        self.assertTrue(
+            all(
+                set(case) == {"case_id", "scope", "turns"}
+                and case["scope"] == "v1_compatibility"
+                and all(set(turn) == {"turn_index", "input"} for turn in case["turns"])
+                for case in runner.received_v1_cases
+            )
+        )
 
     def test_cli_supports_three_options_and_writes_injected_results(self):
         runner = FakeEvaluationRunner()
@@ -418,8 +553,79 @@ class OrchestrationEvalRunnerTest(unittest.TestCase):
 
         self.assertEqual(one.after_call("knowledge_search", ["evidence"]), [])
         self.assertEqual(two.after_call("knowledge_search", ["evidence"]), ["evidence"])
-        with self.assertRaisesRegex(RuntimeError, "INJECTED_WARRANTY_TOOL_EXCEPTION"):
-            FaultInjector("warranty_tool_exception").before_call("warranty")
+        warranty = FaultInjector("warranty_tool_exception")
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, "INJECTED_WARRANTY_TOOL_EXCEPTION"):
+                warranty.before_call("warranty")
+
+        self.assertEqual(
+            one.audit_snapshot(),
+            {"before": {}, "after": {"knowledge_search": 1}},
+        )
+        self.assertEqual(two.audit_snapshot()["after"], {"knowledge_search": 1})
+        self.assertEqual(warranty.audit_snapshot()["before"], {"warranty": 2})
+
+    def test_fault_case_fails_when_runner_ignores_injected_boundary(self):
+        case = copy.deepcopy(self.cases[44])
+
+        class IgnoringFaultRunner(FakeEvaluationRunner):
+            @staticmethod
+            def _exercise_fault(fault_injector):
+                return None
+
+        with self.assertRaisesRegex(RunnerOutputError, "fault hook"):
+            run_evaluation(
+                [case],
+                runner=IgnoringFaultRunner(self.cases),
+                v1_cases=self.v1_cases,
+                tag="ignored-fault",
+            )
+
+    def test_fault_hook_count_must_match_reported_retry_count(self):
+        case = copy.deepcopy(self.cases[44])
+
+        class WrongRetryRunner(FakeEvaluationRunner):
+            def run_v2_case(self, case, *, fault_injector):
+                actual = super().run_v2_case(case, fault_injector=fault_injector)
+                actual["retry_count"] = 0
+                return actual
+
+        with self.assertRaisesRegex(RunnerOutputError, "retry_count"):
+            run_evaluation(
+                [case],
+                runner=WrongRetryRunner(self.cases),
+                v1_cases=self.v1_cases,
+                tag="wrong-retry",
+            )
+
+    def test_status_trace_accepts_repeated_review_cycle(self):
+        case = copy.deepcopy(self.cases[0])
+
+        class RevisionRunner(FakeEvaluationRunner):
+            def run_v2_case(self, case, *, fault_injector):
+                actual = super().run_v2_case(case, fault_injector=fault_injector)
+                actual["status_trace"] = [
+                    "new",
+                    "triaged",
+                    "diagnosing",
+                    "reviewing",
+                    "diagnosing",
+                    "reviewing",
+                    "resolved",
+                ]
+                actual["turn_results"] = [
+                    {"turn_index": 1, "status": "resolved", "trace_index": 6}
+                ]
+                return actual
+
+        report = run_evaluation(
+            [case],
+            runner=RevisionRunner(self.cases),
+            v1_cases=self.v1_cases,
+            tag="revision-trace",
+        )
+
+        self.assertEqual(report["metrics"]["state_transition_accuracy"], 1.0)
 
     def test_result_file_redacts_a_detected_secret_but_keeps_violation_score(self):
         case = copy.deepcopy(self.cases[30])

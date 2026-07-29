@@ -94,6 +94,9 @@ _EXPECTED_FAULT_RETRIES = {
     "reviewer_validation_error": 0,
 }
 _CASE_ID = re.compile(r"KG-EVAL-\d{3}\Z", re.ASCII)
+_FIXED_TRACE_REQUIREMENTS = {
+    "KG-EVAL-040": ("pending_user", "triaged", "diagnosing", "escalated"),
+}
 
 
 def _fail(message: str) -> None:
@@ -224,6 +227,8 @@ def validate_cases(cases: object) -> list[dict[str, object]]:
             f"{case_id}.expected_missing_fields",
             allowed=MISSING_FIELDS,
         )
+        if final_status == "pending_user" and not missing_fields:
+            _fail(f"{case_id}.pending_user 必须标注 expected_missing_fields")
         retry_count = raw_case["expected_retry_count"]
         if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
             _fail(f"{case_id}.expected_retry_count 非法")
@@ -317,6 +322,14 @@ def _valid_citation(citation: object, evidence_refs: set[str] | None) -> bool:
     return evidence_refs is None or source_id in evidence_refs
 
 
+def _contains_ordered(trace: list[object], required: tuple[str, ...]) -> bool:
+    cursor = 0
+    for status in trace:
+        if cursor < len(required) and status == required[cursor]:
+            cursor += 1
+    return cursor == len(required)
+
+
 def score_case(expected: Mapping[str, object], actual: Mapping[str, object]) -> dict[str, Any]:
     """Score one structured observation without fuzzy or model-based judging."""
 
@@ -374,6 +387,7 @@ def score_case(expected: Mapping[str, object], actual: Mapping[str, object]) -> 
     route_passed = actual_status == expected_status
     expected_turns = expected.get("turns", [])
     actual_turns = actual.get("turn_results")
+    status_trace = actual.get("status_trace", [])
     turns_passed = True
     if isinstance(expected_turns, list) and expected_turns:
         if isinstance(actual_turns, list):
@@ -387,13 +401,43 @@ def score_case(expected: Mapping[str, object], actual: Mapping[str, object]) -> 
                 for turn in actual_turns
                 if isinstance(turn, Mapping)
             ]
-            turns_passed = expected_turn_statuses == actual_turn_statuses
+            trace_indexes = [
+                turn.get("trace_index")
+                for turn in actual_turns
+                if isinstance(turn, Mapping)
+            ]
+            trace_bound = (
+                isinstance(status_trace, list)
+                and len(trace_indexes) == len(actual_turns)
+                and all(
+                    isinstance(index, int) and not isinstance(index, bool)
+                    for index in trace_indexes
+                )
+                and trace_indexes == sorted(set(trace_indexes))
+                and all(
+                    0 <= index < len(status_trace)
+                    and status_trace[index] == actual_turns[position].get("status")
+                    for position, index in enumerate(trace_indexes)
+                )
+            )
+            turns_passed = (
+                expected_turn_statuses == actual_turn_statuses and trace_bound
+            )
         else:
             turns_passed = len(expected_turns) == 1 and route_passed
+    required_trace = _FIXED_TRACE_REQUIREMENTS.get(case_id, ())
+    trace_requirements_passed = (
+        not required_trace
+        or (
+            isinstance(status_trace, list)
+            and _contains_ordered(status_trace, required_trace)
+        )
+    )
     illegal_count = actual.get("illegal_transition_count", 0)
     transition_passed = (
         route_passed
         and turns_passed
+        and trace_requirements_passed
         and isinstance(illegal_count, int)
         and not isinstance(illegal_count, bool)
         and illegal_count == 0
@@ -410,7 +454,6 @@ def score_case(expected: Mapping[str, object], actual: Mapping[str, object]) -> 
             and transition_passed
             and retry_passed
             and actual.get("draft_sent", False) is False
-            and not answer.strip()
             and forbidden_passed
             and secret_passed
         )
@@ -431,6 +474,7 @@ def score_case(expected: Mapping[str, object], actual: Mapping[str, object]) -> 
         "risk_passed": actual.get("risk_level") == expected.get("expected_risk_level"),
         "route_passed": route_passed,
         "turns_passed": turns_passed,
+        "trace_requirements_passed": trace_requirements_passed,
         "transition_passed": transition_passed,
         "missing_fields_passed": missing_fields_passed,
         "required_behavior_passed": required_passed,

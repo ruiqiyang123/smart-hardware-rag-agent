@@ -1470,7 +1470,9 @@
     "expected_route": "pending_user",
     "expected_final_status": "pending_user",
     "expected_risk_level": "low",
-    "expected_missing_fields": [],
+    "expected_missing_fields": [
+      "purchase_date"
+    ],
     "expected_retry_count": 0,
     "requires_knowledge_citation": false,
     "contains_secret": false,
