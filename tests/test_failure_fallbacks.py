@@ -1,16 +1,26 @@
 import copy
 import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from langgraph.checkpoint.base import empty_checkpoint
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, StateGraph
 from langgraph.types import Command, Interrupt
 
-from agent.orchestration.runtime import SupportOrchestrator
-from agent.policies.security import IngressGuard
+from agent.orchestration.runtime import (
+    NO_CHECKPOINT_WRITES,
+    LeaseFencedCheckpointer,
+    SupportOrchestrator,
+)
+from agent.orchestration.state import TicketState
+from agent.policies.security import IngressGuard, PolicyGuard
+from agent.security.trusted_sources import TrustedSourcePolicy
 from database.ticket_db import TicketRepository
 
 
@@ -130,6 +140,10 @@ class FailureFallbackTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp.name) / "tickets.db"
         self.repo = TicketRepository(str(self.db_path))
+        self.trusted_sources = TrustedSourcePolicy(["trezor.io"], [])
+        self.final_policy_guard = PolicyGuard(
+            POLICY, trusted_source_policy=self.trusted_sources
+        )
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -142,6 +156,9 @@ class FailureFallbackTest(unittest.TestCase):
             "recursion_limit": 16,
             "lease_seconds": 130,
             "graph_timeout_seconds": 120,
+            "trusted_source_policy": self.trusted_sources,
+            "final_policy_guard": self.final_policy_guard,
+            "checkpoint_safety": NO_CHECKPOINT_WRITES,
         }
         values.update(overrides)
         return SupportOrchestrator(**values)
@@ -153,16 +170,29 @@ class FailureFallbackTest(unittest.TestCase):
         decision = self.repo.begin_command(
             ticket["ticket_id"], command_id, "user_input", 130
         )
-        self.repo.commit_command_result(
-            ticket["ticket_id"],
-            command_id,
-            decision.lease_version,
-            {
-                "status": status,
-                "risk_level": "low",
-                "requires_human": status == "escalated",
-            },
-            [
+        if status == "pending_user":
+            repository_events = [
+                {
+                    key: value
+                    for key, value in graph_event(
+                        command_id, 1, "new", "triaged", "triage.completed"
+                    ).items()
+                    if key != "command_id"
+                },
+                {
+                    key: value
+                    for key, value in graph_event(
+                        command_id,
+                        2,
+                        "triaged",
+                        "pending_user",
+                        "ticket.pending_user",
+                    ).items()
+                    if key != "command_id"
+                },
+            ]
+        else:
+            repository_events = [
                 {
                     key: value
                     for key, value in graph_event(
@@ -174,13 +204,26 @@ class FailureFallbackTest(unittest.TestCase):
                     ).items()
                     if key != "command_id"
                 }
-            ],
+            ]
+        self.repo.commit_command_result(
+            ticket["ticket_id"],
+            command_id,
+            decision.lease_version,
+            {
+                "status": status,
+                "risk_level": "low",
+                "requires_human": status == "escalated",
+            },
+            repository_events,
         )
+        checkpoint_events = [
+            {**event, "command_id": command_id} for event in repository_events
+        ]
         checkpoint = {
             "ticket_id": ticket["ticket_id"],
             "request_id": request_id,
             "command_id": command_id,
-            "event_step": 1,
+            "event_step": checkpoint_events[-1]["step_index"],
             "user_id": "1001",
             "sanitized_input": "安全的初始问题",
             "safe_history": [],
@@ -191,9 +234,7 @@ class FailureFallbackTest(unittest.TestCase):
             "response_version": 0,
             "status": status,
             "requires_human": status == "escalated",
-            "status_events": [
-                graph_event(command_id, 1, "new", status, f"ticket.{status}")
-            ],
+            "status_events": checkpoint_events,
         }
         return ticket, checkpoint
 
@@ -212,6 +253,49 @@ class FailureFallbackTest(unittest.TestCase):
                 "SELECT * FROM ticket_commands WHERE command_id = ?", (command_id,)
             ).fetchone()
         return dict(row) if row else None
+
+    @staticmethod
+    def resolved_output(graph_input, **overrides):
+        state = copy.deepcopy(graph_input)
+        command_id = state["command_id"]
+        state.update(
+            {
+                "event_step": 4,
+                "status": "resolved",
+                "requires_human": False,
+                "review_decision": "approve",
+                "final_answer": "请按照官方说明重新连接设备。",
+                "evidence_refs": [],
+                "evidence": [],
+                "citations": [],
+                "status_events": [
+                    graph_event(command_id, 1, "new", "triaged", "triage.completed"),
+                    graph_event(
+                        command_id,
+                        2,
+                        "triaged",
+                        "diagnosing",
+                        "diagnosis.started",
+                    ),
+                    graph_event(
+                        command_id,
+                        3,
+                        "diagnosing",
+                        "reviewing",
+                        "review.started",
+                    ),
+                    graph_event(
+                        command_id,
+                        4,
+                        "reviewing",
+                        "resolved",
+                        "node.completed",
+                    ),
+                ],
+            }
+        )
+        state.update(overrides)
+        return state
 
     def test_submit_sanitizes_before_database_and_graph(self):
         graph = FakeGraph()
@@ -313,6 +397,52 @@ class FailureFallbackTest(unittest.TestCase):
         self.assertTrue(duplicate.duplicate)
         self.assertEqual(graph.calls, 1)
 
+    def test_runtime_serializes_distinct_actions_for_one_ticket(self):
+        class BlockingGraph(FakeGraph):
+            def __init__(self):
+                super().__init__()
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def invoke(self, graph_input, config):
+                self.started.set()
+                if not self.release.wait(timeout=5):
+                    raise TimeoutError("test release timeout")
+                return super().invoke(graph_input, config)
+
+        ticket, checkpoint = self.seed_paused_ticket("escalated")
+        graph = BlockingGraph()
+        graph.checkpoint_values = checkpoint
+        runtime = self.runtime(graph)
+        results = []
+        errors = []
+
+        def first_action():
+            try:
+                results.append(
+                    runtime.human_action(
+                        ticket["ticket_id"], "approve", action_id="parallel-a"
+                    )
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        worker = threading.Thread(target=first_action)
+        worker.start()
+        self.assertTrue(graph.started.wait(timeout=2))
+        with self.assertRaisesRegex(ValueError, "原 command_id"):
+            runtime.human_action(
+                ticket["ticket_id"], "reject", action_id="parallel-b"
+            )
+        graph.release.set()
+        worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(graph.calls, 1)
+        self.assertIsNone(self.command_row("action:parallel-b"))
+
     def test_reusing_request_id_with_different_payload_is_a_conflict(self):
         graph = FakeGraph()
         runtime = self.runtime(graph)
@@ -362,6 +492,9 @@ class FailureFallbackTest(unittest.TestCase):
                         recursion_limit=16,
                         lease_seconds=130,
                         graph_timeout_seconds=120,
+                        trusted_source_policy=self.trusted_sources,
+                        final_policy_guard=self.final_policy_guard,
+                        checkpoint_safety=NO_CHECKPOINT_WRITES,
                     )
                     original_repo = self.repo
                     self.repo = repo
@@ -518,6 +651,9 @@ class FailureFallbackTest(unittest.TestCase):
                         recursion_limit=16,
                         lease_seconds=130,
                         graph_timeout_seconds=120,
+                        trusted_source_policy=self.trusted_sources,
+                        final_policy_guard=self.final_policy_guard,
+                        checkpoint_safety=NO_CHECKPOINT_WRITES,
                     )
                     with self.assertRaises((TypeError, ValueError)):
                         runtime.submit(
@@ -530,6 +666,214 @@ class FailureFallbackTest(unittest.TestCase):
                             (f"request:invalid-{kind}",),
                         ).fetchone()[0]
                     self.assertEqual(status, "failed")
+
+    def test_runtime_rejects_malicious_resolved_terminal_semantics(self):
+        cases = {
+            "missing_answer": {"final_answer": ""},
+            "human_gate": {"requires_human": True},
+            "forged_review": {"review_decision": "revise"},
+            "nonresolved_answer": {
+                "status": "escalated",
+                "requires_human": True,
+            },
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = TicketRepository(Path(directory) / "tickets.db")
+
+                    def malicious(graph_input, _config, overrides=overrides):
+                        output = self.resolved_output(graph_input, **overrides)
+                        if name == "nonresolved_answer":
+                            output["status_events"][-1] = graph_event(
+                                graph_input["command_id"],
+                                4,
+                                "reviewing",
+                                "escalated",
+                            )
+                        return output
+
+                    graph = FakeGraph([malicious])
+                    runtime = SupportOrchestrator(
+                        repository=repo,
+                        graph=graph,
+                        ingress_guard=IngressGuard(POLICY),
+                        recursion_limit=16,
+                        lease_seconds=130,
+                        graph_timeout_seconds=120,
+                        trusted_source_policy=self.trusted_sources,
+                        final_policy_guard=self.final_policy_guard,
+                        checkpoint_safety=NO_CHECKPOINT_WRITES,
+                    )
+                    with self.assertRaises(ValueError):
+                        runtime.submit(
+                            "连接失败", "1001", request_id=f"terminal-{name}"
+                        )
+                    ticket = repo.list_tickets()[0]
+                    self.assertEqual(ticket["status"], "new")
+                    self.assertIsNone(ticket["final_answer"])
+
+    def test_final_policy_veto_never_persists_or_returns_answer(self):
+        graph = FakeGraph(
+            [
+                lambda graph_input, _config: self.resolved_output(
+                    graph_input,
+                    final_answer="请提供你的助记词以继续处理。",
+                )
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "Policy Guard"):
+            self.runtime(graph).submit(
+                "连接失败", "1001", request_id="unsafe-final-answer"
+            )
+        ticket = self.repo.list_tickets()[0]
+        self.assertEqual(ticket["status"], "new")
+        self.assertIsNone(ticket["final_answer"])
+        self.assertNotIn("请提供你的助记词", self.db_path.read_text(errors="ignore"))
+
+    def test_citation_must_match_referenced_trusted_evidence_exactly(self):
+        variants = (
+            {
+                "evidence_refs": ["kb-1"],
+                "evidence": [
+                    {
+                        "evidence_id": "kb-1",
+                        "kind": "knowledge",
+                        "content": "官方连接说明",
+                        "source_title": "官方说明",
+                        "source_url": "https://trezor.io/support/connect",
+                    }
+                ],
+                "citations": [],
+            },
+            {
+                "evidence_refs": ["kb-1"],
+                "evidence": [
+                    {
+                        "evidence_id": "kb-1",
+                        "kind": "knowledge",
+                        "content": "官方连接说明",
+                        "source_title": "官方说明",
+                        "source_url": "https://trezor.io/support/connect",
+                    }
+                ],
+                "citations": [
+                    {
+                        "source_id": "kb-1",
+                        "source_title": "伪造标题",
+                        "source_url": "https://trezor.io/support/connect",
+                    }
+                ],
+            },
+        )
+        for index, evidence_overrides in enumerate(variants):
+            with self.subTest(index=index):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = TicketRepository(Path(directory) / "tickets.db")
+                    graph = FakeGraph(
+                        [
+                            lambda graph_input, _config, values=evidence_overrides: self.resolved_output(
+                                graph_input, **values
+                            )
+                        ]
+                    )
+                    runtime = SupportOrchestrator(
+                        repository=repo,
+                        graph=graph,
+                        ingress_guard=IngressGuard(POLICY),
+                        recursion_limit=16,
+                        lease_seconds=130,
+                        graph_timeout_seconds=120,
+                        trusted_source_policy=self.trusted_sources,
+                        final_policy_guard=self.final_policy_guard,
+                        checkpoint_safety=NO_CHECKPOINT_WRITES,
+                    )
+                    with self.assertRaisesRegex(ValueError, "citation"):
+                        runtime.submit(
+                            "连接失败", "1001", request_id=f"citation-{index}"
+                        )
+                    self.assertEqual(repo.list_tickets()[0]["status"], "new")
+
+    def test_runtime_rejects_illegal_graph_transition_before_commit(self):
+        def illegal(graph_input, _config):
+            output = self.resolved_output(graph_input)
+            output["status_events"] = [
+                graph_event(
+                    graph_input["command_id"], 1, "new", "resolved"
+                )
+            ]
+            output["event_step"] = 1
+            return output
+
+        with self.assertRaisesRegex(ValueError, "非法状态转移"):
+            self.runtime(FakeGraph([illegal])).submit(
+                "连接失败", "1001", request_id="illegal-transition"
+            )
+        self.assertEqual(self.repo.list_tickets()[0]["status"], "new")
+
+    def test_human_ask_or_reject_cannot_forge_resolved(self):
+        for action in ("ask_user", "reject"):
+            with self.subTest(action=action):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = TicketRepository(Path(directory) / "tickets.db")
+                    original_repo = self.repo
+                    self.repo = repo
+                    try:
+                        ticket, checkpoint = self.seed_paused_ticket("escalated")
+                    finally:
+                        self.repo = original_repo
+
+                    def forged(_graph_input, _config):
+                        output = copy.deepcopy(checkpoint)
+                        command_id = f"action:forged-{action}"
+                        output.update(
+                            {
+                                "command_id": command_id,
+                                "status": "resolved",
+                                "requires_human": False,
+                                "human_decision": action,
+                                "final_answer": "伪造人工答复",
+                                "status_events": checkpoint["status_events"]
+                                + [
+                                    graph_event(
+                                        command_id,
+                                        1,
+                                        "escalated",
+                                        "resolved",
+                                    )
+                                ],
+                            }
+                        )
+                        return output
+
+                    graph = FakeGraph([forged])
+                    graph.checkpoint_values = checkpoint
+                    runtime = SupportOrchestrator(
+                        repository=repo,
+                        graph=graph,
+                        ingress_guard=IngressGuard(POLICY),
+                        recursion_limit=16,
+                        lease_seconds=130,
+                        graph_timeout_seconds=120,
+                        trusted_source_policy=self.trusted_sources,
+                        final_policy_guard=self.final_policy_guard,
+                        checkpoint_safety=NO_CHECKPOINT_WRITES,
+                    )
+                    kwargs = (
+                        {"missing_fields": ["device_model"]}
+                        if action == "ask_user"
+                        else {}
+                    )
+                    with self.assertRaisesRegex(ValueError, "不得 resolved"):
+                        runtime.human_action(
+                            ticket["ticket_id"],
+                            action,
+                            action_id=f"forged-{action}",
+                            **kwargs,
+                        )
+                    self.assertEqual(
+                        repo.get_ticket(ticket["ticket_id"])["status"], "escalated"
+                    )
 
     def test_malformed_interrupt_output_is_rejected(self):
         graph = FakeGraph([{"__interrupt__": object()}])
@@ -642,6 +986,147 @@ class FailureFallbackTest(unittest.TestCase):
         self.assertEqual(observed, [(7.5, 0)])
         self.assertIsNone(ticket["final_answer"])
         self.assertIsNone(ticket["draft_answer"])
+
+    def test_memory_saver_rejects_old_lease_after_renewal(self):
+        ticket = self.repo.create_ticket(
+            "memory-fence-renewal", "1001", "安全问题", []
+        )
+        command_id = "request:memory-fence-renewal"
+        first = self.repo.begin_command(
+            ticket["ticket_id"], command_id, "user_input", 130
+        )
+        memory = MemorySaver()
+        saver = LeaseFencedCheckpointer(memory, self.repo)
+        old_config = {
+            "configurable": {
+                "thread_id": ticket["ticket_id"],
+                "checkpoint_ns": "",
+                "command_id": command_id,
+                "lease_version": first.lease_version,
+            }
+        }
+        old_ready = threading.Event()
+        release_old = threading.Event()
+        old_errors = []
+
+        def checkpoint(marker, version):
+            value = empty_checkpoint()
+            value["channel_values"] = {"marker": marker}
+            value["channel_versions"] = {"marker": version}
+            value["updated_channels"] = ["marker"]
+            return value
+
+        def late_old_write():
+            old_ready.set()
+            release_old.wait(timeout=5)
+            try:
+                saver.put(
+                    old_config,
+                    checkpoint("old", "0001"),
+                    {"source": "input", "step": -1, "parents": {}},
+                    {"marker": "0001"},
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                old_errors.append(error)
+
+        worker = threading.Thread(target=late_old_write)
+        worker.start()
+        self.assertTrue(old_ready.wait(timeout=2))
+        self.repo.expire_command_lease(
+            ticket["ticket_id"], command_id, first.lease_version
+        )
+        renewed = self.repo.begin_command(
+            ticket["ticket_id"], command_id, "user_input", 130
+        )
+        new_config = copy.deepcopy(old_config)
+        new_config["configurable"]["lease_version"] = renewed.lease_version
+        saver.put(
+            new_config,
+            checkpoint("new", "0002"),
+            {"source": "input", "step": -1, "parents": {}},
+            {"marker": "0002"},
+        )
+        release_old.set()
+        worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(renewed.lease_version, first.lease_version + 1)
+        self.assertEqual(len(old_errors), 1)
+        self.assertRegex(str(old_errors[0]), "lease_version")
+        latest = memory.get_tuple(
+            {
+                "configurable": {
+                    "thread_id": ticket["ticket_id"],
+                    "checkpoint_ns": "",
+                }
+            }
+        )
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.checkpoint["channel_values"]["marker"], "new")
+
+    def test_timed_out_real_graph_cannot_write_late_memory_checkpoint(self):
+        node_started = threading.Event()
+        release_node = threading.Event()
+        node_returned = threading.Event()
+
+        def slow_node(state):
+            node_started.set()
+            if not release_node.wait(timeout=5):
+                raise TimeoutError("test release timeout")
+            node_returned.set()
+            return {
+                "status": "escalated",
+                "requires_human": True,
+                "status_events": [
+                    graph_event(
+                        state["command_id"], 1, "new", "escalated"
+                    )
+                ],
+            }
+
+        builder = StateGraph(TicketState)
+        builder.add_node("slow", slow_node)
+        builder.set_entry_point("slow")
+        builder.add_edge("slow", END)
+        memory = MemorySaver()
+        graph = builder.compile(checkpointer=memory)
+        runtime = SupportOrchestrator(
+            repository=self.repo,
+            graph=graph,
+            ingress_guard=IngressGuard(POLICY),
+            recursion_limit=16,
+            lease_seconds=2,
+            graph_timeout_seconds=0.05,
+            trusted_source_policy=self.trusted_sources,
+            final_policy_guard=self.final_policy_guard,
+        )
+
+        with self.assertRaises(TimeoutError):
+            runtime.submit(
+                "连接失败", "1001", request_id="real-memory-timeout"
+            )
+        self.assertTrue(node_started.wait(timeout=2))
+        ticket = self.repo.list_tickets()[0]
+        command = self.command_row("request:real-memory-timeout")
+        self.assertLessEqual(
+            datetime.fromisoformat(command["lease_expires_at"]),
+            datetime.now(timezone.utc),
+        )
+
+        release_node.set()
+        self.assertTrue(node_returned.wait(timeout=2))
+        for worker in threading.enumerate():
+            if worker.name == "keyguard-bounded-invoke":
+                worker.join(timeout=2)
+
+        snapshot = graph.get_state(
+            {"configurable": {"thread_id": ticket["ticket_id"]}}
+        )
+        self.assertEqual(snapshot.values["status"], "new")
+        self.assertEqual(snapshot.values.get("status_events", []), [])
+        self.assertEqual(
+            self.repo.get_ticket(ticket["ticket_id"])["status"], "new"
+        )
 
     def test_runtime_configuration_requires_timeout_inside_lease(self):
         invalid = (

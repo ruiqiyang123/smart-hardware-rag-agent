@@ -323,6 +323,65 @@ class TicketRepositoryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.repo.fail_command(command_id, started.lease_version, "STALE_WORKER")
 
+    def test_one_ticket_allows_only_one_distinct_in_progress_command(self):
+        ticket = self._ticket("single-active")
+        barrier = threading.Barrier(2)
+        decisions = []
+        errors = []
+        lock = threading.Lock()
+
+        def begin(command_id):
+            try:
+                barrier.wait()
+                decision = self.repo.begin_command(
+                    ticket["ticket_id"], command_id, "user_input", 130
+                )
+                with lock:
+                    decisions.append((command_id, decision))
+            except Exception as error:  # pragma: no cover - asserted below
+                with lock:
+                    errors.append(error)
+
+        threads = [
+            threading.Thread(target=begin, args=("request:parallel-a",)),
+            threading.Thread(target=begin, args=("request:parallel-b",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0][1].disposition, CommandDisposition.START)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("原 command_id", str(errors[0]))
+        with sqlite3.connect(self.db_path) as connection:
+            active = connection.execute(
+                "SELECT COUNT(*) FROM ticket_commands WHERE ticket_id = ? AND status = 'in_progress'",
+                (ticket["ticket_id"],),
+            ).fetchone()[0]
+        self.assertEqual(active, 1)
+
+    def test_expired_active_command_must_resume_with_original_id(self):
+        ticket, command_id, started = self._started("expired-original-only")
+        expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                "UPDATE ticket_commands SET lease_expires_at = ? WHERE command_id = ?",
+                (expired, command_id),
+            )
+
+        with self.assertRaisesRegex(ValueError, "原 command_id"):
+            self.repo.begin_command(
+                ticket["ticket_id"], "request:different-id", "user_input", 130
+            )
+        resumed = self.repo.begin_command(
+            ticket["ticket_id"], command_id, "user_input", 130
+        )
+        self.assertEqual(resumed.disposition, CommandDisposition.RESUME)
+        self.assertEqual(resumed.lease_version, started.lease_version + 1)
+
     def test_expired_current_lease_cannot_append_fail_or_commit(self):
         operations = ("append", "fail", "commit")
         for operation in operations:
@@ -451,6 +510,92 @@ class TicketRepositoryTest(unittest.TestCase):
                 decision.lease_version,
                 {"status": "triaged"},
                 [],
+            )
+
+    def test_commit_rejects_stale_ticket_status_and_broken_event_chain(self):
+        ticket, command_id, decision = self._started("stale-ticket-status")
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                "UPDATE tickets SET status = 'triaged' WHERE ticket_id = ?",
+                (ticket["ticket_id"],),
+            )
+        stale_event = {
+            key: value
+            for key, value in self._event(
+                ticket,
+                command_id,
+                decision.lease_version,
+                event_type="ticket.escalated",
+                from_status="new",
+                to_status="escalated",
+            ).items()
+            if key not in {"ticket_id", "command_id", "lease_version"}
+        }
+        with self.assertRaisesRegex(ValueError, "当前状态"):
+            self.repo.commit_command_result(
+                ticket["ticket_id"],
+                command_id,
+                decision.lease_version,
+                {"status": "escalated"},
+                [stale_event],
+            )
+        self.assertEqual(self.repo.get_ticket(ticket["ticket_id"])["status"], "triaged")
+
+        broken_ticket, broken_command, broken_decision = self._started("broken-chain")
+        broken_events = []
+        for step, from_status, to_status, event_type in (
+            (1, "new", "triaged", "triage.completed"),
+            (2, "diagnosing", "escalated", "ticket.escalated"),
+        ):
+            broken_events.append(
+                {
+                    key: value
+                    for key, value in self._event(
+                        broken_ticket,
+                        broken_command,
+                        broken_decision.lease_version,
+                        step_index=step,
+                        from_status=from_status,
+                        to_status=to_status,
+                        event_type=event_type,
+                    ).items()
+                    if key not in {"ticket_id", "command_id", "lease_version"}
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "事件链"):
+            self.repo.commit_command_result(
+                broken_ticket["ticket_id"],
+                broken_command,
+                broken_decision.lease_version,
+                {"status": "escalated"},
+                broken_events,
+            )
+        self.assertEqual(
+            self.repo.get_ticket(broken_ticket["ticket_id"])["status"], "new"
+        )
+
+        illegal_ticket, illegal_command, illegal_decision = self._started(
+            "illegal-transition"
+        )
+        illegal_event = {
+            key: value
+            for key, value in self._event(
+                illegal_ticket,
+                illegal_command,
+                illegal_decision.lease_version,
+                event_type="ticket.resolved",
+                from_status="new",
+                to_status="resolved",
+            ).items()
+            if key not in {"ticket_id", "command_id", "lease_version"}
+        }
+        with self.assertRaisesRegex(ValueError, "非法状态转移"):
+            self.repo.commit_command_result(
+                illegal_ticket["ticket_id"],
+                illegal_command,
+                illegal_decision.lease_version,
+                {"status": "resolved"},
+                [illegal_event],
             )
 
     def test_secret_like_values_are_rejected_before_reaching_database(self):
@@ -686,7 +831,15 @@ class TicketRepositoryTest(unittest.TestCase):
             {
                 key: value
                 for key, value in self._event(
-                    ticket, command_id, decision.lease_version, step
+                    ticket,
+                    command_id,
+                    decision.lease_version,
+                    step,
+                    **(
+                        {"from_status": "triaged", "to_status": "triaged"}
+                        if step == 2
+                        else {}
+                    ),
                 ).items()
                 if key not in {"ticket_id", "command_id", "lease_version"}
             }

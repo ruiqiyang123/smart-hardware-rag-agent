@@ -17,10 +17,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import List, Optional
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command, Interrupt
 
 from agent.orchestration.events import make_event, to_repository_event
 from agent.orchestration.invoke import invoke_with_policy
+from agent.orchestration.routes import assert_transition
 from agent.orchestration.state import (
     MissingField,
     RiskFlag,
@@ -116,6 +118,99 @@ class OrchestrationResult:
 
 class CheckpointRestoreError(RuntimeError):
     """A leased command could not safely continue from its checkpoint."""
+
+
+class _NoCheckpointWritesSafety:
+    """Explicit test-only assertion that a graph never writes checkpoints."""
+
+
+NO_CHECKPOINT_WRITES = _NoCheckpointWritesSafety()
+
+
+class LeaseFencedCheckpointer(BaseCheckpointSaver):
+    """Fence every synchronous checkpoint write with the durable command lease."""
+
+    def __init__(self, delegate: object, repository: object) -> None:
+        if not callable(getattr(delegate, "get_tuple", None)) or not callable(
+            getattr(delegate, "put", None)
+        ) or not callable(getattr(delegate, "put_writes", None)):
+            raise TypeError("delegate checkpointer 接口非法")
+        if not callable(getattr(repository, "guarded_checkpoint_write", None)):
+            raise TypeError("repository checkpoint lease guard 接口非法")
+        super().__init__(serde=getattr(delegate, "serde", None))
+        self.delegate = delegate
+        self.repository = repository
+
+    @property
+    def config_specs(self) -> list:
+        return list(getattr(self.delegate, "config_specs", []))
+
+    @staticmethod
+    def _lease(config: object) -> tuple[str, str, int]:
+        if not isinstance(config, Mapping):
+            raise TypeError("checkpoint config 非法")
+        configurable = config.get("configurable")
+        if not isinstance(configurable, Mapping):
+            raise ValueError("checkpoint config 缺少 configurable")
+        ticket_id = _identifier(configurable.get("thread_id"), "thread_id")
+        command_id = _identifier(configurable.get("command_id"), "command_id")
+        lease_version = configurable.get("lease_version")
+        if (
+            isinstance(lease_version, bool)
+            or not isinstance(lease_version, int)
+            or lease_version <= 0
+        ):
+            raise ValueError("checkpoint lease_version 非法")
+        return ticket_id, command_id, lease_version
+
+    def get_tuple(self, config):
+        return self.delegate.get_tuple(config)
+
+    def list(self, config, *, filter=None, before=None, limit=None):
+        return self.delegate.list(
+            config, filter=filter, before=before, limit=limit
+        )
+
+    def put(self, config, checkpoint, metadata, new_versions):
+        ticket_id, command_id, lease_version = self._lease(config)
+
+        def write():
+            return self.delegate.put(config, checkpoint, metadata, new_versions)
+
+        result = self.repository.guarded_checkpoint_write(
+            ticket_id, command_id, lease_version, write
+        )
+        if not isinstance(result, Mapping):
+            raise TypeError("delegate checkpoint put 输出非法")
+        projected = copy.deepcopy(dict(result))
+        configurable = dict(projected.get("configurable", {}))
+        configurable.update(
+            {"command_id": command_id, "lease_version": lease_version}
+        )
+        projected["configurable"] = configurable
+        return projected
+
+    def put_writes(self, config, writes, task_id, task_path="") -> None:
+        ticket_id, command_id, lease_version = self._lease(config)
+
+        def write():
+            return self.delegate.put_writes(config, writes, task_id, task_path)
+
+        self.repository.guarded_checkpoint_write(
+            ticket_id, command_id, lease_version, write
+        )
+
+    def delete_thread(self, thread_id: str) -> None:
+        return self.delegate.delete_thread(thread_id)
+
+    def get_next_version(self, current, channel):
+        return self.delegate.get_next_version(current, channel)
+
+    def get_delta_channel_history(self, *, config, channels):
+        method = getattr(self.delegate, "get_delta_channel_history", None)
+        if callable(method):
+            return method(config=config, channels=channels)
+        return super().get_delta_channel_history(config=config, channels=channels)
 
 
 @dataclass(frozen=True)
@@ -315,6 +410,8 @@ class SupportOrchestrator:
         lease_seconds: int,
         graph_timeout_seconds: float = 120,
         trusted_source_policy: object | None = None,
+        final_policy_guard: object | None = None,
+        checkpoint_safety: object | None = None,
     ):
         if (
             isinstance(recursion_limit, bool)
@@ -343,6 +440,28 @@ class SupportOrchestrator:
             raise TypeError("graph 接口非法")
         if not callable(getattr(ingress_guard, "sanitize", None)):
             raise TypeError("ingress_guard 接口非法")
+        if not callable(getattr(final_policy_guard, "evaluate", None)):
+            raise TypeError("final_policy_guard 接口非法")
+
+        missing = object()
+        graph_checkpointer = getattr(graph, "checkpointer", missing)
+        if graph_checkpointer is missing:
+            if checkpoint_safety is not NO_CHECKPOINT_WRITES:
+                raise TypeError(
+                    "无 checkpointer 的测试图必须显式声明 NO_CHECKPOINT_WRITES"
+                )
+        else:
+            if checkpoint_safety is not None:
+                raise ValueError("生产图不得绕过 checkpoint lease fence")
+            if graph_checkpointer is None:
+                raise TypeError("生产图必须配置 checkpointer")
+            if isinstance(graph_checkpointer, LeaseFencedCheckpointer):
+                if graph_checkpointer.repository is not repository:
+                    raise ValueError("checkpointer lease fence repository 不匹配")
+            else:
+                graph.checkpointer = LeaseFencedCheckpointer(
+                    graph_checkpointer, repository
+                )
 
         self.repository = repository
         self.graph = graph
@@ -353,10 +472,33 @@ class SupportOrchestrator:
         self.trusted_sources = trusted_source_policy or TrustedSourcePolicy()
         if not callable(getattr(self.trusted_sources, "is_trusted", None)):
             raise TypeError("trusted_source_policy 接口非法")
+        guard_sources = getattr(final_policy_guard, "trusted_sources", None)
+        if guard_sources is not None and guard_sources is not self.trusted_sources:
+            raise ValueError(
+                "final_policy_guard 与 runtime 必须共享 trusted_source_policy"
+            )
+        self.final_policy_guard = final_policy_guard
 
-    def _config(self, ticket_id: str) -> dict:
+    def _config(
+        self,
+        ticket_id: str,
+        command_id: str | None = None,
+        lease_version: int | None = None,
+    ) -> dict:
+        configurable = {"thread_id": _identifier(ticket_id, "ticket_id")}
+        if (command_id is None) != (lease_version is None):
+            raise ValueError("command_id 与 lease_version 必须同时提供")
+        if command_id is not None:
+            configurable["command_id"] = _identifier(command_id, "command_id")
+            if (
+                isinstance(lease_version, bool)
+                or not isinstance(lease_version, int)
+                or lease_version <= 0
+            ):
+                raise ValueError("lease_version 非法")
+            configurable["lease_version"] = lease_version
         return {
-            "configurable": {"thread_id": _identifier(ticket_id, "ticket_id")},
+            "configurable": configurable,
             "recursion_limit": self.recursion_limit,
         }
 
@@ -376,11 +518,17 @@ class SupportOrchestrator:
         values = self._checkpoint_values(ticket_id)
         return self._validated_graph_output(values) if values else {}
 
-    def _invoke_graph(self, graph_input, ticket_id: str) -> dict:
+    def _invoke_graph(
+        self,
+        graph_input,
+        ticket_id: str,
+        command_id: str,
+        lease_version: int,
+    ) -> dict:
         output = invoke_with_policy(
             lambda: self.graph.invoke(
                 graph_input,
-                config=self._config(ticket_id),
+                config=self._config(ticket_id, command_id, lease_version),
             ),
             timeout_seconds=self.graph_timeout_seconds,
             retries=0,
@@ -445,7 +593,7 @@ class SupportOrchestrator:
                 expected_ticket_status=ticket_status,
             )
             raise CheckpointRestoreError("CHECKPOINT_MISMATCH") from None
-        return self._invoke_graph(None, ticket_id)
+        return self._invoke_graph(None, ticket_id, command_id, lease_version)
 
     def _fail_command_safely(
         self, command_id: str, lease_version: int, error_code: str
@@ -462,6 +610,8 @@ class SupportOrchestrator:
         command_id: str,
         decision: CommandDecision,
         graph_input,
+        command_type: str,
+        human_action: str | None = None,
     ) -> None:
         try:
             if decision.disposition == CommandDisposition.RESUME:
@@ -471,7 +621,12 @@ class SupportOrchestrator:
                     decision.lease_version,
                 )
             elif decision.disposition == CommandDisposition.START:
-                output = self._invoke_graph(graph_input, ticket_id)
+                output = self._invoke_graph(
+                    graph_input,
+                    ticket_id,
+                    command_id,
+                    decision.lease_version,
+                )
             else:
                 raise ValueError("command disposition 不可执行")
             self._persist_graph_result(
@@ -479,10 +634,13 @@ class SupportOrchestrator:
                 command_id,
                 decision.lease_version,
                 output,
+                command_type,
+                human_action,
             )
         except TimeoutError:
-            # The worker may still finish a checkpoint. Keep the lease in
-            # progress so a later fenced RESUME can perform consistency checks.
+            self.repository.expire_command_lease(
+                ticket_id, command_id, decision.lease_version
+            )
             raise
         except CheckpointRestoreError:
             raise
@@ -500,6 +658,8 @@ class SupportOrchestrator:
         command_id: str,
         lease_version: int,
         output: object,
+        command_type: str = CommandType.USER_INPUT.value,
+        human_action: str | None = None,
     ) -> None:
         state = self._validated_graph_output(output)
         if state.get("ticket_id") != ticket_id:
@@ -507,6 +667,14 @@ class SupportOrchestrator:
         if state.get("command_id") != command_id:
             raise ValueError("graph command_id 与当前 command 不一致")
         final_status = _status(state.get("status"))
+        citations = self._validated_evidence_bundle(state)
+        self._validate_terminal_state(
+            state,
+            final_status,
+            command_type,
+            human_action,
+            citations,
+        )
 
         updates = {
             "status": final_status,
@@ -570,6 +738,13 @@ class SupportOrchestrator:
             )
             events.append(to_repository_event(terminal))
 
+        ticket = self.repository.get_ticket(ticket_id)
+        if ticket is None:
+            raise ValueError(f"工单不存在: {ticket_id}")
+        self._validate_runtime_event_chain(
+            _status(ticket.get("status")), final_status, events
+        )
+
         self.repository.commit_command_result(
             ticket_id=ticket_id,
             command_id=command_id,
@@ -577,6 +752,154 @@ class SupportOrchestrator:
             updates=updates,
             events=events,
         )
+
+    @staticmethod
+    def _validate_runtime_event_chain(
+        current_status: str,
+        final_status: str,
+        events: list[dict],
+    ) -> None:
+        expected = current_status
+        steps = [event["step_index"] for event in events]
+        if steps != sorted(steps) or len(steps) != len(set(steps)):
+            raise ValueError("runtime 事件 step_index 非法")
+        for event in events:
+            from_status = event["from_status"]
+            to_status = event["to_status"]
+            if from_status is None or to_status is None:
+                raise ValueError("runtime 事件链缺少状态")
+            if from_status != expected:
+                raise ValueError("runtime 事件链 from_status 不连续")
+            if to_status != from_status:
+                assert_transition(from_status, to_status)
+            expected = to_status
+        if expected != final_status:
+            raise ValueError("runtime 事件链末状态不匹配")
+
+    def _validated_evidence_bundle(self, state: Mapping[str, object]) -> list[dict]:
+        evidence_refs = _string_list(
+            state.get("evidence_refs", []), "evidence_refs", 32
+        )
+        raw_evidence = state.get("evidence", [])
+        if not isinstance(raw_evidence, list) or len(raw_evidence) > 16:
+            raise ValueError("checkpoint evidence 非法")
+        evidence_by_id: dict[str, dict] = {}
+        for raw_item in raw_evidence:
+            required = {
+                "evidence_id",
+                "kind",
+                "content",
+                "source_title",
+                "source_url",
+            }
+            allowed = required | {"metadata"}
+            if (
+                not isinstance(raw_item, dict)
+                or not required.issubset(raw_item)
+                or not set(raw_item).issubset(allowed)
+            ):
+                raise ValueError("checkpoint evidence 字段非法")
+            evidence_id = _safe_text(
+                raw_item["evidence_id"], "evidence.evidence_id", 128
+            )
+            kind = raw_item["kind"]
+            if kind not in {"knowledge", "profile", "device", "warranty", "chain"}:
+                raise ValueError("checkpoint evidence kind 非法")
+            content = _safe_text(raw_item["content"], "evidence.content", 32 * 1024)
+            title = _safe_text(
+                raw_item["source_title"], "evidence.source_title", 500
+            )
+            url = raw_item["source_url"]
+            if url is not None:
+                url = _safe_text(url, "evidence.source_url", 2_000)
+                if not self.trusted_sources.is_trusted(url):
+                    raise ValueError("checkpoint evidence URL 不可信")
+            if "metadata" in raw_item:
+                metadata = _strict_json(raw_item["metadata"])
+                if not isinstance(metadata, dict):
+                    raise ValueError("checkpoint evidence metadata 非法")
+            if evidence_id in evidence_by_id:
+                raise ValueError("checkpoint evidence_id 重复")
+            evidence_by_id[evidence_id] = {
+                "evidence_id": evidence_id,
+                "kind": kind,
+                "content": content,
+                "source_title": title,
+                "source_url": url,
+            }
+        if not set(evidence_refs).issubset(evidence_by_id):
+            raise ValueError("checkpoint evidence_refs 包含未知证据")
+
+        citations = self._citations(state.get("citations", []))
+        citation_by_id = {item["source_id"]: item for item in citations}
+        for citation in citations:
+            source = evidence_by_id.get(citation["source_id"])
+            if (
+                source is None
+                or citation["source_id"] not in evidence_refs
+                or citation["source_title"] != source["source_title"]
+                or citation["source_url"] != source["source_url"]
+            ):
+                raise ValueError("checkpoint citation 与 evidence 不匹配")
+        for evidence_id in evidence_refs:
+            source = evidence_by_id[evidence_id]
+            if (
+                source["kind"] == "knowledge"
+                and source["source_url"] is not None
+                and evidence_id not in citation_by_id
+            ):
+                raise ValueError("checkpoint knowledge evidence 缺少 citation")
+        return citations
+
+    def _final_policy_passes(self, final_answer: str, citations: list[dict]) -> None:
+        urls = [citation["source_url"] for citation in citations]
+        try:
+            decision = self.final_policy_guard.evaluate(final_answer, urls)
+        except Exception:
+            raise ValueError("最终答复 Policy Guard 执行失败") from None
+        passed = getattr(decision, "passed", None)
+        reasons = getattr(decision, "reason_codes", None)
+        if passed is not True or not isinstance(reasons, list) or reasons:
+            raise ValueError("最终答复未通过 Policy Guard")
+
+    def _validate_terminal_state(
+        self,
+        state: Mapping[str, object],
+        final_status: str,
+        command_type: str,
+        human_action: str | None,
+        citations: list[dict],
+    ) -> None:
+        requires_human = state.get("requires_human", False)
+        if not isinstance(requires_human, bool):
+            raise ValueError("requires_human 非法")
+        final_answer = _safe_text(
+            state.get("final_answer", ""),
+            "final_answer",
+            2_000,
+            allow_empty=True,
+        )
+        if final_status != Status.RESOLVED.value:
+            if final_answer:
+                raise ValueError("非 resolved 状态不得包含 final_answer")
+            if final_status == Status.ESCALATED.value and not requires_human:
+                raise ValueError("escalated 状态必须 requires_human")
+            return
+
+        if not final_answer or requires_human:
+            raise ValueError("resolved 状态必须包含答复且关闭人工门")
+        review_decision = state.get("review_decision")
+        human_decision = state.get("human_decision")
+        if command_type == CommandType.USER_INPUT.value:
+            if review_decision != "approve" or human_decision not in {None, ""}:
+                raise ValueError("USER_INPUT resolved 必须由 Review approve")
+        else:
+            if human_action not in {"approve", "edit_send"}:
+                raise ValueError("ask_user/reject 不得 resolved")
+            expected_type = _HUMAN_COMMAND_TYPES[human_action].value
+            if command_type != expected_type or human_decision != human_action:
+                raise ValueError("human resolved decision 与 action 不匹配")
+        self._final_policy_passes(final_answer, citations)
 
     def _citations(self, value: object) -> list[dict]:
         if value is None:
@@ -678,10 +1001,20 @@ class SupportOrchestrator:
         if ticket is None:
             raise ValueError(f"工单不存在: {ticket_id}")
         checkpoint = self._checkpoint_values(ticket_id)
-        citations = self._citations(checkpoint.get("citations", []))
+        citations = self._validated_evidence_bundle(checkpoint)
         final_answer = ticket.get("final_answer") or ""
         if final_answer:
             final_answer = _safe_text(final_answer, "final_answer", 2_000)
+        result_status = _status(ticket.get("status"))
+        requires_human = ticket.get("requires_human")
+        if requires_human not in {0, 1}:
+            raise ValueError("ticket requires_human 非法")
+        if result_status == Status.RESOLVED.value:
+            if not final_answer or requires_human != 0:
+                raise ValueError("resolved ticket 终态非法")
+            self._final_policy_passes(final_answer, citations)
+        elif final_answer:
+            raise ValueError("非 resolved ticket 不得返回 final_answer")
         sanitized_input = _safe_text(
             sanitized_input, "sanitized_input", 10_000, allow_empty=True
         )
@@ -690,7 +1023,7 @@ class SupportOrchestrator:
         )
         return OrchestrationResult(
             ticket_id=_identifier(ticket_id, "ticket_id"),
-            status=_status(ticket.get("status")),
+            status=result_status,
             sanitized_input=sanitized_input,
             user_notice=user_notice,
             final_answer=final_answer,
@@ -795,6 +1128,7 @@ class SupportOrchestrator:
             command_id=command_id,
             decision=decision,
             graph_input=state,
+            command_type=CommandType.USER_INPUT.value,
         )
         return self._result(
             ticket_id,
@@ -856,6 +1190,7 @@ class SupportOrchestrator:
             command_id=command_id,
             decision=decision,
             graph_input=resume_command,
+            command_type=CommandType.USER_INPUT.value,
         )
         return self._result(
             ticket_id,
@@ -926,5 +1261,7 @@ class SupportOrchestrator:
             command_id=command_id,
             decision=decision,
             graph_input=Command(resume=resume_payload),
+            command_type=_HUMAN_COMMAND_TYPES[action].value,
+            human_action=action,
         )
         return self._result(ticket_id, "", "")

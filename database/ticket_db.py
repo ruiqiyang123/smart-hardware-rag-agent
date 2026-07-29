@@ -7,13 +7,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from agent.security.secrets import (
     TransactionHash,
     contains_unredacted_secret,
     is_fully_redacted,
 )
+from agent.orchestration.routes import assert_transition
 
 
 class CommandDisposition(str, Enum):
@@ -172,6 +173,9 @@ CREATE TABLE IF NOT EXISTS ticket_events (
     FOREIGN KEY(ticket_id, command_id)
         REFERENCES ticket_commands(ticket_id, command_id)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ticket_commands_one_in_progress
+    ON ticket_commands(ticket_id)
+    WHERE status = 'in_progress';
 PRAGMA user_version = 4;
 """
 _SENSITIVE_METADATA_KEYS = {
@@ -633,6 +637,19 @@ class TicketRepository:
                     return CommandDecision(CommandDisposition.RESUME, version)
                 return CommandDecision(CommandDisposition.IN_PROGRESS, version)
 
+            active = connection.execute(
+                """
+                SELECT command_id FROM ticket_commands
+                WHERE ticket_id = ? AND status = 'in_progress'
+                LIMIT 1
+                """,
+                (ticket_id,),
+            ).fetchone()
+            if active is not None:
+                raise ValueError(
+                    "工单已有 in_progress command；必须使用原 command_id 恢复"
+                )
+
             ticket = connection.execute(
                 "SELECT status FROM tickets WHERE ticket_id = ?", (ticket_id,)
             ).fetchone()
@@ -712,6 +729,65 @@ class TicketRepository:
             )
             if cursor.rowcount != 1:
                 raise ValueError("command 失败写入时 lease 已失效")
+
+    def expire_command_lease(
+        self,
+        ticket_id: str,
+        command_id: str,
+        lease_version: int,
+    ) -> None:
+        """Fence a timed-out worker without terminally failing its command."""
+
+        ticket_id = self._nonempty_text(ticket_id, "ticket_id")
+        command_id = self._nonempty_text(command_id, "command_id")
+        lease_version = self._positive_integer(lease_version, "lease_version")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            command = self._command_row(connection, command_id)
+            if command is None:
+                raise ValueError(f"command 不存在: {command_id}")
+            self._check_command_owner(command, ticket_id, lease_version)
+            if command["status"] != "in_progress":
+                raise ValueError("只有 in_progress command 可以过期 lease")
+            stamp = self._now()
+            cursor = connection.execute(
+                """
+                UPDATE ticket_commands
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE command_id = ? AND ticket_id = ?
+                  AND status = 'in_progress' AND lease_version = ?
+                """,
+                (stamp, stamp, command_id, ticket_id, lease_version),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("command lease 过期写入失败")
+
+    def guarded_checkpoint_write(
+        self,
+        ticket_id: str,
+        command_id: str,
+        lease_version: int,
+        writer: Callable[[], object],
+    ) -> object:
+        """Run one checkpoint write while holding the command lease DB fence."""
+
+        ticket_id = self._nonempty_text(ticket_id, "ticket_id")
+        command_id = self._nonempty_text(command_id, "command_id")
+        lease_version = self._positive_integer(lease_version, "lease_version")
+        if not callable(writer):
+            raise TypeError("checkpoint writer 必须可调用")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            command = self._command_row(connection, command_id)
+            if command is None:
+                raise ValueError(f"command 不存在: {command_id}")
+            self._check_command_owner(
+                command,
+                ticket_id,
+                lease_version,
+                require_active=True,
+            )
+            return writer()
 
     def fail_checkpoint_restore(
         self,
@@ -1002,6 +1078,29 @@ class TicketRepository:
             raise ValueError("final event to_status 必须等于 final status")
         return str(final_status)
 
+    @staticmethod
+    def _validate_event_chain(
+        current_status: str,
+        final_status: str,
+        prepared_events: List[Dict[str, object]],
+    ) -> None:
+        steps = [event["step_index"] for event in prepared_events]
+        if steps != sorted(steps) or len(steps) != len(set(steps)):
+            raise ValueError("事件 step_index 必须严格递增")
+        expected_status = current_status
+        for event in prepared_events:
+            from_status = event["from_status"]
+            to_status = event["to_status"]
+            if from_status is None or to_status is None:
+                raise ValueError("事件链必须显式声明 from_status/to_status")
+            if from_status != expected_status:
+                raise ValueError("事件链 from_status 与工单当前状态不一致")
+            if to_status != from_status:
+                assert_transition(from_status, to_status)
+            expected_status = to_status
+        if expected_status != final_status:
+            raise ValueError("事件链末状态与 updates status 不一致")
+
     def commit_command_result(
         self,
         ticket_id: str,
@@ -1043,6 +1142,15 @@ class TicketRepository:
                 raise ValueError("只有 in_progress command 可以提交结果")
             self._check_command_owner(
                 command, ticket_id, lease_version, require_active=True
+            )
+
+            ticket = connection.execute(
+                "SELECT status FROM tickets WHERE ticket_id = ?", (ticket_id,)
+            ).fetchone()
+            if ticket is None:
+                raise ValueError(f"工单不存在: {ticket_id}")
+            self._validate_event_chain(
+                ticket["status"], final_status, prepared_events
             )
 
             stamp = self._now()
