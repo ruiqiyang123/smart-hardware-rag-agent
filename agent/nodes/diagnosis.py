@@ -29,6 +29,7 @@ _PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "diagnosis_prom
 _MAX_INPUT_LENGTH = 10_000
 _MAX_EVIDENCE_ITEMS = 16
 _MAX_EVIDENCE_CONTENT = 32 * 1024
+_MAX_REVIEW_FEEDBACK_ITEMS = 9
 _TOOL_NAMES = frozenset(
     {"knowledge_search", "profile", "warranty", "chain_status"}
 )
@@ -223,6 +224,43 @@ def _missing_fields(value: object) -> List[MissingField]:
     return result
 
 
+def _review_feedback(state: dict) -> dict | None:
+    revision_count = state.get("revision_count", 0)
+    if (
+        isinstance(revision_count, bool)
+        or not isinstance(revision_count, int)
+        or revision_count not in {0, 1}
+    ):
+        raise ValueError("revision_count 非法")
+    if revision_count == 0:
+        return None
+    reasons = state.get("review_reasons")
+    changes = state.get("required_changes")
+    if (
+        not isinstance(reasons, list)
+        or not reasons
+        or len(reasons) > _MAX_REVIEW_FEEDBACK_ITEMS
+        or not isinstance(changes, list)
+        or not changes
+        or len(changes) > 6
+    ):
+        raise ValueError("review_feedback 非法")
+
+    def normalize(items: list, field_name: str, max_length: int) -> List[str]:
+        normalized: List[str] = []
+        for item in items:
+            text = _safe_text(item, field_name, max_length=max_length)
+            if text in normalized:
+                raise ValueError("review_feedback 不得重复")
+            normalized.append(text)
+        return normalized
+
+    return {
+        "review_reasons": normalize(reasons, "review_reason", 64),
+        "required_changes": normalize(changes, "required_change", 300),
+    }
+
+
 def _normalize_query(request: ToolRequest) -> ToolRequest:
     query = request.query
     if request.name == "warranty":
@@ -376,6 +414,8 @@ class DiagnosisAgent:
         answer_runner: object | None = None,
         timeout_seconds: float = 20,
         retries: int = 1,
+        tool_timeout_seconds: float | None = None,
+        tool_retries: int | None = None,
         trusted_source_policy: TrustedSourcePolicy | None = None,
         trusted_source_domains: object | None = None,
         trusted_source_url_prefixes: object | None = None,
@@ -385,6 +425,11 @@ class DiagnosisAgent:
         if not (model_mode or runners_mode):
             raise ValueError("DiagnosisAgent 必须提供 model 或一对 runners")
         _validate_execution_policy(timeout_seconds, retries)
+        if tool_timeout_seconds is None:
+            tool_timeout_seconds = timeout_seconds
+        if tool_retries is None:
+            tool_retries = retries
+        _validate_execution_policy(tool_timeout_seconds, tool_retries)
         if model_mode:
             factory = getattr(model, "with_structured_output", None)
             if not callable(factory):
@@ -410,6 +455,8 @@ class DiagnosisAgent:
         self.tool_registry = dict(tool_registry)
         self.timeout_seconds = timeout_seconds
         self.retries = retries
+        self.tool_timeout_seconds = tool_timeout_seconds
+        self.tool_retries = tool_retries
         if trusted_source_policy is not None:
             if not isinstance(trusted_source_policy, TrustedSourcePolicy):
                 raise TypeError("trusted_source_policy 类型非法")
@@ -466,6 +513,7 @@ class DiagnosisAgent:
                 remaining_unknowns=missing_fields,
             )
         safe_tool_context = _safe_tool_context(state, sanitized_input)
+        review_feedback = _review_feedback(state)
 
         plan_payload = {
             "allowed_tools": sorted(allowed),
@@ -473,6 +521,8 @@ class DiagnosisAgent:
             "sanitized_input": sanitized_input,
             "missing_fields": [],
         }
+        if review_feedback is not None:
+            plan_payload["review_feedback"] = review_feedback
         plan_messages = [
             SystemMessage(content=self.prompt),
             HumanMessage(
@@ -508,8 +558,8 @@ class DiagnosisAgent:
                     lambda tool=tool, request=request: tool(
                         copy.deepcopy(safe_tool_context), request.query
                     ),
-                    self.timeout_seconds,
-                    self.retries,
+                    self.tool_timeout_seconds,
+                    self.tool_retries,
                 )
                 if not isinstance(raw_items, list):
                     raise ValueError("工具证据必须是列表")
@@ -553,6 +603,8 @@ class DiagnosisAgent:
             },
             "evidence": evidence_json,
         }
+        if review_feedback is not None:
+            answer_payload["review_feedback"] = review_feedback
         answer_messages = [
             SystemMessage(content=self.prompt),
             HumanMessage(

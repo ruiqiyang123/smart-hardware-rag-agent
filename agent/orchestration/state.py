@@ -299,6 +299,7 @@ class TicketState(TypedDict, total=False):
     risk_flags: List[str]
     missing_fields: List[str]
     suggested_route: str
+    summary: str
     customer_context: Dict[str, str]
     diagnosis_summary: str
     recommended_actions: List[DiagnosisActionState]

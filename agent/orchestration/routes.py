@@ -126,7 +126,12 @@ def route_after_entry(state: object) -> str:
     risk_level = _risk_level(_required(values, "risk_level"))
     requires_human = _optional_bool(values, "requires_human")
     status = _status(values["status"]) if "status" in values else None
-    if status not in {None, Status.NEW, Status.ESCALATED}:
+    if status not in {
+        None,
+        Status.NEW,
+        Status.PENDING_USER,
+        Status.ESCALATED,
+    }:
         raise IllegalRoute("入口状态非法")
     return (
         "human_review"
