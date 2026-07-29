@@ -124,6 +124,20 @@ ERROR_USER_MESSAGES = {
 }
 
 
+def _safe_exception_type(error: BaseException) -> str:
+    try:
+        exception_type = getattr(type(error), "__name__", None)
+    except Exception:
+        exception_type = None
+    if (
+        not isinstance(exception_type, str)
+        or _EXCEPTION_TYPE_PATTERN.fullmatch(exception_type) is None
+        or contains_unredacted_secret(exception_type)
+    ):
+        return "Exception"
+    return exception_type
+
+
 @dataclass(frozen=True)
 class OrchestrationResult:
     ticket_id: str
@@ -154,6 +168,14 @@ class PersistenceFailureError(RuntimeError):
 
 class _CheckpointPersistenceFailure(PersistenceFailureError):
     """Private marker for failures inside checkpoint persistence boundaries."""
+
+    def __init__(self, error: object):
+        super().__init__(ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"])
+        self.safe_exception_type = (
+            _safe_exception_type(error)
+            if isinstance(error, BaseException)
+            else "Exception"
+        )
 
 
 @dataclass(frozen=True, init=False, slots=True)
@@ -257,12 +279,22 @@ class LeaseFencedCheckpointer(BaseCheckpointSaver):
         return ticket_id, command_id, lease_version
 
     def get_tuple(self, config):
-        return self.delegate.get_tuple(config)
+        try:
+            return self.delegate.get_tuple(config)
+        except _CheckpointPersistenceFailure:
+            raise
+        except Exception as error:
+            raise _CheckpointPersistenceFailure(error) from None
 
     def list(self, config, *, filter=None, before=None, limit=None):
-        return self.delegate.list(
-            config, filter=filter, before=before, limit=limit
-        )
+        try:
+            yield from self.delegate.list(
+                config, filter=filter, before=before, limit=limit
+            )
+        except _CheckpointPersistenceFailure:
+            raise
+        except Exception as error:
+            raise _CheckpointPersistenceFailure(error) from None
 
     def put(self, config, checkpoint, metadata, new_versions):
         ticket_id, command_id, lease_version = self._lease(config)
@@ -282,9 +314,14 @@ class LeaseFencedCheckpointer(BaseCheckpointSaver):
                 projected_versions,
             )
 
-        result = self.repository.guarded_checkpoint_write(
-            ticket_id, command_id, lease_version, write
-        )
+        try:
+            result = self.repository.guarded_checkpoint_write(
+                ticket_id, command_id, lease_version, write
+            )
+        except _CheckpointPersistenceFailure:
+            raise
+        except Exception as error:
+            raise _CheckpointPersistenceFailure(error) from None
         if not isinstance(result, Mapping):
             raise TypeError("delegate checkpoint put 输出非法")
         projected = copy.deepcopy(dict(result))
@@ -309,12 +346,22 @@ class LeaseFencedCheckpointer(BaseCheckpointSaver):
                 config, projected_writes, task_id, task_path
             )
 
-        self.repository.guarded_checkpoint_write(
-            ticket_id, command_id, lease_version, write
-        )
+        try:
+            self.repository.guarded_checkpoint_write(
+                ticket_id, command_id, lease_version, write
+            )
+        except _CheckpointPersistenceFailure:
+            raise
+        except Exception as error:
+            raise _CheckpointPersistenceFailure(error) from None
 
     def delete_thread(self, thread_id: str) -> None:
-        return self.delegate.delete_thread(thread_id)
+        try:
+            return self.delegate.delete_thread(thread_id)
+        except _CheckpointPersistenceFailure:
+            raise
+        except Exception as error:
+            raise _CheckpointPersistenceFailure(error) from None
 
     def get_next_version(self, current, channel):
         return self.delegate.get_next_version(current, channel)
@@ -322,7 +369,12 @@ class LeaseFencedCheckpointer(BaseCheckpointSaver):
     def get_delta_channel_history(self, *, config, channels):
         method = getattr(self.delegate, "get_delta_channel_history", None)
         if callable(method):
-            return method(config=config, channels=channels)
+            try:
+                return method(config=config, channels=channels)
+            except _CheckpointPersistenceFailure:
+                raise
+            except Exception as error:
+                raise _CheckpointPersistenceFailure(error) from None
         return super().get_delta_channel_history(config=config, channels=channels)
 
 
@@ -813,7 +865,13 @@ class SupportOrchestrator:
                 or any(not isinstance(item, Interrupt) for item in interrupts)
             ):
                 raise ValueError("graph interrupt 输出非法")
-            checkpoint = self._checkpoint_values(ticket_id)
+            try:
+                snapshot = self._checkpoint_snapshot(ticket_id)
+            except _CheckpointPersistenceFailure:
+                raise
+            except Exception as error:
+                raise _CheckpointPersistenceFailure(error) from None
+            checkpoint = self._checkpoint_values_from_snapshot(snapshot)
             if not checkpoint:
                 raise ValueError("graph interrupt 缺少 checkpoint state")
             return self._validated_graph_output(checkpoint)
@@ -841,26 +899,18 @@ class SupportOrchestrator:
         try:
             ticket = self.repository.get_ticket(ticket_id)
         except Exception as error:
-            self._log_failure(
-                ticket_id, "checkpoint_restore", "PERSISTENCE_FAILURE", error
-            )
-            raise _CheckpointPersistenceFailure(
-                ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
-            ) from None
+            raise _CheckpointPersistenceFailure(error) from None
         if ticket is None:
             raise _CheckpointPersistenceFailure(
-                ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
+                LookupError("ticket unavailable")
             ) from None
         ticket_status = _status(ticket.get("status"))
         try:
             snapshot = self._checkpoint_snapshot(ticket_id)
         except Exception as error:
-            self._log_failure(
-                ticket_id, "checkpoint_restore", "PERSISTENCE_FAILURE", error
-            )
-            raise _CheckpointPersistenceFailure(
-                ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
-            ) from None
+            if isinstance(error, _CheckpointPersistenceFailure):
+                raise
+            raise _CheckpointPersistenceFailure(error) from None
         try:
             checkpoint = self._checkpoint_values_from_snapshot(snapshot)
             checkpoint = (
@@ -886,15 +936,9 @@ class SupportOrchestrator:
                     expected_ticket_status=ticket_status,
                 )
             except Exception as error:
-                self._log_failure(
-                    ticket_id,
-                    "checkpoint_restore",
-                    "PERSISTENCE_FAILURE",
-                    error,
-                )
-                raise _CheckpointPersistenceFailure(
-                    ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
-                ) from None
+                if isinstance(error, _CheckpointPersistenceFailure):
+                    raise
+                raise _CheckpointPersistenceFailure(error) from None
             raise CheckpointRestoreError("CHECKPOINT_MISMATCH") from None
         return self._invoke_graph(None, ticket_id, command_id, lease_version)
 
@@ -916,16 +960,11 @@ class SupportOrchestrator:
     ) -> None:
         """Log stable metadata without request input or exception details."""
 
-        try:
-            exception_type = getattr(type(error), "__name__", None)
-        except Exception:
-            exception_type = None
-        if (
-            not isinstance(exception_type, str)
-            or _EXCEPTION_TYPE_PATTERN.fullmatch(exception_type) is None
-            or contains_unredacted_secret(exception_type)
-        ):
-            exception_type = "Exception"
+        exception_type = (
+            error.safe_exception_type
+            if isinstance(error, _CheckpointPersistenceFailure)
+            else _safe_exception_type(error)
+        )
         logger.error(
             "[orchestration] error_code=%s ticket_id=%s node_name=%s exception_type=%s",
             error_code,
@@ -961,7 +1000,10 @@ class SupportOrchestrator:
                 )
             else:
                 raise ValueError("command disposition 不可执行")
-        except _CheckpointPersistenceFailure:
+        except _CheckpointPersistenceFailure as error:
+            self._log_failure(
+                ticket_id, "checkpoint", "PERSISTENCE_FAILURE", error
+            )
             raise PersistenceFailureError(
                 ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
             ) from None

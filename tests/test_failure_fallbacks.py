@@ -1630,6 +1630,123 @@ class FailureFallbackTest(unittest.TestCase):
         self.assertEqual(result.status, "escalated")
         self.assertGreaterEqual(graph.state_reads, 1)
 
+    def test_interrupt_checkpoint_read_failure_preserves_in_progress_command(self):
+        graph = FakeGraph(
+            [
+                {
+                    "__interrupt__": [
+                        Interrupt(
+                            value={"type": "human_review"},
+                            id="persistence-read-failure",
+                        )
+                    ]
+                }
+            ]
+        )
+        hostile_type = type("TemporaryInterruptReadError", (RuntimeError,), {})
+        hostile_type.__name__ = f"{MNEMONIC}\nforged-interrupt-log"
+        runtime = self.runtime(graph)
+
+        with patch.object(
+            graph,
+            "get_state",
+            side_effect=hostile_type("checkpoint read body must stay private"),
+        ), patch.object(
+            self.repo, "fail_command", wraps=self.repo.fail_command
+        ) as fail_command, self.assertLogs(
+            "agent", level="ERROR"
+        ) as captured, self.assertRaises(
+            PersistenceFailureError
+        ) as raised:
+            runtime.submit(
+                "连接失败", "1001", request_id="interrupt-read-failure"
+            )
+
+        fail_command.assert_not_called()
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(
+            self.command_row("request:interrupt-read-failure")["status"],
+            "in_progress",
+        )
+        self.assertEqual(graph.calls, 1)
+        messages = "\n".join(captured.output)
+        self.assertNotIn(MNEMONIC, messages)
+        self.assertNotIn("forged-interrupt-log", messages)
+        self.assertIn("error_code=PERSISTENCE_FAILURE", messages)
+        self.assertIn("exception_type=Exception", messages)
+        self.assertEqual(
+            sum(
+                "error_code=PERSISTENCE_FAILURE" in record.getMessage()
+                for record in captured.records
+            ),
+            1,
+        )
+
+    def test_real_graph_checkpoint_write_failure_preserves_in_progress_command(self):
+        def terminal_node(state):
+            return {
+                "status": "escalated",
+                "requires_human": True,
+                "status_events": [
+                    graph_event(
+                        state["command_id"], 1, "new", "escalated"
+                    )
+                ],
+            }
+
+        builder = StateGraph(TicketState)
+        builder.add_node("terminal", terminal_node)
+        builder.set_entry_point("terminal")
+        builder.add_edge("terminal", END)
+        graph = builder.compile(checkpointer=MemorySaver())
+        runtime = SupportOrchestrator(
+            repository=self.repo,
+            graph=graph,
+            ingress_guard=IngressGuard(POLICY),
+            recursion_limit=16,
+            lease_seconds=130,
+            graph_timeout_seconds=120,
+            trusted_source_policy=self.trusted_sources,
+            final_policy_guard=self.final_policy_guard,
+        )
+        hostile_type = type("TemporaryCheckpointWriteError", (RuntimeError,), {})
+        hostile_type.__name__ = f"{MNEMONIC}\nforged-write-log"
+
+        with patch.object(
+            self.repo,
+            "guarded_checkpoint_write",
+            side_effect=hostile_type("checkpoint write body must stay private"),
+        ) as guarded_write, patch.object(
+            self.repo, "fail_command", wraps=self.repo.fail_command
+        ) as fail_command, self.assertLogs(
+            "agent", level="ERROR"
+        ) as captured, self.assertRaises(
+            PersistenceFailureError
+        ) as raised:
+            runtime.submit(
+                "连接失败", "1001", request_id="checkpoint-write-failure"
+            )
+
+        self.assertGreaterEqual(guarded_write.call_count, 1)
+        fail_command.assert_not_called()
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(
+            self.command_row("request:checkpoint-write-failure")["status"],
+            "in_progress",
+        )
+        messages = "\n".join(captured.output)
+        self.assertNotIn(MNEMONIC, messages)
+        self.assertNotIn("forged-write-log", messages)
+        self.assertIn("error_code=PERSISTENCE_FAILURE", messages)
+        self.assertIn("exception_type=Exception", messages)
+        self.assertEqual(
+            sum(
+                "error_code=PERSISTENCE_FAILURE" in record.getMessage()
+                for record in captured.records
+            ),
+            1,
+        )
+
     def test_result_rejects_untrusted_https_citation(self):
         def output(graph_input, _config):
             state = copy.deepcopy(graph_input)
@@ -1775,7 +1892,12 @@ class FailureFallbackTest(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(renewed.lease_version, first.lease_version + 1)
         self.assertEqual(len(old_errors), 1)
-        self.assertRegex(str(old_errors[0]), "lease_version")
+        self.assertIsInstance(old_errors[0], PersistenceFailureError)
+        self.assertIsNone(old_errors[0].__cause__)
+        self.assertEqual(
+            str(old_errors[0]),
+            "结果状态暂时无法确认，未发送草稿，可用同一请求确认结果。",
+        )
         latest = memory.get_tuple(
             {
                 "configurable": {
