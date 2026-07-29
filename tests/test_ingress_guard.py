@@ -15,11 +15,13 @@ MNEMONIC_WORDS = (
 )
 HEX_SECRET = "1" * 64
 WIF_SECRET = "5" + "H" * 50
+TRANSACTION_HASH = "0x" + "a" * 64
 
 
 class WalletSafetyGuardTest(unittest.TestCase):
     def setUp(self):
         self.policy = {
+            "policy_version": "2026-07-28.v1",
             "official_domains": ["support.ledger.com", "trezor.io"],
             "critical_response_template_zh": "固定安全提示",
         }
@@ -121,6 +123,55 @@ class WalletSafetyGuardTest(unittest.TestCase):
         self.assertEqual(result.risk_flags, [])
         self.assertIn("[REDACTED_SECRET]", result.sanitized_input)
 
+    def test_labeled_transaction_hash_is_preserved_and_can_be_persisted(self):
+        raw_input = f"transaction hash: {TRANSACTION_HASH}"
+
+        result = self.ingress.sanitize(raw_input)
+
+        self.assertEqual(result.sanitized_input, raw_input)
+        self.assertEqual(result.risk_level, "low")
+        self.assertEqual(result.risk_flags, [])
+        with tempfile.TemporaryDirectory() as directory:
+            repository = TicketRepository(Path(directory) / "tickets.db")
+            ticket = repository.create_ticket(
+                "transaction-request", "user-1", result.sanitized_input, []
+            )
+        self.assertEqual(ticket["sanitized_input"], raw_input)
+
+    def test_policy_allows_labeled_transaction_hash_in_normal_answer(self):
+        text = f"交易哈希：{TRANSACTION_HASH}，可在官方浏览器中查询。"
+
+        result = self.output.evaluate(text, citation_urls=[])
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.reason_codes, [])
+
+    def test_transaction_hash_context_rejects_non_whitelisted_labels(self):
+        for label in ("transaction_hash", "transaction-hash", "hash"):
+            with self.subTest(label=label):
+                result = self.ingress.sanitize(f"{label}: {TRANSACTION_HASH}")
+                self.assertEqual(result.risk_level, "critical")
+                self.assertEqual(result.risk_flags, ["secret_exposure"])
+                self.assertNotIn(TRANSACTION_HASH, result.sanitized_input)
+
+    def test_transaction_hash_label_cannot_hide_private_key_context(self):
+        disguised_inputs = (
+            f"private key: transaction hash: {TRANSACTION_HASH}",
+            f"private key: txid: {TRANSACTION_HASH}",
+            f"私钥：交易哈希：{TRANSACTION_HASH}",
+            f"私钥：交易ID：{TRANSACTION_HASH}",
+        )
+        for index, disguised in enumerate(disguised_inputs):
+            with self.subTest(case=index):
+                sanitized = self.ingress.sanitize(disguised)
+                policy = self.output.evaluate(disguised, citation_urls=[])
+
+                self.assertEqual(sanitized.risk_level, "critical")
+                self.assertEqual(sanitized.risk_flags, ["secret_exposure"])
+                self.assertNotIn(TRANSACTION_HASH, sanitized.sanitized_input)
+                self.assertFalse(policy.passed)
+                self.assertEqual(policy.reason_codes, ["secret_exposure"])
+
     def test_empty_and_non_string_ingress_fail_closed_without_echo(self):
         for raw_value in ("", "   ", None, 123):
             with self.subTest(value_type=type(raw_value).__name__):
@@ -205,9 +256,32 @@ class WalletSafetyGuardTest(unittest.TestCase):
     def test_policy_configuration_is_strict_and_has_safe_errors(self):
         invalid_policies = (
             {},
-            {"official_domains": [], "critical_response_template_zh": "提示"},
-            {"official_domains": ["ledger.com"], "critical_response_template_zh": ""},
             {
+                "official_domains": ["ledger.com"],
+                "critical_response_template_zh": "提示",
+            },
+            {
+                "policy_version": "",
+                "official_domains": ["ledger.com"],
+                "critical_response_template_zh": "提示",
+            },
+            {
+                "policy_version": 1,
+                "official_domains": ["ledger.com"],
+                "critical_response_template_zh": "提示",
+            },
+            {
+                "policy_version": "2026-07-28.v1",
+                "official_domains": [],
+                "critical_response_template_zh": "提示",
+            },
+            {
+                "policy_version": "2026-07-28.v1",
+                "official_domains": ["ledger.com"],
+                "critical_response_template_zh": "",
+            },
+            {
+                "policy_version": "2026-07-28.v1",
                 "official_domains": ["https://ledger.com"],
                 "critical_response_template_zh": "提示",
             },
@@ -218,6 +292,25 @@ class WalletSafetyGuardTest(unittest.TestCase):
                     IngressGuard(policy)
                 self.assertNotIsInstance(caught.exception, KeyError)
                 self.assertNotEqual(str(caught.exception), "")
+
+        invalid_domains = (
+            " ledger.com",
+            "ledger.com ",
+            "Ledger.com",
+            "ledger.com.",
+            "ledger.com/path",
+            "ledger.com:443",
+        )
+        for constructor in (IngressGuard, PolicyGuard):
+            for domain in invalid_domains:
+                policy = {
+                    "policy_version": "2026-07-28.v1",
+                    "official_domains": [domain],
+                    "critical_response_template_zh": "提示",
+                }
+                with self.subTest(constructor=constructor.__name__, domain=domain):
+                    with self.assertRaises(ValueError):
+                        constructor(policy)
 
     def test_minimal_failure_notice_is_fixed_and_non_empty(self):
         self.assertIn("系统暂时无法安全处理", MINIMAL_FAILURE_NOTICE)

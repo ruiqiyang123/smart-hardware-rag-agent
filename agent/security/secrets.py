@@ -10,6 +10,11 @@ _HEX_PRIVATE_KEY_PATTERN = re.compile(
     r"(?<![0-9A-Fa-f])(?:0[xX])?[0-9A-Fa-f]{64}(?![0-9A-Fa-f])"
 )
 _TRANSACTION_HASH_PATTERN = re.compile(r"(?:0[xX])?[0-9A-Fa-f]{64}")
+_LABELED_TRANSACTION_HASH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])(?:transaction hash|txid|交易哈希|交易ID)"
+    r"\s*(?::|：)?\s*(?:0[xX])?[0-9A-Fa-f]{64}(?![0-9A-Fa-f])",
+    re.IGNORECASE,
+)
 _WIF_PATTERN = re.compile(
     r"(?<![1-9A-HJ-NP-Za-km-z])[5KL][1-9A-HJ-NP-Za-km-z]{50,51}"
     r"(?![1-9A-HJ-NP-Za-km-z])"
@@ -25,7 +30,7 @@ _PASSPHRASE_PATTERN = re.compile(
 )
 _LABELED_PRIVATE_KEY_PATTERN = re.compile(
     r"(?:private[_ -]?key|私钥)\s*(?::|=|：|是|为)\s*"
-    r"[^\s,，;；\x00]{8,256}",
+    r"[^\s,，;；\x00]{1,256}",
     re.IGNORECASE,
 )
 _BIP39_SEPARATOR_PATTERN = re.compile(r"[\s,，;；]+")
@@ -115,13 +120,23 @@ def _merge_spans(spans: Iterable[Tuple[int, int]]) -> List[Tuple[int, int]]:
     return [(start, end) for start, end in merged]
 
 
+def _spans_overlap(left: Tuple[int, int], right: Tuple[int, int]) -> bool:
+    return left[0] < right[1] and right[0] < left[1]
+
+
+def _mask_spans(value: str, spans: Iterable[Tuple[int, int]]) -> str:
+    characters = list(value)
+    for start, end in spans:
+        characters[start:end] = "\x00" * (end - start)
+    return "".join(characters)
+
+
 def _secret_spans(value: str) -> List[Tuple[int, int]]:
     candidate = _REDACTED_PATTERN.sub(
         lambda match: "\x00" * len(match.group(0)), value
     )
     spans: List[Tuple[int, int]] = []
     patterns: Sequence[re.Pattern] = (
-        _HEX_PRIVATE_KEY_PATTERN,
         _WIF_PATTERN,
         _PIN_PATTERN,
         _PASSPHRASE_PATTERN,
@@ -132,6 +147,23 @@ def _secret_spans(value: str) -> List[Tuple[int, int]]:
             (match.start(), match.end()) for match in pattern.finditer(candidate)
         )
     spans.extend(_bip39_spans(candidate))
+
+    labeled_hash_spans = [
+        (match.start(), match.end())
+        for match in _LABELED_TRANSACTION_HASH_PATTERN.finditer(candidate)
+    ]
+    safe_hash_spans: List[Tuple[int, int]] = []
+    for labeled_hash_span in labeled_hash_spans:
+        if any(_spans_overlap(labeled_hash_span, span) for span in spans):
+            spans.append(labeled_hash_span)
+        else:
+            safe_hash_spans.append(labeled_hash_span)
+
+    private_key_candidate = _mask_spans(candidate, safe_hash_spans)
+    spans.extend(
+        (match.start(), match.end())
+        for match in _HEX_PRIVATE_KEY_PATTERN.finditer(private_key_candidate)
+    )
     return _merge_spans(spans)
 
 

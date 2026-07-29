@@ -127,25 +127,32 @@ class PolicyDecision:
 def _validate_policy(policy: object) -> Tuple[Tuple[str, ...], str]:
     if not isinstance(policy, dict):
         raise TypeError("安全策略必须是对象")
+    if "policy_version" not in policy:
+        raise ValueError("安全策略缺少 policy_version")
     if "official_domains" not in policy:
         raise ValueError("安全策略缺少 official_domains")
     if "critical_response_template_zh" not in policy:
         raise ValueError("安全策略缺少 critical_response_template_zh")
+
+    policy_version = policy["policy_version"]
+    if not isinstance(policy_version, str):
+        raise TypeError("policy_version 必须是字符串")
+    if not policy_version.strip():
+        raise ValueError("policy_version 不能为空")
 
     domains = policy["official_domains"]
     if not isinstance(domains, list):
         raise TypeError("official_domains 必须是字符串列表")
     if not domains:
         raise ValueError("official_domains 不能为空")
-    normalized_domains: List[str] = []
+    validated_domains: List[str] = []
     for domain in domains:
         if not isinstance(domain, str):
             raise TypeError("official_domains 必须是字符串列表")
-        normalized = domain.strip().lower().rstrip(".")
-        if not normalized or _DOMAIN_PATTERN.fullmatch(normalized) is None:
+        if not domain or _DOMAIN_PATTERN.fullmatch(domain) is None:
             raise ValueError("official_domains 包含非法域名")
-        normalized_domains.append(normalized)
-    if len(normalized_domains) != len(set(normalized_domains)):
+        validated_domains.append(domain)
+    if len(validated_domains) != len(set(validated_domains)):
         raise ValueError("official_domains 不得包含重复域名")
 
     template = policy["critical_response_template_zh"]
@@ -156,7 +163,7 @@ def _validate_policy(policy: object) -> Tuple[Tuple[str, ...], str]:
         raise ValueError("critical_response_template_zh 不能为空")
     if contains_unredacted_secret(template):
         raise ValueError("critical_response_template_zh 包含敏感信息")
-    return tuple(normalized_domains), template
+    return tuple(validated_domains), template
 
 
 class IngressGuard:
