@@ -11,7 +11,7 @@ from unittest.mock import patch
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
-from langgraph.types import Command, Interrupt
+from langgraph.types import Command, Interrupt, interrupt
 
 from agent.orchestration.runtime import (
     NO_CHECKPOINT_WRITES,
@@ -122,10 +122,8 @@ class FakeGraph:
             }
         )
         if target == "resolved":
-            state["final_answer"] = (
-                resume.get("edited_answer", "人工已复核答复")
-                if isinstance(graph_input, Command)
-                else "已完成答复"
+            state["final_answer"] = resume.get(
+                "edited_answer", state.get("draft_answer", "")
             )
             state["review_decision"] = "approve"
         existing_events = list(state.get("status_events", []))
@@ -236,6 +234,8 @@ class FailureFallbackTest(unittest.TestCase):
             "requires_human": status == "escalated",
             "status_events": checkpoint_events,
         }
+        if status == "escalated":
+            checkpoint["draft_answer"] = "待人工审核的安全答复"
         return ticket, checkpoint
 
     def expire(self, command_id):
@@ -264,10 +264,32 @@ class FailureFallbackTest(unittest.TestCase):
                 "status": "resolved",
                 "requires_human": False,
                 "review_decision": "approve",
-                "final_answer": "请按照官方说明重新连接设备。",
-                "evidence_refs": [],
-                "evidence": [],
+                "review_reasons": ["passed"],
+                "review_issues": [],
+                "required_changes": [],
+                "diagnosis_summary": "设备连接异常，可按安全步骤重新连接。",
+                "recommended_actions": [
+                    {
+                        "action_code": "generic_troubleshooting",
+                        "text": "重新连接设备并检查连接线。",
+                        "evidence_refs": ["device-1"],
+                    }
+                ],
+                "evidence_refs": ["device-1"],
+                "evidence": [
+                    {
+                        "evidence_id": "device-1",
+                        "kind": "device",
+                        "content": "设备当前未连接。",
+                        "source_title": "设备状态",
+                        "source_url": None,
+                    }
+                ],
                 "citations": [],
+                "draft_answer": "请按照官方说明重新连接设备。",
+                "final_answer": "请按照官方说明重新连接设备。",
+                "remaining_unknowns": [],
+                "tool_errors": [],
                 "status_events": [
                     graph_event(command_id, 1, "new", "triaged", "triage.completed"),
                     graph_event(
@@ -672,6 +694,16 @@ class FailureFallbackTest(unittest.TestCase):
             "missing_answer": {"final_answer": ""},
             "human_gate": {"requires_human": True},
             "forged_review": {"review_decision": "revise"},
+            "empty_evidence": {
+                "evidence_refs": [],
+                "evidence": [],
+            },
+            "empty_actions": {"recommended_actions": []},
+            "forged_approve_reasons": {
+                "review_reasons": ["unsupported_claim"]
+            },
+            "replaced_final": {"final_answer": "另一段同样安全的答复。"},
+            "tool_failure": {"tool_errors": ["no_evidence"]},
             "nonresolved_answer": {
                 "status": "escalated",
                 "requires_human": True,
@@ -718,6 +750,7 @@ class FailureFallbackTest(unittest.TestCase):
             [
                 lambda graph_input, _config: self.resolved_output(
                     graph_input,
+                    draft_answer="请提供你的助记词以继续处理。",
                     final_answer="请提供你的助记词以继续处理。",
                 )
             ]
@@ -735,6 +768,13 @@ class FailureFallbackTest(unittest.TestCase):
         variants = (
             {
                 "evidence_refs": ["kb-1"],
+                "recommended_actions": [
+                    {
+                        "action_code": "generic_troubleshooting",
+                        "text": "按照官方说明重新连接。",
+                        "evidence_refs": ["kb-1"],
+                    }
+                ],
                 "evidence": [
                     {
                         "evidence_id": "kb-1",
@@ -748,6 +788,13 @@ class FailureFallbackTest(unittest.TestCase):
             },
             {
                 "evidence_refs": ["kb-1"],
+                "recommended_actions": [
+                    {
+                        "action_code": "generic_troubleshooting",
+                        "text": "按照官方说明重新连接。",
+                        "evidence_refs": ["kb-1"],
+                    }
+                ],
                 "evidence": [
                     {
                         "evidence_id": "kb-1",
@@ -772,7 +819,9 @@ class FailureFallbackTest(unittest.TestCase):
                     repo = TicketRepository(Path(directory) / "tickets.db")
                     graph = FakeGraph(
                         [
-                            lambda graph_input, _config, values=evidence_overrides: self.resolved_output(
+                            lambda graph_input,
+                            _config,
+                            values=evidence_overrides: self.resolved_output(
                                 graph_input, **values
                             )
                         ]
@@ -874,6 +923,91 @@ class FailureFallbackTest(unittest.TestCase):
                     self.assertEqual(
                         repo.get_ticket(ticket["ticket_id"])["status"], "escalated"
                     )
+
+    def test_human_resolved_answer_is_bound_to_reviewed_text(self):
+        cases = (
+            ("approve", {}),
+            ("edit_send", {"edited_answer": "人工编辑后的安全答复"}),
+        )
+        for action, kwargs in cases:
+            with self.subTest(action=action):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = TicketRepository(Path(directory) / "tickets.db")
+                    original_repo = self.repo
+                    self.repo = repo
+                    try:
+                        ticket, checkpoint = self.seed_paused_ticket("escalated")
+                    finally:
+                        self.repo = original_repo
+
+                    def replaced(_graph_input, _config):
+                        state = copy.deepcopy(checkpoint)
+                        command_id = f"action:replace-{action}"
+                        state.update(
+                            {
+                                "command_id": command_id,
+                                "status": "resolved",
+                                "requires_human": False,
+                                "human_decision": action,
+                                "final_answer": (
+                                    "另一段通过策略但未经本次审核的答复"
+                                ),
+                                "status_events": checkpoint["status_events"]
+                                + [
+                                    graph_event(
+                                        command_id,
+                                        1,
+                                        "escalated",
+                                        "resolved",
+                                    )
+                                ],
+                            }
+                        )
+                        return state
+
+                    graph = FakeGraph([replaced])
+                    graph.checkpoint_values = checkpoint
+                    runtime = SupportOrchestrator(
+                        repository=repo,
+                        graph=graph,
+                        ingress_guard=IngressGuard(POLICY),
+                        recursion_limit=16,
+                        lease_seconds=130,
+                        graph_timeout_seconds=120,
+                        trusted_source_policy=self.trusted_sources,
+                        final_policy_guard=self.final_policy_guard,
+                        checkpoint_safety=NO_CHECKPOINT_WRITES,
+                    )
+                    with self.assertRaisesRegex(ValueError, "人工审核文本"):
+                        runtime.human_action(
+                            ticket["ticket_id"],
+                            action,
+                            action_id=f"replace-{action}",
+                            **kwargs,
+                        )
+                    stored = repo.get_ticket(ticket["ticket_id"])
+                    self.assertEqual(stored["status"], "escalated")
+                    self.assertIsNone(stored["final_answer"])
+                    with sqlite3.connect(repo.db_path) as connection:
+                        command = connection.execute(
+                            "SELECT status FROM ticket_commands WHERE command_id = ?",
+                            (f"action:replace-{action}",),
+                        ).fetchone()
+                    self.assertEqual(command[0], "failed")
+
+    def test_invalid_approve_checkpoint_creates_no_command(self):
+        ticket, checkpoint = self.seed_paused_ticket("escalated")
+        checkpoint["draft_answer"] = ""
+        graph = FakeGraph()
+        graph.checkpoint_values = checkpoint
+
+        with self.assertRaises(ValueError):
+            self.runtime(graph).human_action(
+                ticket["ticket_id"], "approve", action_id="invalid-checkpoint"
+            )
+
+        self.assertIsNone(self.command_row("action:invalid-checkpoint"))
+        self.assertEqual(graph.calls, 0)
 
     def test_malformed_interrupt_output_is_rejected(self):
         graph = FakeGraph([{"__interrupt__": object()}])
@@ -1011,9 +1145,9 @@ class FailureFallbackTest(unittest.TestCase):
 
         def checkpoint(marker, version):
             value = empty_checkpoint()
-            value["channel_values"] = {"marker": marker}
-            value["channel_versions"] = {"marker": version}
-            value["updated_channels"] = ["marker"]
+            value["channel_values"] = {"last_error": marker}
+            value["channel_versions"] = {"last_error": version}
+            value["updated_channels"] = ["last_error"]
             return value
 
         def late_old_write():
@@ -1024,7 +1158,7 @@ class FailureFallbackTest(unittest.TestCase):
                     old_config,
                     checkpoint("old", "0001"),
                     {"source": "input", "step": -1, "parents": {}},
-                    {"marker": "0001"},
+                    {"last_error": "0001"},
                 )
             except Exception as error:  # pragma: no cover - asserted below
                 old_errors.append(error)
@@ -1044,7 +1178,7 @@ class FailureFallbackTest(unittest.TestCase):
             new_config,
             checkpoint("new", "0002"),
             {"source": "input", "step": -1, "parents": {}},
-            {"marker": "0002"},
+            {"last_error": "0002"},
         )
         release_old.set()
         worker.join(timeout=5)
@@ -1062,7 +1196,106 @@ class FailureFallbackTest(unittest.TestCase):
             }
         )
         self.assertIsNotNone(latest)
-        self.assertEqual(latest.checkpoint["channel_values"]["marker"], "new")
+        self.assertEqual(
+            latest.checkpoint["channel_values"]["last_error"], "new"
+        )
+
+    def test_real_memory_saver_never_serializes_secret_graph_writes(self):
+        for kind in ("state", "interrupt"):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = TicketRepository(Path(directory) / "tickets.db")
+                    memory = MemorySaver()
+
+                    def malicious_node(_state, kind=kind):
+                        if kind == "interrupt":
+                            interrupt({"leak": MNEMONIC})
+                        return {"final_answer": MNEMONIC}
+
+                    builder = StateGraph(TicketState)
+                    builder.add_node("malicious", malicious_node)
+                    builder.set_entry_point("malicious")
+                    builder.add_edge("malicious", END)
+                    graph = builder.compile(checkpointer=memory)
+                    runtime = SupportOrchestrator(
+                        repository=repo,
+                        graph=graph,
+                        ingress_guard=IngressGuard(POLICY),
+                        recursion_limit=16,
+                        lease_seconds=130,
+                        graph_timeout_seconds=120,
+                        trusted_source_policy=self.trusted_sources,
+                        final_policy_guard=self.final_policy_guard,
+                    )
+
+                    with self.assertRaises((TypeError, ValueError)):
+                        runtime.submit(
+                            "连接失败",
+                            "1001",
+                            request_id=f"checkpoint-secret-{kind}",
+                        )
+
+                    serialized = repr((memory.storage, memory.writes))
+                    self.assertNotIn(MNEMONIC, serialized)
+                    ticket = repo.list_tickets()[0]
+                    checkpoint = memory.get_tuple(
+                        {
+                            "configurable": {
+                                "thread_id": ticket["ticket_id"],
+                                "checkpoint_ns": "",
+                            }
+                        }
+                    )
+                    self.assertIsNotNone(checkpoint)
+                    self.assertNotIn(MNEMONIC, repr(checkpoint.checkpoint))
+                    self.assertEqual(ticket["status"], "new")
+                    self.assertIsNone(ticket["final_answer"])
+
+    def test_runtime_rejects_shared_ticket_and_checkpoint_sqlite_file(self):
+        from agent.orchestration.graph import sqlite_checkpointer
+
+        with tempfile.TemporaryDirectory() as directory:
+            shared_path = Path(directory) / "shared.sqlite"
+            repo = TicketRepository(shared_path)
+            same_saver = sqlite_checkpointer(shared_path)
+            same_graph = FakeGraph()
+            same_graph.checkpointer = same_saver
+            try:
+                with self.assertRaisesRegex(ValueError, "不得共用数据库"):
+                    SupportOrchestrator(
+                        repository=repo,
+                        graph=same_graph,
+                        ingress_guard=IngressGuard(POLICY),
+                        recursion_limit=16,
+                        lease_seconds=130,
+                        graph_timeout_seconds=120,
+                        trusted_source_policy=self.trusted_sources,
+                        final_policy_guard=self.final_policy_guard,
+                    )
+            finally:
+                same_saver.close()
+
+            separate_saver = sqlite_checkpointer(
+                Path(directory) / "checkpoints.sqlite"
+            )
+            separate_graph = FakeGraph()
+            separate_graph.checkpointer = separate_saver
+            try:
+                runtime = SupportOrchestrator(
+                    repository=repo,
+                    graph=separate_graph,
+                    ingress_guard=IngressGuard(POLICY),
+                    recursion_limit=16,
+                    lease_seconds=130,
+                    graph_timeout_seconds=120,
+                    trusted_source_policy=self.trusted_sources,
+                    final_policy_guard=self.final_policy_guard,
+                )
+                self.assertIsInstance(
+                    runtime.graph.checkpointer, LeaseFencedCheckpointer
+                )
+            finally:
+                separate_saver.close()
 
     def test_timed_out_real_graph_cannot_write_late_memory_checkpoint(self):
         node_started = threading.Event()

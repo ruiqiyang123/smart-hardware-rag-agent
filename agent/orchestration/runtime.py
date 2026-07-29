@@ -12,9 +12,11 @@ import hashlib
 import json
 import math
 import re
+import sqlite3
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -24,6 +26,7 @@ from agent.orchestration.events import make_event, to_repository_event
 from agent.orchestration.invoke import invoke_with_policy
 from agent.orchestration.routes import assert_transition
 from agent.orchestration.state import (
+    DiagnosisResult,
     MissingField,
     RiskFlag,
     RiskLevel,
@@ -173,9 +176,21 @@ class LeaseFencedCheckpointer(BaseCheckpointSaver):
 
     def put(self, config, checkpoint, metadata, new_versions):
         ticket_id, command_id, lease_version = self._lease(config)
+        projected_checkpoint = _project_checkpoint(checkpoint)
+        projected_metadata = _strict_json(metadata)
+        projected_versions = _strict_json(new_versions)
+        if not isinstance(projected_metadata, dict) or not isinstance(
+            projected_versions, dict
+        ):
+            raise TypeError("checkpoint metadata/version 非法")
 
         def write():
-            return self.delegate.put(config, checkpoint, metadata, new_versions)
+            return self.delegate.put(
+                config,
+                projected_checkpoint,
+                projected_metadata,
+                projected_versions,
+            )
 
         result = self.repository.guarded_checkpoint_write(
             ticket_id, command_id, lease_version, write
@@ -192,9 +207,17 @@ class LeaseFencedCheckpointer(BaseCheckpointSaver):
 
     def put_writes(self, config, writes, task_id, task_path="") -> None:
         ticket_id, command_id, lease_version = self._lease(config)
+        projected_writes = _project_checkpoint_writes(writes)
+        if (
+            _strict_json(task_id) != task_id
+            or _strict_json(task_path) != task_path
+        ):
+            raise ValueError("checkpoint task 标识非法")
 
         def write():
-            return self.delegate.put_writes(config, writes, task_id, task_path)
+            return self.delegate.put_writes(
+                config, projected_writes, task_id, task_path
+            )
 
         self.repository.guarded_checkpoint_write(
             ticket_id, command_id, lease_version, write
@@ -290,6 +313,131 @@ def _strict_json(value: object, path: tuple[str, ...] = (), depth: int = 0):
             copied[key] = _strict_json(nested, path + (key,), depth + 1)
         return copied
     raise TypeError("只允许严格 JSON 值")
+
+
+def _project_ticket_state(value: object) -> dict:
+    if not isinstance(value, Mapping):
+        raise TypeError("checkpoint state 必须是映射")
+    unknown = set(value) - _STATE_FIELDS
+    if unknown:
+        raise ValueError("checkpoint state 包含未知字段")
+    projected = _strict_json(dict(value))
+    if not isinstance(projected, dict):  # pragma: no cover - defensive
+        raise TypeError("checkpoint state 非法")
+    return projected
+
+
+def _project_interrupts(value: object):
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("checkpoint interrupt 通道非法")
+    projected = []
+    for item in value:
+        if not isinstance(item, Interrupt):
+            raise TypeError("checkpoint interrupt 条目非法")
+        interrupt_id = _identifier(item.id, "interrupt.id")
+        interrupt_value = _strict_json(item.value)
+        projected.append(Interrupt(value=interrupt_value, id=interrupt_id))
+    return tuple(projected) if isinstance(value, tuple) else projected
+
+
+def _project_checkpoint_channel(channel: object, value: object):
+    if (
+        not isinstance(channel, str)
+        or not channel
+        or len(channel) > 512
+        or _forbidden_control(channel)
+        or contains_unredacted_secret(channel)
+    ):
+        raise ValueError("checkpoint channel 非法")
+    if channel == "__start__":
+        return _project_ticket_state(value)
+    if channel in _STATE_FIELDS:
+        return _project_ticket_state({channel: value})[channel]
+    if channel == "__interrupt__":
+        return _project_interrupts(value)
+    if channel == "__error__":
+        raise ValueError("checkpoint error 对象不得持久化")
+    if channel in {
+        "__input__",
+        "__no_writes__",
+        "__overwrite__",
+        "__pregel_tasks",
+        "__previous__",
+        "__resume__",
+        "__return__",
+        "__scheduled__",
+    }:
+        return _strict_json(value)
+    if channel.startswith("branch:"):
+        return _strict_json(value)
+    raise ValueError("checkpoint 包含未知持久化通道")
+
+
+def _project_checkpoint(checkpoint: object) -> dict:
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError("checkpoint 非法")
+    channel_values = checkpoint.get("channel_values")
+    if not isinstance(channel_values, Mapping):
+        raise TypeError("checkpoint channel_values 非法")
+    projected_channels = {
+        channel: _project_checkpoint_channel(channel, value)
+        for channel, value in channel_values.items()
+    }
+    projected = _strict_json(
+        {key: value for key, value in checkpoint.items() if key != "channel_values"}
+    )
+    if not isinstance(projected, dict):  # pragma: no cover - defensive
+        raise TypeError("checkpoint 非法")
+    projected["channel_values"] = projected_channels
+    return projected
+
+
+def _project_checkpoint_writes(writes: object) -> list[tuple[str, object]]:
+    if isinstance(writes, (str, bytes)):
+        raise TypeError("checkpoint writes 非法")
+    try:
+        entries = list(writes)
+    except TypeError:
+        raise TypeError("checkpoint writes 非法") from None
+    projected = []
+    for entry in entries:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            raise TypeError("checkpoint write 条目非法")
+        channel, value = entry
+        projected.append((channel, _project_checkpoint_channel(channel, value)))
+    return projected
+
+
+def _sqlite_database_paths(checkpointer: object) -> set[Path]:
+    connection = getattr(checkpointer, "_managed_connection", None)
+    if not isinstance(connection, sqlite3.Connection):
+        connection = getattr(checkpointer, "conn", None)
+    if not isinstance(connection, sqlite3.Connection):
+        return set()
+    try:
+        rows = connection.execute("PRAGMA database_list").fetchall()
+    except sqlite3.Error:
+        raise ValueError("无法验证 SQLite checkpointer 数据库路径") from None
+    paths = set()
+    for row in rows:
+        filename = row[2]
+        if isinstance(filename, str) and filename:
+            paths.add(Path(filename).expanduser().resolve())
+    return paths
+
+
+def _assert_separate_checkpoint_database(
+    repository: object, checkpointer: object
+) -> None:
+    repository_path = getattr(repository, "db_path", None)
+    if not isinstance(repository_path, (str, Path)) or not str(repository_path):
+        return
+    saver_paths = _sqlite_database_paths(checkpointer)
+    if not saver_paths:
+        return
+    resolved_repository = Path(repository_path).expanduser().resolve()
+    if resolved_repository in saver_paths:
+        raise ValueError("ticket repository 与 SQLite checkpointer 不得共用数据库")
 
 
 def _safe_history(value: object) -> list[dict[str, str]]:
@@ -458,7 +606,11 @@ class SupportOrchestrator:
             if isinstance(graph_checkpointer, LeaseFencedCheckpointer):
                 if graph_checkpointer.repository is not repository:
                     raise ValueError("checkpointer lease fence repository 不匹配")
+                _assert_separate_checkpoint_database(
+                    repository, graph_checkpointer.delegate
+                )
             else:
+                _assert_separate_checkpoint_database(repository, graph_checkpointer)
                 graph.checkpointer = LeaseFencedCheckpointer(
                     graph_checkpointer, repository
                 )
@@ -555,10 +707,12 @@ class SupportOrchestrator:
             raise TypeError("graph 输出必须是映射")
         if "__interrupt__" in output:
             raise ValueError("graph 输出不得持久化 __interrupt__")
-        unknown = set(output) - _STATE_FIELDS
-        if unknown:
-            raise ValueError("graph 输出包含未知 state 字段")
-        return copy.deepcopy(_strict_json(dict(output)))
+        try:
+            return copy.deepcopy(_project_ticket_state(output))
+        except ValueError as error:
+            if "未知字段" in str(error):
+                raise ValueError("graph 输出包含未知 state 字段") from None
+            raise
 
     def _resume_expired_command(
         self,
@@ -612,6 +766,7 @@ class SupportOrchestrator:
         graph_input,
         command_type: str,
         human_action: str | None = None,
+        expected_final_answer: str | None = None,
     ) -> None:
         try:
             if decision.disposition == CommandDisposition.RESUME:
@@ -636,6 +791,7 @@ class SupportOrchestrator:
                 output,
                 command_type,
                 human_action,
+                expected_final_answer,
             )
         except TimeoutError:
             self.repository.expire_command_lease(
@@ -660,6 +816,7 @@ class SupportOrchestrator:
         output: object,
         command_type: str = CommandType.USER_INPUT.value,
         human_action: str | None = None,
+        expected_final_answer: str | None = None,
     ) -> None:
         state = self._validated_graph_output(output)
         if state.get("ticket_id") != ticket_id:
@@ -673,6 +830,7 @@ class SupportOrchestrator:
             final_status,
             command_type,
             human_action,
+            expected_final_answer,
             citations,
         )
 
@@ -868,6 +1026,7 @@ class SupportOrchestrator:
         final_status: str,
         command_type: str,
         human_action: str | None,
+        expected_final_answer: str | None,
         citations: list[dict],
     ) -> None:
         requires_human = state.get("requires_human", False)
@@ -893,13 +1052,78 @@ class SupportOrchestrator:
         if command_type == CommandType.USER_INPUT.value:
             if review_decision != "approve" or human_decision not in {None, ""}:
                 raise ValueError("USER_INPUT resolved 必须由 Review approve")
+            try:
+                DiagnosisResult.model_validate(
+                    {
+                        "outcome": "draft",
+                        "diagnosis_summary": state.get("diagnosis_summary"),
+                        "recommended_actions": state.get("recommended_actions"),
+                        "evidence_refs": state.get("evidence_refs"),
+                        "citations": state.get("citations"),
+                        "draft_answer": state.get("draft_answer"),
+                        "remaining_unknowns": state.get("remaining_unknowns"),
+                    }
+                )
+            except (TypeError, ValueError):
+                raise ValueError("USER_INPUT resolved diagnosis 语义非法") from None
+            if state.get("tool_errors") != []:
+                raise ValueError("USER_INPUT resolved tool_errors 必须为空")
+            if (
+                state.get("review_reasons") != ["passed"]
+                or state.get("review_issues") != []
+                or state.get("required_changes") != []
+            ):
+                raise ValueError("USER_INPUT resolved review 语义非法")
+            if state.get("final_answer") != state.get("draft_answer"):
+                raise ValueError("USER_INPUT resolved 答复与审核草稿不一致")
         else:
             if human_action not in {"approve", "edit_send"}:
                 raise ValueError("ask_user/reject 不得 resolved")
             expected_type = _HUMAN_COMMAND_TYPES[human_action].value
             if command_type != expected_type or human_decision != human_action:
                 raise ValueError("human resolved decision 与 action 不匹配")
+            if (
+                not isinstance(expected_final_answer, str)
+                or not expected_final_answer
+                or state.get("final_answer") != expected_final_answer
+            ):
+                raise ValueError("human resolved 答复与人工审核文本不一致")
         self._final_policy_passes(final_answer, citations)
+
+    def _approved_checkpoint_answer(self, ticket_id: str) -> str:
+        checkpoint = self._checkpoint_values(ticket_id)
+        if not checkpoint:
+            raise ValueError("approve 缺少 checkpoint")
+        state = self._validated_graph_output(checkpoint)
+        if state.get("ticket_id") != ticket_id:
+            raise ValueError("checkpoint ticket_id 不匹配")
+        status = _status(state.get("status"))
+        if status not in {Status.ESCALATED.value, Status.RESOLVED.value}:
+            raise ValueError("approve checkpoint 状态非法")
+        citations = self._validated_evidence_bundle(state)
+        raw_draft = state.get("draft_answer")
+        draft = _safe_text(raw_draft, "checkpoint draft_answer", 2_000)
+        if raw_draft != draft:
+            raise ValueError("checkpoint draft_answer 必须是规范安全文本")
+        if status == Status.ESCALATED.value:
+            self._validate_terminal_state(
+                state,
+                status,
+                CommandType.HUMAN_APPROVE.value,
+                None,
+                None,
+                citations,
+            )
+        else:
+            self._validate_terminal_state(
+                state,
+                status,
+                CommandType.HUMAN_APPROVE.value,
+                "approve",
+                draft,
+                citations,
+            )
+        return draft
 
     def _citations(self, value: object) -> list[dict]:
         if value is None:
@@ -1212,6 +1436,10 @@ class SupportOrchestrator:
         action_id = uuid.uuid4().hex if action_id is None else action_id
         action_id = _identifier(action_id, "action_id", 120)
         resume_payload = {"command_id": f"action:{action_id}", "action": action}
+        expected_final_answer = None
+
+        if action == "approve":
+            expected_final_answer = self._approved_checkpoint_answer(ticket_id)
 
         if action == "edit_send":
             sanitized_answer = _validated_ingress(
@@ -1220,6 +1448,7 @@ class SupportOrchestrator:
             resume_payload["edited_answer"] = _safe_text(
                 sanitized_answer.sanitized_input, "edited_answer", 2_000
             )
+            expected_final_answer = resume_payload["edited_answer"]
         elif edited_answer != "":
             raise ValueError("该 human action 不接受 edited_answer")
 
@@ -1263,5 +1492,6 @@ class SupportOrchestrator:
             graph_input=Command(resume=resume_payload),
             command_type=_HUMAN_COMMAND_TYPES[action].value,
             human_action=action,
+            expected_final_answer=expected_final_answer,
         )
         return self._result(ticket_id, "", "")
