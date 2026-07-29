@@ -103,6 +103,7 @@ class AgentContractTest(unittest.TestCase):
                 "safe_history": [],
                 "risk_level": "critical",
                 "sensitive_flags": ["secret_exposure"],
+                "risk_flags": [],
             }
         )
 
@@ -110,6 +111,23 @@ class AgentContractTest(unittest.TestCase):
         self.assertEqual(result["priority"], "P0")
         self.assertEqual(result["suggested_route"], "escalate")
         self.assertEqual(result["risk_flags"], ["secret_exposure"])
+
+    def test_ingress_safety_fields_are_explicitly_required_before_invoke(self):
+        for missing_field in ("risk_level", "sensitive_flags", "risk_flags"):
+            state = self._state()
+            state.pop(missing_field)
+            runner = FakeStructuredRunner(triage_result())
+            with self.subTest(missing_field=missing_field), self.assertRaises(
+                ValueError
+            ):
+                TriageAgent(runner=runner).run(state)
+            self.assertEqual(runner.calls, [])
+
+        runner = FakeStructuredRunner(triage_result())
+        output = TriageAgent(runner=runner).run(self._state())
+        self.assertEqual(output["risk_level"], "low")
+        self.assertEqual(output["risk_flags"], [])
+        self.assertEqual(len(runner.calls), 1)
 
     def test_triage_cannot_lower_ingress_high_risk(self):
         result = TriageAgent(runner=FakeStructuredRunner(triage_result())).run(
@@ -134,6 +152,7 @@ class AgentContractTest(unittest.TestCase):
                 "safe_history": [],
                 "risk_level": "low",
                 "sensitive_flags": [RiskFlag.PHISHING],
+                "risk_flags": [],
             }
         )
 
@@ -181,6 +200,7 @@ class AgentContractTest(unittest.TestCase):
                 "safe_history": [{"role": "user", "content": "设备无法启动"}],
                 "risk_level": "medium",
                 "sensitive_flags": [],
+                "risk_flags": [],
             }
         )
 

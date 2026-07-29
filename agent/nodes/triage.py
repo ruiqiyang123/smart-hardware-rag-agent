@@ -196,7 +196,12 @@ def _validate_runner_result(
 
 
 class TriageAgent:
-    """Run one structured triage call and enforce deterministic safety policy."""
+    """Run structured triage with deterministic safety policy.
+
+    ``retries`` applies only to completed, retryable validation/type failures in
+    ``invoke_with_policy``. A timeout fails closed immediately and is never
+    retried because its worker may still be running.
+    """
 
     def __init__(
         self,
@@ -233,6 +238,9 @@ class TriageAgent:
     def run(self, state: dict) -> dict:
         if not isinstance(state, dict):
             raise TypeError("state 必须是对象")
+        ingress_fields = ("risk_level", "sensitive_flags", "risk_flags")
+        if any(field not in state for field in ingress_fields):
+            raise ValueError("state 缺少入口安全字段")
         sanitized_input = state.get("sanitized_input")
         if (
             not isinstance(sanitized_input, str)
@@ -244,11 +252,9 @@ class TriageAgent:
             raise ValueError("sanitized_input 包含未脱敏内容")
 
         history = _safe_history(state.get("safe_history", []))
-        ingress_risk = _risk_level(state.get("risk_level", RiskLevel.LOW.value))
-        sensitive_flags = _risk_flags(
-            state.get("sensitive_flags", []), "sensitive_flags"
-        )
-        existing_risk_flags = _risk_flags(state.get("risk_flags", []), "risk_flags")
+        ingress_risk = _risk_level(state["risk_level"])
+        sensitive_flags = _risk_flags(state["sensitive_flags"], "sensitive_flags")
+        existing_risk_flags = _risk_flags(state["risk_flags"], "risk_flags")
         entry_flags = list(dict.fromkeys(sensitive_flags + existing_risk_flags))
         required_fields_json = {
             category: [field.value for field in fields]
