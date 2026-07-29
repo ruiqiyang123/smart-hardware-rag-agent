@@ -131,7 +131,7 @@ NO_CHECKPOINT_WRITES = _NoCheckpointWritesSafety()
 
 
 class LeaseFencedCheckpointer(BaseCheckpointSaver):
-    """Fence every synchronous checkpoint write with the durable command lease."""
+    """Fence writes for KeyGuard's fixed graph; dynamic Send/push is unsupported."""
 
     def __init__(self, delegate: object, repository: object) -> None:
         if not callable(getattr(delegate, "get_tuple", None)) or not callable(
@@ -357,11 +357,17 @@ def _project_checkpoint_channel(channel: object, value: object):
         return _project_interrupts(value)
     if channel == "__error__":
         raise ValueError("checkpoint error 对象不得持久化")
+    if channel in {"__pregel_push", "__pregel_tasks"}:
+        empty_internal = value is None or (
+            isinstance(value, (str, list, dict)) and len(value) == 0
+        )
+        if not empty_internal:
+            raise ValueError("KeyGuard 不支持动态 Send/push checkpoint")
+        return _strict_json(value)
     if channel in {
         "__input__",
         "__no_writes__",
         "__overwrite__",
-        "__pregel_tasks",
         "__previous__",
         "__resume__",
         "__return__",
@@ -1055,7 +1061,7 @@ class SupportOrchestrator:
             try:
                 DiagnosisResult.model_validate(
                     {
-                        "outcome": "draft",
+                        "outcome": state.get("outcome"),
                         "diagnosis_summary": state.get("diagnosis_summary"),
                         "recommended_actions": state.get("recommended_actions"),
                         "evidence_refs": state.get("evidence_refs"),

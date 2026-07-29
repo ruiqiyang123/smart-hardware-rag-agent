@@ -508,7 +508,7 @@ def _diagnosis_node(
             raw = _validated_diagnosis_update(
                 dependency(copy.deepcopy(dict(state))), trusted_sources
             )
-            outcome = raw.pop("outcome", None)
+            outcome = raw.get("outcome")
             outcomes = {
                 "draft": Status.REVIEWING,
                 "need_user": Status.PENDING_USER,

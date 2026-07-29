@@ -267,6 +267,7 @@ class FailureFallbackTest(unittest.TestCase):
                 "review_reasons": ["passed"],
                 "review_issues": [],
                 "required_changes": [],
+                "outcome": "draft",
                 "diagnosis_summary": "设备连接异常，可按安全步骤重新连接。",
                 "recommended_actions": [
                     {
@@ -704,6 +705,9 @@ class FailureFallbackTest(unittest.TestCase):
             },
             "replaced_final": {"final_answer": "另一段同样安全的答复。"},
             "tool_failure": {"tool_errors": ["no_evidence"]},
+            "need_user_outcome": {"outcome": "need_user"},
+            "escalate_outcome": {"outcome": "escalate"},
+            "missing_outcome": {},
             "nonresolved_answer": {
                 "status": "escalated",
                 "requires_human": True,
@@ -716,6 +720,8 @@ class FailureFallbackTest(unittest.TestCase):
 
                     def malicious(graph_input, _config, overrides=overrides):
                         output = self.resolved_output(graph_input, **overrides)
+                        if name == "missing_outcome":
+                            output.pop("outcome")
                         if name == "nonresolved_answer":
                             output["status_events"][-1] = graph_event(
                                 graph_input["command_id"],
@@ -1199,6 +1205,54 @@ class FailureFallbackTest(unittest.TestCase):
         self.assertEqual(
             latest.checkpoint["channel_values"]["last_error"], "new"
         )
+
+    def test_checkpoint_fence_explicitly_rejects_dynamic_send_channels(self):
+        ticket = self.repo.create_ticket(
+            "dynamic-send-unsupported", "1001", "安全问题", []
+        )
+        command_id = "request:dynamic-send-unsupported"
+        decision = self.repo.begin_command(
+            ticket["ticket_id"], command_id, "user_input", 130
+        )
+        saver = LeaseFencedCheckpointer(MemorySaver(), self.repo)
+        config = {
+            "configurable": {
+                "thread_id": ticket["ticket_id"],
+                "checkpoint_ns": "",
+                "command_id": command_id,
+                "lease_version": decision.lease_version,
+            }
+        }
+        checkpoint = empty_checkpoint()
+        checkpoint["channel_values"] = {"last_error": ""}
+        checkpoint["channel_versions"] = {"last_error": "0001"}
+        checkpoint["updated_channels"] = ["last_error"]
+        write_config = saver.put(
+            config,
+            checkpoint,
+            {"source": "input", "step": -1, "parents": {}},
+            {"last_error": "0001"},
+        )
+        saver.put_writes(
+            write_config,
+            [("__pregel_tasks", [])],
+            "task-empty-send-list",
+        )
+        saver.put_writes(
+            write_config,
+            [("__pregel_push", None)],
+            "task-empty-push-marker",
+        )
+
+        for channel in ("__pregel_tasks", "__pregel_push"):
+            with self.subTest(channel=channel), self.assertRaisesRegex(
+                ValueError, "不支持动态 Send/push"
+            ):
+                saver.put_writes(
+                    config,
+                    [(channel, [object()])],
+                    "task-dynamic-send",
+                )
 
     def test_real_memory_saver_never_serializes_secret_graph_writes(self):
         for kind in ("state", "interrupt"):

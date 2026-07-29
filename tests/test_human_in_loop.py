@@ -109,6 +109,7 @@ class HumanInLoopTest(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["outcome"], "draft")
         self.assertEqual(
             result["final_answer"], "请先更换可信电源线，然后重新连接设备。"
         )

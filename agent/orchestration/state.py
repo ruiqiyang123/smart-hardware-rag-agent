@@ -301,6 +301,7 @@ class TicketState(TypedDict, total=False):
     suggested_route: str
     summary: str
     customer_context: Dict[str, str]
+    outcome: str
     diagnosis_summary: str
     recommended_actions: List[DiagnosisActionState]
     evidence_refs: List[str]
