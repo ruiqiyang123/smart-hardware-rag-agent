@@ -20,6 +20,7 @@ from agent.orchestration.routes import (
     route_after_triage,
 )
 from agent.orchestration.state import RiskLevel, Status
+from agent.security.secrets import TransactionHash
 from database.ticket_db import TicketRepository
 
 
@@ -27,6 +28,7 @@ MNEMONIC = (
     "abandon ability able about above absent absorb abstract absurd abuse "
     "access accident"
 )
+TRANSACTION_HASH = "0x" + "a" * 64
 
 
 class OrchestrationRoutesTest(unittest.TestCase):
@@ -380,6 +382,21 @@ class OrchestrationEventTest(unittest.TestCase):
             with self.subTest(case=index), self.assertRaises(ValueError):
                 self._event(**changes)
 
+    def test_transaction_hash_requires_explicit_type_at_event_ingress(self):
+        typed = self._event(
+            metadata={"transaction_hash": TransactionHash(TRANSACTION_HASH)}
+        )
+
+        self.assertEqual(typed["metadata"]["transaction_hash"], TRANSACTION_HASH)
+        for metadata in (
+            {"transaction_hash": TRANSACTION_HASH},
+            {"transaction_hash": "not-a-transaction-hash"},
+            {"nested": {"transaction_hash": TransactionHash(TRANSACTION_HASH)}},
+            {"hashes": [TransactionHash(TRANSACTION_HASH)]},
+        ):
+            with self.subTest(metadata=metadata), self.assertRaises(ValueError):
+                self._event(metadata=metadata)
+
     def test_event_round_trips_without_pickle(self):
         event = self._event()
         serializer = JsonPlusSerializer(
@@ -416,6 +433,63 @@ class OrchestrationEventTest(unittest.TestCase):
         self.assertNotIn("command_id", payload)
         self.assertIsInstance(event_id, int)
         self.assertGreater(event_id, 0)
+
+    def test_typed_transaction_hash_round_trips_and_repository_accepts_it(self):
+        event = self._event(
+            metadata={"transaction_hash": TransactionHash(TRANSACTION_HASH)}
+        )
+        serializer = JsonPlusSerializer(
+            pickle_fallback=False,
+            allowed_json_modules=None,
+            allowed_msgpack_modules=None,
+        )
+        restored = serializer.loads_typed(serializer.dumps_typed(event))
+
+        self.assertEqual(restored["metadata"]["transaction_hash"], TRANSACTION_HASH)
+        payload = to_repository_event(restored)
+        self.assertIsInstance(
+            payload["metadata"]["transaction_hash"], TransactionHash
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repository = TicketRepository(str(Path(directory) / "tickets.db"))
+            ticket = repository.create_ticket(
+                "typed-hash-event", "user-1", "查询交易状态", []
+            )
+            command_id = event["command_id"]
+            decision = repository.begin_command(
+                ticket["ticket_id"], command_id, "user_input", 30
+            )
+            event_id = repository.append_event(
+                ticket["ticket_id"],
+                command_id,
+                decision.lease_version,
+                **payload,
+            )
+
+        self.assertGreater(event_id, 0)
+
+    def test_repository_adapter_revalidates_tampered_events(self):
+        safe_event = self._event()
+        tampered_events = []
+        for field, value in (
+            ("command_id", ""),
+            ("step_index", 0),
+            ("node_name", " "),
+            ("from_status", "unknown"),
+        ):
+            tampered = dict(safe_event)
+            tampered[field] = value
+            tampered_events.append(tampered)
+        invalid_hash = dict(safe_event)
+        invalid_hash["metadata"] = {"transaction_hash": "not-a-hash"}
+        tampered_events.append(invalid_hash)
+        extra_field = dict(safe_event)
+        extra_field["raw_payload"] = "must-not-pass"
+        tampered_events.append(extra_field)
+
+        for index, tampered in enumerate(tampered_events):
+            with self.subTest(case=index), self.assertRaises(ValueError):
+                to_repository_event(tampered)
 
 
 class InvokeWithPolicyTest(unittest.TestCase):
