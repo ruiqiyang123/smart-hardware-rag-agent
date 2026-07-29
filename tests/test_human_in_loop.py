@@ -193,7 +193,7 @@ class HumanInLoopTest(unittest.TestCase):
 
         graph = self._graph(triage=triage)
         config = {"configurable": {"thread_id": "ask-user"}}
-        graph.invoke(_initial_state(risk_level="critical"), config)
+        graph.invoke(_initial_state(status="escalated"), config)
 
         waiting = graph.invoke(
             Command(
@@ -225,6 +225,107 @@ class HumanInLoopTest(unittest.TestCase):
         self.assertEqual(result["status"], "resolved")
         self.assertEqual(triage_calls, ["设备型号为 Nano X，当前无法开机"])
         self.assertGreaterEqual(result["event_step"], 2)
+
+    def test_user_resume_cannot_downgrade_critical_human_gate(self):
+        triage_calls = []
+
+        def triage(state):
+            triage_calls.append(state)
+            return _triage(state)
+
+        graph = self._graph(triage=triage)
+        config = {"configurable": {"thread_id": "critical-ask-user"}}
+        graph.invoke(
+            _initial_state(
+                risk_level="critical",
+                risk_flags=["phishing", "asset_loss"],
+                sensitive_flags=["phishing"],
+                requires_human=True,
+            ),
+            config,
+        )
+        waiting = graph.invoke(
+            Command(
+                resume={
+                    "command_id": "critical-human-ask-1",
+                    "action": "ask_user",
+                    "missing_fields": ["device_model"],
+                }
+            ),
+            config,
+        )
+        self.assertEqual(waiting["status"], "pending_user")
+
+        result = graph.invoke(
+            Command(
+                resume={
+                    "command_id": "critical-user-reply-1",
+                    "request_id": "critical-request-2",
+                    "sanitized_input": "设备型号为 Nano X",
+                    "sensitive_flags": [],
+                    "risk_flags": [],
+                    "risk_level": "low",
+                }
+            ),
+            config,
+        )
+
+        self.assertEqual(result["status"], "escalated")
+        self.assertEqual(result["risk_level"], "critical")
+        self.assertEqual(result["risk_flags"], ["phishing", "asset_loss"])
+        self.assertEqual(result["sensitive_flags"], ["phishing"])
+        self.assertTrue(result["requires_human"])
+        self.assertEqual(triage_calls, [])
+        self.assertIn("__interrupt__", result)
+
+    def test_user_resume_merges_flags_stably_and_applies_flag_floor(self):
+        graph = self._graph()
+        config = {"configurable": {"thread_id": "resume-risk-merge"}}
+        graph.invoke(
+            _initial_state(
+                risk_level="high",
+                risk_flags=["device_auth_failure", "address_mismatch"],
+                sensitive_flags=["device_auth_failure"],
+                requires_human=True,
+            ),
+            config,
+        )
+        graph.invoke(
+            Command(
+                resume={
+                    "command_id": "merge-human-ask-1",
+                    "action": "ask_user",
+                    "missing_fields": ["device_model"],
+                }
+            ),
+            config,
+        )
+        result = graph.invoke(
+            Command(
+                resume={
+                    "command_id": "merge-user-reply-1",
+                    "request_id": "merge-request-2",
+                    "sanitized_input": "设备型号为 Nano X",
+                    "sensitive_flags": ["remote_control"],
+                    "risk_flags": ["address_mismatch", "phishing"],
+                    "risk_level": "low",
+                }
+            ),
+            config,
+        )
+
+        self.assertEqual(result["risk_level"], "critical")
+        self.assertEqual(
+            result["risk_flags"],
+            ["device_auth_failure", "address_mismatch", "phishing"],
+        )
+        self.assertEqual(
+            result["sensitive_flags"],
+            ["device_auth_failure", "remote_control"],
+        )
+        self.assertTrue(result["requires_human"])
+        self.assertEqual(result["status"], "escalated")
+        self.assertIn("__interrupt__", result)
 
     def test_review_allows_exactly_one_revision_with_feedback(self):
         diagnosis_states = []

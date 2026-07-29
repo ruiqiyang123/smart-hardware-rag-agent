@@ -777,7 +777,6 @@ def _human_review_node(policy_guard: object) -> Callable[[TicketState], dict]:
                 state,
                 {
                     "status": Status.PENDING_USER.value,
-                    "requires_human": False,
                     "human_decision": action,
                     "missing_fields": resume["missing_fields"],
                     "last_error": "",
@@ -831,33 +830,55 @@ def _await_user(state: TicketState) -> dict:
         command_id = _identifier(resumed["command_id"], "command_id")
         request_id = _identifier(resumed["request_id"], "request_id")
         sanitized_input = _safe_text(resumed["sanitized_input"], "sanitized_input", 10_000)
-        sensitive_flags = resumed["sensitive_flags"]
-        risk_flags = resumed["risk_flags"]
-        if (
-            not isinstance(sensitive_flags, list)
-            or not isinstance(risk_flags, list)
-            or any(not isinstance(item, str) or item not in _RISK_FLAGS for item in sensitive_flags + risk_flags)
-            or len(sensitive_flags) != len(set(sensitive_flags))
-            or len(risk_flags) != len(set(risk_flags))
-            or resumed["risk_level"] not in _RISK_LEVELS
-        ):
+        old_sensitive_flags = state.get("sensitive_flags", [])
+        old_risk_flags = state.get("risk_flags", [])
+        new_sensitive_flags = resumed["sensitive_flags"]
+        new_risk_flags = resumed["risk_flags"]
+
+        def validated_flags(value: object) -> list[str]:
+            if (
+                not isinstance(value, list)
+                or any(
+                    not isinstance(item, str) or item not in _RISK_FLAGS
+                    for item in value
+                )
+                or len(value) != len(set(value))
+            ):
+                raise ValueError("恢复风险字段非法")
+            return list(value)
+
+        old_sensitive_flags = validated_flags(old_sensitive_flags)
+        old_risk_flags = validated_flags(old_risk_flags)
+        new_sensitive_flags = validated_flags(new_sensitive_flags)
+        new_risk_flags = validated_flags(new_risk_flags)
+        old_risk_level = state.get("risk_level")
+        new_risk_level = resumed["risk_level"]
+        if old_risk_level not in _RISK_LEVELS or new_risk_level not in _RISK_LEVELS:
             raise ValueError("恢复风险字段非法")
-        combined_flags = set(sensitive_flags) | set(risk_flags)
-        if combined_flags & _CRITICAL_FLAGS and resumed["risk_level"] != RiskLevel.CRITICAL.value:
-            raise ValueError("critical flag 与风险等级不一致")
-        if combined_flags & _HIGH_FLAGS and resumed["risk_level"] not in {
-            RiskLevel.HIGH.value,
-            RiskLevel.CRITICAL.value,
-        }:
-            raise ValueError("high flag 与风险等级不一致")
+
+        sensitive_flags = list(
+            dict.fromkeys(old_sensitive_flags + new_sensitive_flags)
+        )
+        risk_flags = list(dict.fromkeys(old_risk_flags + new_risk_flags))
+        all_flags = set(sensitive_flags) | set(risk_flags)
+        if all_flags & _CRITICAL_FLAGS:
+            flag_floor = RiskLevel.CRITICAL.value
+        elif all_flags & _HIGH_FLAGS:
+            flag_floor = RiskLevel.HIGH.value
+        else:
+            flag_floor = RiskLevel.LOW.value
+        effective_risk_level = max(
+            (old_risk_level, new_risk_level, flag_floor),
+            key=_RISK_ORDER.__getitem__,
+        )
         return with_event(
             state,
             {
                 "request_id": request_id,
                 "sanitized_input": sanitized_input,
-                "sensitive_flags": list(sensitive_flags),
-                "risk_flags": list(risk_flags),
-                "risk_level": resumed["risk_level"],
+                "sensitive_flags": sensitive_flags,
+                "risk_flags": risk_flags,
+                "risk_level": effective_risk_level,
                 "missing_fields": [],
                 "last_error": "",
             },
