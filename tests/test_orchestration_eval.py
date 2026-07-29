@@ -294,11 +294,33 @@ class OrchestrationScorerTest(unittest.TestCase):
                 ],
             ),
         )
+        trailing_completion = score_case(
+            expected,
+            self._actual(
+                status_trace=[
+                    "new",
+                    "triaged",
+                    "pending_user",
+                    "escalated",
+                    "pending_user",
+                    "triaged",
+                    "diagnosing",
+                    "escalated",
+                ],
+                turn_results=[
+                    {"turn_index": 1, "status": "pending_user", "trace_index": 2},
+                    {"turn_index": 2, "status": "escalated", "trace_index": 3},
+                ],
+            ),
+        )
 
         self.assertFalse(shortcut["trace_requirements_passed"])
         self.assertFalse(shortcut["transition_passed"])
         self.assertTrue(complete["trace_requirements_passed"])
         self.assertTrue(complete["transition_passed"])
+        self.assertFalse(trailing_completion["turns_passed"])
+        self.assertFalse(trailing_completion["trace_requirements_passed"])
+        self.assertFalse(trailing_completion["transition_passed"])
 
     @staticmethod
     def _expected(**updates):
@@ -626,6 +648,36 @@ class OrchestrationEvalRunnerTest(unittest.TestCase):
         )
 
         self.assertEqual(report["metrics"]["state_transition_accuracy"], 1.0)
+
+    def test_last_turn_must_bind_to_terminal_trace_state(self):
+        case = copy.deepcopy(self.cases[39])
+
+        class TrailingTraceRunner(FakeEvaluationRunner):
+            def run_v2_case(self, case, *, fault_injector):
+                actual = super().run_v2_case(case, fault_injector=fault_injector)
+                actual["status_trace"] = [
+                    "new",
+                    "triaged",
+                    "pending_user",
+                    "escalated",
+                    "pending_user",
+                    "triaged",
+                    "diagnosing",
+                    "escalated",
+                ]
+                actual["turn_results"] = [
+                    {"turn_index": 1, "status": "pending_user", "trace_index": 2},
+                    {"turn_index": 2, "status": "escalated", "trace_index": 3},
+                ]
+                return actual
+
+        with self.assertRaisesRegex(RunnerOutputError, "末轮"):
+            run_evaluation(
+                [case],
+                runner=TrailingTraceRunner(self.cases),
+                v1_cases=self.v1_cases,
+                tag="trailing-trace",
+            )
 
     def test_result_file_redacts_a_detected_secret_but_keeps_violation_score(self):
         case = copy.deepcopy(self.cases[30])

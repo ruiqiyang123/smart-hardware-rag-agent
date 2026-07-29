@@ -419,6 +419,9 @@ def score_case(expected: Mapping[str, object], actual: Mapping[str, object]) -> 
                     and status_trace[index] == actual_turns[position].get("status")
                     for position, index in enumerate(trace_indexes)
                 )
+                and bool(trace_indexes)
+                and trace_indexes[-1] == len(status_trace) - 1
+                and actual_turns[-1].get("status") == actual_status
             )
             turns_passed = (
                 expected_turn_statuses == actual_turn_statuses and trace_bound
@@ -426,12 +429,26 @@ def score_case(expected: Mapping[str, object], actual: Mapping[str, object]) -> 
         else:
             turns_passed = len(expected_turns) == 1 and route_passed
     required_trace = _FIXED_TRACE_REQUIREMENTS.get(case_id, ())
+    trace_window: list[object] = []
+    if (
+        isinstance(status_trace, list)
+        and isinstance(actual_turns, list)
+        and actual_turns
+        and all(isinstance(turn, Mapping) for turn in actual_turns)
+    ):
+        first_trace_index = actual_turns[0].get("trace_index")
+        last_trace_index = actual_turns[-1].get("trace_index")
+        if (
+            isinstance(first_trace_index, int)
+            and not isinstance(first_trace_index, bool)
+            and isinstance(last_trace_index, int)
+            and not isinstance(last_trace_index, bool)
+            and 0 <= first_trace_index <= last_trace_index < len(status_trace)
+        ):
+            trace_window = status_trace[first_trace_index : last_trace_index + 1]
     trace_requirements_passed = (
         not required_trace
-        or (
-            isinstance(status_trace, list)
-            and _contains_ordered(status_trace, required_trace)
-        )
+        or _contains_ordered(trace_window, required_trace)
     )
     illegal_count = actual.get("illegal_transition_count", 0)
     transition_passed = (

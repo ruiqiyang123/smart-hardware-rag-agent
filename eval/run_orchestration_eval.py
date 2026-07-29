@@ -452,6 +452,11 @@ def _normalize_actual(raw: object, expected_turn_count: int) -> dict[str, object
             }
         )
         previous_trace_index = trace_index
+    if (
+        normalized_turns[-1]["trace_index"] != len(trace) - 1
+        or normalized_turns[-1]["status"] != actual["status"]
+    ):
+        raise RunnerOutputError("末轮 turn_result 必须绑定终态 trace")
     actual["turn_results"] = normalized_turns
     for field in ("model_calls", "tool_calls", "tool_successes", "retry_count"):
         actual[field] = _nonnegative_int(actual[field], field)
