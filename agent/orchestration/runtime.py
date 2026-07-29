@@ -1,0 +1,930 @@
+"""Safe runtime boundary for the checkpointed support graph.
+
+Raw caller input is sanitized before this module touches the repository or the
+graph.  Commands are fenced by durable leases and graph results are projected
+onto the repository's narrow atomic completion API.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+import re
+import uuid
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import List, Optional
+
+from langgraph.types import Command, Interrupt
+
+from agent.orchestration.events import make_event, to_repository_event
+from agent.orchestration.invoke import invoke_with_policy
+from agent.orchestration.state import (
+    MissingField,
+    RiskFlag,
+    RiskLevel,
+    Status,
+    TicketState,
+)
+from agent.security.secrets import TransactionHash, contains_unredacted_secret
+from agent.security.trusted_sources import TrustedSourcePolicy
+from database.ticket_db import (
+    CommandDecision,
+    CommandDisposition,
+    CommandType,
+)
+
+
+_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}", re.ASCII)
+_STATE_FIELDS = frozenset(TicketState.__annotations__)
+_INITIAL_STATE_FIELDS = frozenset(
+    {
+        "ticket_id",
+        "request_id",
+        "command_id",
+        "event_step",
+        "user_id",
+        "sanitized_input",
+        "safe_history",
+        "sensitive_flags",
+        "risk_level",
+        "risk_flags",
+        "revision_count",
+        "response_version",
+        "status",
+        "requires_human",
+        "status_events",
+    }
+)
+_HISTORY_ROLES = frozenset({"user", "assistant"})
+_HUMAN_COMMAND_TYPES = {
+    "approve": CommandType.HUMAN_APPROVE,
+    "edit_send": CommandType.HUMAN_EDIT_SEND,
+    "ask_user": CommandType.HUMAN_ASK,
+    "reject": CommandType.HUMAN_REJECT,
+}
+_MISSING_FIELDS = frozenset(item.value for item in MissingField)
+_RISK_FLAGS = frozenset(item.value for item in RiskFlag)
+_RISK_LEVELS = frozenset(item.value for item in RiskLevel)
+_CRITICAL_FLAGS = frozenset(
+    {
+        RiskFlag.SECRET_EXPOSURE.value,
+        RiskFlag.PHISHING.value,
+        RiskFlag.ASSET_LOSS.value,
+    }
+)
+_HIGH_FLAGS = frozenset(
+    {
+        RiskFlag.UNOFFICIAL_FIRMWARE.value,
+        RiskFlag.ADDRESS_MISMATCH.value,
+        RiskFlag.SUSPICIOUS_SIGNATURE.value,
+        RiskFlag.DEVICE_AUTH_FAILURE.value,
+        RiskFlag.REMOTE_CONTROL.value,
+    }
+)
+_DB_EVENT_FIELDS = frozenset(
+    {
+        "event_id",
+        "ticket_id",
+        "idempotency_key",
+        "command_id",
+        "step_index",
+        "node_name",
+        "event_type",
+        "from_status",
+        "to_status",
+        "summary",
+        "metadata_json",
+        "created_at",
+    }
+)
+
+
+@dataclass(frozen=True)
+class OrchestrationResult:
+    ticket_id: str
+    status: str
+    sanitized_input: str
+    user_notice: str
+    final_answer: str
+    citations: List[dict]
+    events: List[dict]
+    duplicate: bool = False
+
+
+class CheckpointRestoreError(RuntimeError):
+    """A leased command could not safely continue from its checkpoint."""
+
+
+@dataclass(frozen=True)
+class _ValidatedIngress:
+    sanitized_input: str
+    risk_level: str
+    risk_flags: list[str]
+    critical_notice: str
+
+
+def _forbidden_control(value: str) -> bool:
+    return any(
+        (ord(character) < 0x20 and character not in {"\n", "\t"})
+        or 0x7F <= ord(character) <= 0x9F
+        for character in value
+    )
+
+
+def _safe_text(
+    value: object,
+    field: str,
+    max_length: int,
+    *,
+    allow_empty: bool = False,
+) -> str:
+    if not isinstance(value, str) or len(value) > max_length:
+        raise ValueError(f"{field} 非法")
+    if _forbidden_control(value):
+        raise ValueError(f"{field} 非法")
+    normalized = " ".join(value.split())
+    if not allow_empty and not normalized:
+        raise ValueError(f"{field} 非法")
+    if contains_unredacted_secret(normalized):
+        raise ValueError(f"{field} 包含未脱敏内容")
+    return normalized
+
+
+def _identifier(value: object, field: str, max_length: int = 128) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) > max_length
+        or _IDENTIFIER_PATTERN.fullmatch(value) is None
+        or contains_unredacted_secret(value)
+    ):
+        raise ValueError(f"{field} 非法")
+    return value
+
+
+def _strict_json(value: object, path: tuple[str, ...] = (), depth: int = 0):
+    if depth > 32:
+        raise ValueError("JSON 嵌套过深")
+    if isinstance(value, str):
+        if len(value) > 32 * 1024 or _forbidden_control(value):
+            raise ValueError("JSON 文本非法")
+        if path and path[-1] == "transaction_hash":
+            return TransactionHash(value).value
+        if contains_unredacted_secret(value):
+            raise ValueError("JSON 包含未脱敏内容")
+        return value
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("JSON 包含非有限数")
+        return value
+    if isinstance(value, list):
+        return [
+            _strict_json(item, path + ("[]",), depth + 1) for item in value
+        ]
+    if isinstance(value, dict):
+        copied = {}
+        for key, nested in value.items():
+            if not isinstance(key, str) or _forbidden_control(key):
+                raise ValueError("JSON key 非法")
+            if contains_unredacted_secret(key):
+                raise ValueError("JSON key 包含未脱敏内容")
+            copied[key] = _strict_json(nested, path + (key,), depth + 1)
+        return copied
+    raise TypeError("只允许严格 JSON 值")
+
+
+def _safe_history(value: object) -> list[dict[str, str]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 24:
+        raise ValueError("safe_history 非法")
+    projected: list[dict[str, str]] = []
+    total_length = 0
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"role", "content"}:
+            raise ValueError("safe_history 条目非法")
+        role = item["role"]
+        if not isinstance(role, str) or role not in _HISTORY_ROLES:
+            raise ValueError("safe_history role 非法")
+        content = _safe_text(item["content"], "safe_history.content", 10_000)
+        total_length += len(content)
+        if total_length > 32_000:
+            raise ValueError("safe_history 总长度超限")
+        projected.append({"role": role, "content": content})
+    return projected
+
+
+def _validated_ingress(value: object) -> _ValidatedIngress:
+    required = {
+        "sanitized_input",
+        "risk_level",
+        "risk_flags",
+        "critical_notice",
+    }
+    if any(not hasattr(value, field) for field in required):
+        raise TypeError("ingress 输出契约非法")
+    sanitized_input = _safe_text(
+        getattr(value, "sanitized_input"), "sanitized_input", 10_000
+    )
+    risk_level = getattr(value, "risk_level")
+    if not isinstance(risk_level, str) or risk_level not in _RISK_LEVELS:
+        raise ValueError("ingress risk_level 非法")
+    risk_flags = _string_list(
+        getattr(value, "risk_flags"), "ingress risk_flags", 16
+    )
+    if any(flag not in _RISK_FLAGS for flag in risk_flags):
+        raise ValueError("ingress risk_flags 非法")
+    flags = set(risk_flags)
+    if flags & _CRITICAL_FLAGS and risk_level != RiskLevel.CRITICAL.value:
+        raise ValueError("ingress critical flag 与 risk_level 不一致")
+    if flags & _HIGH_FLAGS and risk_level not in {
+        RiskLevel.HIGH.value,
+        RiskLevel.CRITICAL.value,
+    }:
+        raise ValueError("ingress high flag 与 risk_level 不一致")
+    critical_notice = _safe_text(
+        getattr(value, "critical_notice"),
+        "critical_notice",
+        2_000,
+        allow_empty=True,
+    )
+    if risk_level == RiskLevel.CRITICAL.value and not critical_notice:
+        raise ValueError("critical ingress 缺少固定安全提示")
+    return _ValidatedIngress(
+        sanitized_input=sanitized_input,
+        risk_level=risk_level,
+        risk_flags=risk_flags,
+        critical_notice=critical_notice,
+    )
+
+
+def _payload_fingerprint(payload: dict) -> str:
+    safe_payload = _strict_json(payload)
+    canonical = json.dumps(
+        safe_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _optional_output_text(
+    value: object, field: str, max_length: int
+) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    return _safe_text(value, field, max_length)
+
+
+def _nonnegative_integer(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} 非法")
+    return value
+
+
+def _string_list(value: object, field: str, maximum: int = 32) -> list[str]:
+    if not isinstance(value, list) or len(value) > maximum:
+        raise ValueError(f"{field} 非法")
+    result = [_safe_text(item, field, 300) for item in value]
+    if len(result) != len(set(result)):
+        raise ValueError(f"{field} 不得重复")
+    return result
+
+
+def _status(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("status 非法")
+    try:
+        return Status(value).value
+    except ValueError:
+        raise ValueError("status 非法") from None
+
+
+class SupportOrchestrator:
+    def __init__(
+        self,
+        repository,
+        graph,
+        ingress_guard,
+        recursion_limit: int,
+        lease_seconds: int,
+        graph_timeout_seconds: float = 120,
+        trusted_source_policy: object | None = None,
+    ):
+        if (
+            isinstance(recursion_limit, bool)
+            or not isinstance(recursion_limit, int)
+            or recursion_limit <= 0
+        ):
+            raise ValueError("recursion_limit 必须是正整数")
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or lease_seconds <= 0
+        ):
+            raise ValueError("lease_seconds 必须是正整数")
+        if (
+            isinstance(graph_timeout_seconds, bool)
+            or not isinstance(graph_timeout_seconds, (int, float))
+            or not math.isfinite(graph_timeout_seconds)
+            or graph_timeout_seconds <= 0
+        ):
+            raise ValueError("graph_timeout_seconds 必须是有限正数")
+        if graph_timeout_seconds >= lease_seconds:
+            raise ValueError("graph_timeout_seconds 必须严格小于 command lease")
+        if not callable(getattr(repository, "begin_command", None)):
+            raise TypeError("repository 接口非法")
+        if not callable(getattr(graph, "invoke", None)):
+            raise TypeError("graph 接口非法")
+        if not callable(getattr(ingress_guard, "sanitize", None)):
+            raise TypeError("ingress_guard 接口非法")
+
+        self.repository = repository
+        self.graph = graph
+        self.ingress_guard = ingress_guard
+        self.recursion_limit = recursion_limit
+        self.lease_seconds = lease_seconds
+        self.graph_timeout_seconds = float(graph_timeout_seconds)
+        self.trusted_sources = trusted_source_policy or TrustedSourcePolicy()
+        if not callable(getattr(self.trusted_sources, "is_trusted", None)):
+            raise TypeError("trusted_source_policy 接口非法")
+
+    def _config(self, ticket_id: str) -> dict:
+        return {
+            "configurable": {"thread_id": _identifier(ticket_id, "ticket_id")},
+            "recursion_limit": self.recursion_limit,
+        }
+
+    def _checkpoint_values(self, ticket_id: str) -> dict:
+        get_state = getattr(self.graph, "get_state", None)
+        if not callable(get_state):
+            return {}
+        snapshot = get_state(self._config(ticket_id))
+        values = getattr(snapshot, "values", None)
+        if values is None:
+            return {}
+        if not isinstance(values, Mapping):
+            raise TypeError("checkpoint state 非法")
+        return copy.deepcopy(dict(values))
+
+    def get_state(self, ticket_id: str) -> dict:
+        values = self._checkpoint_values(ticket_id)
+        return self._validated_graph_output(values) if values else {}
+
+    def _invoke_graph(self, graph_input, ticket_id: str) -> dict:
+        output = invoke_with_policy(
+            lambda: self.graph.invoke(
+                graph_input,
+                config=self._config(ticket_id),
+            ),
+            timeout_seconds=self.graph_timeout_seconds,
+            retries=0,
+        )
+        if isinstance(output, Mapping) and "__interrupt__" in output:
+            interrupts = output.get("__interrupt__")
+            unknown = set(output) - _STATE_FIELDS - {"__interrupt__"}
+            if (
+                unknown
+                or not isinstance(interrupts, (list, tuple))
+                or not interrupts
+                or any(not isinstance(item, Interrupt) for item in interrupts)
+            ):
+                raise ValueError("graph interrupt 输出非法")
+            checkpoint = self._checkpoint_values(ticket_id)
+            if not checkpoint:
+                raise ValueError("graph interrupt 缺少 checkpoint state")
+            return self._validated_graph_output(checkpoint)
+        return self._validated_graph_output(output)
+
+    @staticmethod
+    def _validated_graph_output(output: object) -> dict:
+        if not isinstance(output, Mapping):
+            raise TypeError("graph 输出必须是映射")
+        if "__interrupt__" in output:
+            raise ValueError("graph 输出不得持久化 __interrupt__")
+        unknown = set(output) - _STATE_FIELDS
+        if unknown:
+            raise ValueError("graph 输出包含未知 state 字段")
+        return copy.deepcopy(_strict_json(dict(output)))
+
+    def _resume_expired_command(
+        self,
+        ticket_id: str,
+        command_id: str,
+        lease_version: int,
+    ) -> dict:
+        ticket = self.repository.get_ticket(ticket_id)
+        if ticket is None:
+            raise ValueError(f"工单不存在: {ticket_id}")
+        ticket_status = _status(ticket.get("status"))
+        consistent = False
+        try:
+            checkpoint = self._checkpoint_values(ticket_id)
+            if checkpoint:
+                checkpoint = self._validated_graph_output(checkpoint)
+                consistent = (
+                    checkpoint.get("ticket_id") == ticket_id
+                    and checkpoint.get("status") == ticket_status
+                    and ticket_status in {
+                        Status.PENDING_USER.value,
+                        Status.ESCALATED.value,
+                    }
+                )
+        except Exception:
+            consistent = False
+        if not consistent:
+            self.repository.fail_checkpoint_restore(
+                ticket_id=ticket_id,
+                command_id=command_id,
+                lease_version=lease_version,
+                expected_ticket_status=ticket_status,
+            )
+            raise CheckpointRestoreError("CHECKPOINT_MISMATCH") from None
+        return self._invoke_graph(None, ticket_id)
+
+    def _fail_command_safely(
+        self, command_id: str, lease_version: int, error_code: str
+    ) -> None:
+        try:
+            self.repository.fail_command(command_id, lease_version, error_code)
+        except Exception:
+            pass
+
+    def _execute(
+        self,
+        *,
+        ticket_id: str,
+        command_id: str,
+        decision: CommandDecision,
+        graph_input,
+    ) -> None:
+        try:
+            if decision.disposition == CommandDisposition.RESUME:
+                output = self._resume_expired_command(
+                    ticket_id,
+                    command_id,
+                    decision.lease_version,
+                )
+            elif decision.disposition == CommandDisposition.START:
+                output = self._invoke_graph(graph_input, ticket_id)
+            else:
+                raise ValueError("command disposition 不可执行")
+            self._persist_graph_result(
+                ticket_id,
+                command_id,
+                decision.lease_version,
+                output,
+            )
+        except TimeoutError:
+            # The worker may still finish a checkpoint. Keep the lease in
+            # progress so a later fenced RESUME can perform consistency checks.
+            raise
+        except CheckpointRestoreError:
+            raise
+        except Exception:
+            self._fail_command_safely(
+                command_id,
+                decision.lease_version,
+                "GRAPH_EXECUTION_FAILED",
+            )
+            raise
+
+    def _persist_graph_result(
+        self,
+        ticket_id: str,
+        command_id: str,
+        lease_version: int,
+        output: object,
+    ) -> None:
+        state = self._validated_graph_output(output)
+        if state.get("ticket_id") != ticket_id:
+            raise ValueError("graph ticket_id 与 command 不一致")
+        if state.get("command_id") != command_id:
+            raise ValueError("graph command_id 与当前 command 不一致")
+        final_status = _status(state.get("status"))
+
+        updates = {
+            "status": final_status,
+            "category": state.get("category"),
+            "priority": state.get("priority"),
+            "risk_level": state.get("risk_level"),
+            "summary": _optional_output_text(state.get("summary"), "summary", 300),
+            "risk_flags_json": _string_list(
+                state.get("risk_flags", []), "risk_flags", 16
+            ),
+            "missing_fields_json": _string_list(
+                state.get("missing_fields", []), "missing_fields", 16
+            ),
+            "evidence_refs_json": _string_list(
+                state.get("evidence_refs", []), "evidence_refs", 32
+            ),
+            "draft_answer": _optional_output_text(
+                state.get("draft_answer"), "draft_answer", 2_000
+            ),
+            "final_answer": _optional_output_text(
+                state.get("final_answer"), "final_answer", 2_000
+            ),
+            "review_decision": state.get("review_decision") or None,
+            "revision_count": _nonnegative_integer(
+                state.get("revision_count", 0), "revision_count"
+            ),
+            "response_version": _nonnegative_integer(
+                state.get("response_version", 0), "response_version"
+            ),
+            "requires_human": state.get("requires_human", False),
+            "manual_gate_reason": _optional_output_text(
+                state.get("manual_gate_reason"), "manual_gate_reason", 500
+            ),
+        }
+        if not isinstance(updates["requires_human"], bool):
+            raise ValueError("requires_human 非法")
+
+        raw_events = state.get("status_events")
+        if not isinstance(raw_events, list):
+            raise ValueError("status_events 非法")
+        events = []
+        for raw_event in raw_events:
+            if not isinstance(raw_event, Mapping):
+                raise ValueError("status_event 非法")
+            if raw_event.get("command_id") == command_id:
+                events.append(to_repository_event(raw_event))
+        if not events:
+            raise ValueError("当前 command 缺少可提交事件")
+        steps = [event["step_index"] for event in events]
+        if steps != sorted(steps) or len(steps) != len(set(steps)):
+            raise ValueError("当前 command 事件顺序非法")
+        if events[-1]["event_type"] != f"ticket.{final_status}":
+            terminal = make_event(
+                command_id=command_id,
+                step_index=steps[-1] + 1,
+                node_name="runtime",
+                event_type=f"ticket.{final_status}",
+                summary="工作流结果已原子提交",
+                from_status=final_status,
+                to_status=final_status,
+            )
+            events.append(to_repository_event(terminal))
+
+        self.repository.commit_command_result(
+            ticket_id=ticket_id,
+            command_id=command_id,
+            lease_version=lease_version,
+            updates=updates,
+            events=events,
+        )
+
+    def _citations(self, value: object) -> list[dict]:
+        if value is None:
+            return []
+        if not isinstance(value, list) or len(value) > 16:
+            raise ValueError("checkpoint citations 非法")
+        citations = []
+        source_ids = set()
+        for item in value:
+            if not isinstance(item, dict) or set(item) != {
+                "source_id",
+                "source_title",
+                "source_url",
+            }:
+                raise ValueError("checkpoint citation 字段非法")
+            source_id = _safe_text(item["source_id"], "citation.source_id", 128)
+            title = _safe_text(item["source_title"], "citation.source_title", 500)
+            url = _safe_text(item["source_url"], "citation.source_url", 2_000)
+            if not self.trusted_sources.is_trusted(url):
+                raise ValueError("checkpoint citation URL 不可信")
+            if source_id in source_ids:
+                raise ValueError("checkpoint citation 重复")
+            source_ids.add(source_id)
+            citations.append(
+                {
+                    "source_id": source_id,
+                    "source_title": title,
+                    "source_url": url,
+                }
+            )
+        return citations
+
+    @staticmethod
+    def _events(value: object) -> list[dict]:
+        if not isinstance(value, list):
+            raise ValueError("database events 非法")
+        projected = []
+        for row in value:
+            if not isinstance(row, dict) or set(row) != _DB_EVENT_FIELDS:
+                raise ValueError("database event 字段非法")
+            try:
+                metadata = json.loads(row["metadata_json"])
+            except (TypeError, json.JSONDecodeError) as error:
+                raise ValueError("database event metadata 非法") from error
+            metadata = _strict_json(metadata)
+            if not isinstance(metadata, dict):
+                raise ValueError("database event metadata 非法")
+            event_id = row["event_id"]
+            step_index = row["step_index"]
+            if (
+                isinstance(event_id, bool)
+                or not isinstance(event_id, int)
+                or event_id <= 0
+                or isinstance(step_index, bool)
+                or not isinstance(step_index, int)
+                or step_index < 0
+            ):
+                raise ValueError("database event index 非法")
+            projected.append(
+                {
+                    "event_id": event_id,
+                    "ticket_id": _identifier(row["ticket_id"], "event.ticket_id"),
+                    "idempotency_key": _safe_text(
+                        row["idempotency_key"], "event.idempotency_key", 512
+                    ),
+                    "command_id": _identifier(row["command_id"], "event.command_id"),
+                    "step_index": step_index,
+                    "node_name": _safe_text(row["node_name"], "event.node_name", 64),
+                    "event_type": _safe_text(
+                        row["event_type"], "event.event_type", 128
+                    ),
+                    "from_status": (
+                        _status(row["from_status"])
+                        if row["from_status"] is not None
+                        else None
+                    ),
+                    "to_status": (
+                        _status(row["to_status"])
+                        if row["to_status"] is not None
+                        else None
+                    ),
+                    "summary": _safe_text(row["summary"], "event.summary", 500),
+                    "metadata": metadata,
+                    "created_at": _safe_text(
+                        row["created_at"], "event.created_at", 128
+                    ),
+                }
+            )
+        return projected
+
+    def _result(
+        self,
+        ticket_id: str,
+        sanitized_input: str,
+        user_notice: str,
+        duplicate: bool = False,
+    ) -> OrchestrationResult:
+        ticket = self.repository.get_ticket(ticket_id)
+        if ticket is None:
+            raise ValueError(f"工单不存在: {ticket_id}")
+        checkpoint = self._checkpoint_values(ticket_id)
+        citations = self._citations(checkpoint.get("citations", []))
+        final_answer = ticket.get("final_answer") or ""
+        if final_answer:
+            final_answer = _safe_text(final_answer, "final_answer", 2_000)
+        sanitized_input = _safe_text(
+            sanitized_input, "sanitized_input", 10_000, allow_empty=True
+        )
+        user_notice = _safe_text(
+            user_notice, "user_notice", 2_000, allow_empty=True
+        )
+        return OrchestrationResult(
+            ticket_id=_identifier(ticket_id, "ticket_id"),
+            status=_status(ticket.get("status")),
+            sanitized_input=sanitized_input,
+            user_notice=user_notice,
+            final_answer=final_answer,
+            citations=citations,
+            events=self._events(self.repository.list_events(ticket_id)),
+            duplicate=duplicate,
+        )
+
+    def _existing_decision_result(
+        self,
+        decision: CommandDecision,
+        *,
+        ticket_id: str,
+        sanitized_input: str,
+        user_notice: str,
+    ) -> Optional[OrchestrationResult]:
+        if decision.disposition in {
+            CommandDisposition.COMPLETED,
+            CommandDisposition.IN_PROGRESS,
+        }:
+            return self._result(
+                ticket_id,
+                sanitized_input,
+                user_notice,
+                duplicate=True,
+            )
+        if decision.disposition == CommandDisposition.FAILED:
+            raise RuntimeError("该 command 已安全失败，请使用新的幂等 ID")
+        return None
+
+    def submit(
+        self,
+        raw_input: str,
+        user_id: str,
+        request_id: Optional[str] = None,
+        safe_history: Optional[List[dict]] = None,
+    ) -> OrchestrationResult:
+        # This must remain the first operation involving caller-controlled text.
+        sanitized = _validated_ingress(self.ingress_guard.sanitize(raw_input))
+        history = _safe_history(safe_history)
+        request_id = uuid.uuid4().hex if request_id is None else request_id
+        request_id = _identifier(request_id, "request_id", 120)
+        user_id = _identifier(user_id, "user_id")
+        sanitized_input = sanitized.sanitized_input
+        risk_flags = list(sanitized.risk_flags)
+        fingerprint = _payload_fingerprint(
+            {
+                "kind": "submit",
+                "user_id": user_id,
+                "sanitized_input": sanitized_input,
+                "risk_level": sanitized.risk_level,
+                "risk_flags": risk_flags,
+                "safe_history": history,
+            }
+        )
+        ticket = self.repository.create_ticket(
+            request_id,
+            user_id,
+            sanitized_input,
+            risk_flags,
+        )
+        ticket_id = _identifier(ticket["ticket_id"], "ticket_id")
+        command_id = _identifier(f"request:{request_id}", "command_id")
+        decision = self.repository.begin_command(
+            ticket_id,
+            command_id,
+            CommandType.USER_INPUT.value,
+            self.lease_seconds,
+            payload_fingerprint=fingerprint,
+            required_status=Status.NEW.value,
+        )
+        duplicate = self._existing_decision_result(
+            decision,
+            ticket_id=ticket_id,
+            sanitized_input=sanitized_input,
+            user_notice=sanitized.critical_notice,
+        )
+        if duplicate is not None:
+            return duplicate
+
+        state = {
+            "ticket_id": ticket_id,
+            "request_id": request_id,
+            "command_id": command_id,
+            "event_step": 0,
+            "user_id": user_id,
+            "sanitized_input": sanitized_input,
+            "safe_history": history,
+            "sensitive_flags": list(risk_flags),
+            "risk_level": sanitized.risk_level,
+            "risk_flags": list(risk_flags),
+            "revision_count": 0,
+            "response_version": 0,
+            "status": _status(ticket["status"]),
+            "requires_human": sanitized.risk_level in {"high", "critical"},
+            "status_events": [],
+        }
+        if set(state) != _INITIAL_STATE_FIELDS:
+            raise AssertionError("runtime initial state 投影发生漂移")
+        self._execute(
+            ticket_id=ticket_id,
+            command_id=command_id,
+            decision=decision,
+            graph_input=state,
+        )
+        return self._result(
+            ticket_id,
+            sanitized_input,
+            sanitized.critical_notice,
+        )
+
+    def resume_user(
+        self,
+        ticket_id: str,
+        raw_input: str,
+        request_id: Optional[str] = None,
+    ) -> OrchestrationResult:
+        sanitized = _validated_ingress(self.ingress_guard.sanitize(raw_input))
+        ticket_id = _identifier(ticket_id, "ticket_id")
+        request_id = uuid.uuid4().hex if request_id is None else request_id
+        request_id = _identifier(request_id, "request_id", 120)
+        sanitized_input = sanitized.sanitized_input
+        risk_flags = list(sanitized.risk_flags)
+        fingerprint = _payload_fingerprint(
+            {
+                "kind": "resume_user",
+                "ticket_id": ticket_id,
+                "sanitized_input": sanitized_input,
+                "risk_level": sanitized.risk_level,
+                "risk_flags": risk_flags,
+            }
+        )
+        command_id = _identifier(f"request:{request_id}", "command_id")
+        decision = self.repository.begin_command(
+            ticket_id,
+            command_id,
+            CommandType.USER_INPUT.value,
+            self.lease_seconds,
+            payload_fingerprint=fingerprint,
+            required_status=Status.PENDING_USER.value,
+        )
+        duplicate = self._existing_decision_result(
+            decision,
+            ticket_id=ticket_id,
+            sanitized_input=sanitized_input,
+            user_notice=sanitized.critical_notice,
+        )
+        if duplicate is not None:
+            return duplicate
+
+        resume_command = Command(
+            resume={
+                "command_id": command_id,
+                "request_id": request_id,
+                "sanitized_input": sanitized_input,
+                "sensitive_flags": list(risk_flags),
+                "risk_flags": list(risk_flags),
+                "risk_level": sanitized.risk_level,
+            }
+        )
+        self._execute(
+            ticket_id=ticket_id,
+            command_id=command_id,
+            decision=decision,
+            graph_input=resume_command,
+        )
+        return self._result(
+            ticket_id,
+            sanitized_input,
+            sanitized.critical_notice,
+        )
+
+    def human_action(
+        self,
+        ticket_id: str,
+        action: str,
+        edited_answer: str = "",
+        missing_fields: Optional[List[str]] = None,
+        action_id: Optional[str] = None,
+    ) -> OrchestrationResult:
+        if not isinstance(action, str) or action not in _HUMAN_COMMAND_TYPES:
+            raise ValueError("human action 非法")
+        ticket_id = _identifier(ticket_id, "ticket_id")
+        action_id = uuid.uuid4().hex if action_id is None else action_id
+        action_id = _identifier(action_id, "action_id", 120)
+        resume_payload = {"command_id": f"action:{action_id}", "action": action}
+
+        if action == "edit_send":
+            sanitized_answer = _validated_ingress(
+                self.ingress_guard.sanitize(edited_answer)
+            )
+            resume_payload["edited_answer"] = _safe_text(
+                sanitized_answer.sanitized_input, "edited_answer", 2_000
+            )
+        elif edited_answer != "":
+            raise ValueError("该 human action 不接受 edited_answer")
+
+        if action == "ask_user":
+            fields = _string_list(missing_fields, "missing_fields", 16)
+            if not fields or any(field not in _MISSING_FIELDS for field in fields):
+                raise ValueError("missing_fields 非法")
+            resume_payload["missing_fields"] = fields
+        elif missing_fields not in (None, []):
+            raise ValueError("该 human action 不接受 missing_fields")
+
+        command_id = _identifier(resume_payload["command_id"], "command_id")
+        fingerprint = _payload_fingerprint(
+            {
+                "kind": "human_action",
+                "ticket_id": ticket_id,
+                "payload": resume_payload,
+            }
+        )
+        decision = self.repository.begin_command(
+            ticket_id,
+            command_id,
+            _HUMAN_COMMAND_TYPES[action].value,
+            self.lease_seconds,
+            payload_fingerprint=fingerprint,
+            required_status=Status.ESCALATED.value,
+        )
+        duplicate = self._existing_decision_result(
+            decision,
+            ticket_id=ticket_id,
+            sanitized_input="",
+            user_notice="",
+        )
+        if duplicate is not None:
+            return duplicate
+
+        self._execute(
+            ticket_id=ticket_id,
+            command_id=command_id,
+            decision=decision,
+            graph_input=Command(resume=resume_payload),
+        )
+        return self._result(ticket_id, "", "")

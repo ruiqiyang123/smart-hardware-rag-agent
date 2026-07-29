@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -67,7 +68,9 @@ CATEGORY_VALUES = {
     "security_report",
     "other",
 }
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+_EMPTY_PAYLOAD_FINGERPRINT = "0" * 64
+_PAYLOAD_FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}", re.ASCII)
 
 
 SCHEMA = """
@@ -119,6 +122,11 @@ CREATE TABLE IF NOT EXISTS ticket_commands (
     command_type TEXT NOT NULL CHECK(command_type IN (
         'user_input', 'human_approve', 'human_edit_send', 'human_ask', 'human_reject'
     )),
+    payload_fingerprint TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'
+        CHECK(
+            length(payload_fingerprint) = 64
+            AND payload_fingerprint NOT GLOB '*[^0-9a-f]*'
+        ),
     status TEXT NOT NULL CHECK(status IN ('in_progress', 'completed', 'failed')),
     lease_expires_at TEXT NOT NULL CHECK(length(trim(lease_expires_at)) > 0),
     lease_version INTEGER NOT NULL DEFAULT 1
@@ -164,7 +172,7 @@ CREATE TABLE IF NOT EXISTS ticket_events (
     FOREIGN KEY(ticket_id, command_id)
         REFERENCES ticket_commands(ticket_id, command_id)
 );
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 """
 _SENSITIVE_METADATA_KEYS = {
     "pin",
@@ -277,6 +285,17 @@ class TicketRepository:
     def _nonnegative_integer(value: object, field_name: str) -> int:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"{field_name} 必须是非负整数")
+        return value
+
+    @staticmethod
+    def _payload_fingerprint(value: object) -> str:
+        if value is None:
+            return _EMPTY_PAYLOAD_FINGERPRINT
+        if (
+            not isinstance(value, str)
+            or _PAYLOAD_FINGERPRINT_PATTERN.fullmatch(value) is None
+        ):
+            raise ValueError("payload_fingerprint 必须是 64 位小写十六进制")
         return value
 
     @classmethod
@@ -552,6 +571,8 @@ class TicketRepository:
         command_id: str,
         command_type: str,
         lease_seconds: int,
+        payload_fingerprint: Optional[str] = None,
+        required_status: Optional[str] = None,
     ) -> CommandDecision:
         ticket_id = self._nonempty_text(ticket_id, "ticket_id")
         command_id = self._nonempty_text(command_id, "command_id")
@@ -561,6 +582,14 @@ class TicketRepository:
         except ValueError as error:
             raise ValueError("command_type 非法") from error
         lease_seconds = self._positive_integer(lease_seconds, "lease_seconds")
+        payload_fingerprint = self._payload_fingerprint(payload_fingerprint)
+        if required_status is not None:
+            required_status = self._enum_value(
+                required_status,
+                "required_status",
+                STATUS_VALUES,
+                allow_none=False,
+            )
         now = datetime.now(timezone.utc)
         lease = (now + timedelta(seconds=lease_seconds)).isoformat()
         stamp = now.isoformat()
@@ -572,9 +601,10 @@ class TicketRepository:
                 if (
                     existing["ticket_id"] != ticket_id
                     or existing["command_type"] != command_type
+                    or existing["payload_fingerprint"] != payload_fingerprint
                 ):
                     raise ValueError(
-                        "command_id 已绑定到不同的 ticket_id 或 command_type"
+                        "command_id 已绑定到不同的 ticket_id、command_type 或 payload"
                     )
                 version = int(existing["lease_version"])
                 if existing["status"] == "completed":
@@ -608,14 +638,26 @@ class TicketRepository:
             ).fetchone()
             if ticket is None:
                 raise ValueError(f"工单不存在: {ticket_id}")
+            if required_status is not None and ticket["status"] != required_status:
+                raise ValueError(
+                    f"command 仅允许在 {required_status} 状态创建"
+                )
             connection.execute(
                 """
                 INSERT INTO ticket_commands (
-                    command_id, ticket_id, command_type, status,
+                    command_id, ticket_id, command_type, payload_fingerprint, status,
                     lease_expires_at, lease_version, created_at, updated_at
-                ) VALUES (?, ?, ?, 'in_progress', ?, 1, ?, ?)
+                ) VALUES (?, ?, ?, ?, 'in_progress', ?, 1, ?, ?)
                 """,
-                (command_id, ticket_id, command_type, lease, stamp, stamp),
+                (
+                    command_id,
+                    ticket_id,
+                    command_type,
+                    payload_fingerprint,
+                    lease,
+                    stamp,
+                    stamp,
+                ),
             )
             connection.execute(
                 """
@@ -670,6 +712,102 @@ class TicketRepository:
             )
             if cursor.rowcount != 1:
                 raise ValueError("command 失败写入时 lease 已失效")
+
+    def fail_checkpoint_restore(
+        self,
+        ticket_id: str,
+        command_id: str,
+        lease_version: int,
+        expected_ticket_status: str,
+    ) -> CommandDecision:
+        """Atomically fail an unsafe checkpoint restore and escalate its ticket."""
+
+        ticket_id = self._nonempty_text(ticket_id, "ticket_id")
+        command_id = self._nonempty_text(command_id, "command_id")
+        lease_version = self._positive_integer(lease_version, "lease_version")
+        expected_ticket_status = self._enum_value(
+            expected_ticket_status,
+            "expected_ticket_status",
+            STATUS_VALUES,
+            allow_none=False,
+        )
+        error_code = "CHECKPOINT_MISMATCH"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            command = self._command_row(connection, command_id)
+            if command is None:
+                raise ValueError(f"command 不存在: {command_id}")
+            self._check_command_owner(
+                command,
+                ticket_id,
+                lease_version,
+                require_active=True,
+            )
+            ticket = connection.execute(
+                "SELECT status FROM tickets WHERE ticket_id = ?", (ticket_id,)
+            ).fetchone()
+            if ticket is None:
+                raise ValueError(f"工单不存在: {ticket_id}")
+            if ticket["status"] != expected_ticket_status:
+                raise ValueError("checkpoint 恢复失败提交时工单状态已变化")
+
+            stamp = self._now()
+            cursor = connection.execute(
+                """
+                UPDATE tickets
+                SET status = 'escalated', requires_human = 1,
+                    manual_gate_reason = 'checkpoint_restore_failed', updated_at = ?
+                WHERE ticket_id = ? AND status = ?
+                """,
+                (stamp, ticket_id, expected_ticket_status),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("checkpoint 恢复失败提交时工单状态已变化")
+
+            event = self._prepare_event(
+                {
+                    "step_index": 1,
+                    "node_name": "runtime",
+                    "event_type": "system.checkpoint_restore_failed",
+                    "from_status": expected_ticket_status,
+                    "to_status": "escalated",
+                    "summary": "checkpoint 与业务状态不一致，停止自动恢复",
+                    "metadata": {"error_code": error_code},
+                }
+            )
+            event_id = self._append_event_in_transaction(
+                connection,
+                ticket_id,
+                command_id,
+                lease_version,
+                event,
+            )
+            failure_stamp = self._now()
+            cursor = connection.execute(
+                """
+                UPDATE ticket_commands
+                SET status = 'failed', error_code = ?, updated_at = ?
+                WHERE command_id = ? AND ticket_id = ?
+                  AND status = 'in_progress' AND lease_version = ?
+                  AND lease_expires_at > ?
+                """,
+                (
+                    error_code,
+                    failure_stamp,
+                    command_id,
+                    ticket_id,
+                    lease_version,
+                    failure_stamp,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("checkpoint 恢复失败写入时 lease 已失效")
+            return CommandDecision(
+                CommandDisposition.FAILED,
+                lease_version,
+                "escalated",
+                event_id,
+            )
 
     def _append_event_in_transaction(
         self,
