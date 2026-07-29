@@ -42,6 +42,7 @@ from database.ticket_db import (
     CommandDisposition,
     CommandType,
 )
+from utils.logger_handler import logger
 
 
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}", re.ASCII)
@@ -108,6 +109,19 @@ _DB_EVENT_FIELDS = frozenset(
     }
 )
 
+ERROR_USER_MESSAGES = {
+    "TRIAGE_TIMEOUT": "自动分诊暂不可用，工单已保留并转人工。",
+    "TRIAGE_FAILURE": "自动分诊暂不可用，工单已保留并转人工。",
+    "DIAGNOSIS_NO_EVIDENCE": "未找到足够依据，未自动生成处理结论。",
+    "DIAGNOSIS_FAILURE": "自动诊断暂不可用，工单已保留并转人工。",
+    "TOOL_FAILURE": "事实查询失败，工单已保留并转人工。",
+    "REVIEW_FAILURE": "安全复核失败，草稿未发送。",
+    "CHECKPOINT_MISMATCH": "恢复状态异常，已停止自动执行。",
+    "GRAPH_TIMEOUT": "自动流程超时，未发送草稿，可用同一请求确认结果。",
+    "GRAPH_EXECUTION_FAILED": "自动流程执行失败，草稿未发送。",
+    "PERSISTENCE_FAILURE": "结果状态暂时无法确认，未发送草稿，可用同一请求确认结果。",
+}
+
 
 @dataclass(frozen=True)
 class OrchestrationResult:
@@ -131,6 +145,10 @@ class CommandInProgressError(RuntimeError):
 
 class CommandFailedError(RuntimeError):
     """The same idempotent command already reached a failed terminal state."""
+
+
+class PersistenceFailureError(RuntimeError):
+    """Durable command state could not be safely confirmed."""
 
 
 @dataclass(frozen=True, init=False, slots=True)
@@ -843,6 +861,23 @@ class SupportOrchestrator:
         except Exception:
             return False
 
+    @staticmethod
+    def _log_failure(
+        ticket_id: str,
+        node_name: str,
+        error_code: str,
+        error: BaseException,
+    ) -> None:
+        """Log stable metadata without request input or exception details."""
+
+        logger.error(
+            "[orchestration] error_code=%s ticket_id=%s node_name=%s exception_type=%s",
+            error_code,
+            ticket_id,
+            node_name,
+            type(error).__name__,
+        )
+
     def _execute(
         self,
         *,
@@ -870,6 +905,48 @@ class SupportOrchestrator:
                 )
             else:
                 raise ValueError("command disposition 不可执行")
+        except TimeoutError as error:
+            self._log_failure(
+                ticket_id, "runtime", "GRAPH_TIMEOUT", error
+            )
+            try:
+                self.repository.expire_command_lease(
+                    ticket_id, command_id, decision.lease_version
+                )
+            except Exception as persistence_error:
+                self._log_failure(
+                    ticket_id,
+                    "runtime",
+                    "PERSISTENCE_FAILURE",
+                    persistence_error,
+                )
+                raise PersistenceFailureError(
+                    ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
+                ) from None
+            raise TimeoutError(ERROR_USER_MESSAGES["GRAPH_TIMEOUT"]) from None
+        except CheckpointRestoreError as error:
+            self._log_failure(
+                ticket_id, "runtime", "CHECKPOINT_MISMATCH", error
+            )
+            raise CheckpointRestoreError("CHECKPOINT_MISMATCH") from None
+        except Exception as error:
+            self._log_failure(
+                ticket_id, "runtime", "GRAPH_EXECUTION_FAILED", error
+            )
+            failed = self._fail_command_safely(
+                command_id,
+                decision.lease_version,
+                "GRAPH_EXECUTION_FAILED",
+            )
+            if failed:
+                raise CommandFailedError(
+                    ERROR_USER_MESSAGES["GRAPH_EXECUTION_FAILED"]
+                ) from None
+            raise PersistenceFailureError(
+                ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
+            ) from None
+
+        try:
             self._persist_graph_result(
                 ticket_id,
                 command_id,
@@ -879,22 +956,24 @@ class SupportOrchestrator:
                 human_action,
                 expected_final_answer,
             )
-        except TimeoutError:
-            self.repository.expire_command_lease(
-                ticket_id, command_id, decision.lease_version
-            )
-            raise
-        except CheckpointRestoreError:
+        except PersistenceFailureError:
             raise
         except Exception as error:
+            self._log_failure(
+                ticket_id, "runtime", "GRAPH_EXECUTION_FAILED", error
+            )
             failed = self._fail_command_safely(
                 command_id,
                 decision.lease_version,
                 "GRAPH_EXECUTION_FAILED",
             )
             if failed:
-                raise CommandFailedError("command 执行失败") from error
-            raise
+                raise CommandFailedError(
+                    ERROR_USER_MESSAGES["GRAPH_EXECUTION_FAILED"]
+                ) from None
+            raise PersistenceFailureError(
+                ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
+            ) from None
 
     def _persist_graph_result(
         self,
@@ -991,13 +1070,21 @@ class SupportOrchestrator:
             _status(ticket.get("status")), final_status, events
         )
 
-        self.repository.commit_command_result(
-            ticket_id=ticket_id,
-            command_id=command_id,
-            lease_version=lease_version,
-            updates=updates,
-            events=events,
-        )
+        try:
+            self.repository.commit_command_result(
+                ticket_id=ticket_id,
+                command_id=command_id,
+                lease_version=lease_version,
+                updates=updates,
+                events=events,
+            )
+        except Exception as error:
+            self._log_failure(
+                ticket_id, "runtime", "PERSISTENCE_FAILURE", error
+            )
+            raise PersistenceFailureError(
+                ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
+            ) from None
 
     @staticmethod
     def _validate_runtime_event_chain(
@@ -1333,6 +1420,9 @@ class SupportOrchestrator:
         user_notice = _safe_text(
             user_notice, "user_notice", 2_000, allow_empty=True
         )
+        error_code = checkpoint.get("last_error")
+        if not user_notice and isinstance(error_code, str):
+            user_notice = ERROR_USER_MESSAGES.get(error_code, "")
         return OrchestrationResult(
             ticket_id=_identifier(ticket_id, "ticket_id"),
             status=result_status,

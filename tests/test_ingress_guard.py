@@ -405,6 +405,74 @@ class WalletSafetyGuardTest(unittest.TestCase):
             self.assertNotIn(MNEMONIC_WORDS, ticket["sanitized_input"])
             self.assertNotIn(MNEMONIC_WORDS, str(caught.exception))
 
+    def test_fixed_secret_is_absent_from_all_recoverable_surfaces(self):
+        from agent.orchestration.graph import build_support_graph, sqlite_checkpointer
+        from agent.orchestration.runtime import SupportOrchestrator
+        from agent.security.trusted_sources import TrustedSourcePolicy
+
+        def broken_triage(_state):
+            raise RuntimeError(f"provider body contained {MNEMONIC_WORDS}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            ticket_db_path = Path(directory) / "tickets.db"
+            checkpoint_db_path = Path(directory) / "checkpoints.db"
+            repository = TicketRepository(ticket_db_path)
+            trusted_sources = TrustedSourcePolicy(
+                self.policy["official_domains"], []
+            )
+            final_guard = PolicyGuard(
+                self.policy, trusted_source_policy=trusted_sources
+            )
+            saver = sqlite_checkpointer(checkpoint_db_path)
+            graph = build_support_graph(
+                triage_node=broken_triage,
+                diagnosis_node=lambda _state: {},
+                review_node=lambda _state: {},
+                policy_guard=final_guard,
+                checkpointer=saver,
+            )
+            runtime = SupportOrchestrator(
+                repository=repository,
+                graph=graph,
+                ingress_guard=self.ingress,
+                recursion_limit=16,
+                lease_seconds=130,
+                graph_timeout_seconds=120,
+                trusted_source_policy=trusted_sources,
+                final_policy_guard=final_guard,
+            )
+            with self.assertLogs("agent", level="ERROR") as captured:
+                secret_result = runtime.submit(
+                    f"助记词是 {MNEMONIC_WORDS}",
+                    "user-1",
+                    request_id="secret-surface",
+                )
+                fault_result = runtime.submit(
+                    "蓝牙连接失败",
+                    "user-1",
+                    request_id="secret-exception-body",
+                )
+            streamlit_messages = [
+                {"role": "user", "content": secret_result.sanitized_input},
+                {
+                    "role": "assistant",
+                    "content": secret_result.user_notice
+                    or secret_result.final_answer,
+                },
+                {"role": "user", "content": fault_result.sanitized_input},
+                {
+                    "role": "assistant",
+                    "content": fault_result.user_notice or fault_result.final_answer,
+                },
+            ]
+            saver.close()
+
+            secret_bytes = MNEMONIC_WORDS.encode("utf-8")
+            self.assertNotIn(secret_bytes, ticket_db_path.read_bytes())
+            self.assertNotIn(secret_bytes, checkpoint_db_path.read_bytes())
+            self.assertNotIn(MNEMONIC_WORDS, str(streamlit_messages))
+            self.assertNotIn(MNEMONIC_WORDS, "\n".join(captured.output))
+
 
 if __name__ == "__main__":
     unittest.main()

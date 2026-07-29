@@ -397,6 +397,57 @@ class HumanInLoopTest(unittest.TestCase):
         self.assertEqual(vetoed.get("final_answer", ""), "")
         self.assertIn("__interrupt__", vetoed)
 
+    def test_node_fault_codes_distinguish_timeout_no_evidence_and_tool_failure(self):
+        from agent.orchestration.graph import build_support_graph
+
+        def timed_out_triage(_state):
+            raise TimeoutError("private provider request body")
+
+        triage_timeout = build_support_graph(
+            triage_node=timed_out_triage,
+            diagnosis_node=_diagnosis,
+            review_node=_review,
+            policy_guard=lambda _text, _citations: True,
+            checkpointer=MemorySaver(),
+        ).invoke(
+            _initial_state(),
+            {"configurable": {"thread_id": "triage-timeout"}},
+        )
+        self.assertEqual(triage_timeout["status"], "escalated")
+        self.assertEqual(triage_timeout["last_error"], "TRIAGE_TIMEOUT")
+        self.assertEqual(triage_timeout.get("final_answer", ""), "")
+        self.assertNotIn("private provider", str(triage_timeout))
+
+        for name, tool_errors, error_code in (
+            ("no-evidence", ["no_evidence"], "DIAGNOSIS_NO_EVIDENCE"),
+            (
+                "tool-failure",
+                ["tool_failure:knowledge_search"],
+                "TOOL_FAILURE",
+            ),
+        ):
+            with self.subTest(name=name):
+                def failed_diagnosis(_state, tool_errors=tool_errors):
+                    result = _diagnosis(_state)
+                    # A dependency must not smuggle a tool error through a
+                    # superficially valid draft outcome.
+                    result["tool_errors"] = tool_errors
+                    return result
+
+                failed = build_support_graph(
+                    triage_node=_triage,
+                    diagnosis_node=failed_diagnosis,
+                    review_node=_review,
+                    policy_guard=lambda _text, _citations: True,
+                    checkpointer=MemorySaver(),
+                ).invoke(
+                    _initial_state(),
+                    {"configurable": {"thread_id": name}},
+                )
+                self.assertEqual(failed["status"], "escalated")
+                self.assertEqual(failed["last_error"], error_code)
+                self.assertEqual(failed.get("final_answer", ""), "")
+
     def test_sqlite_checkpoint_recovers_interrupt_after_rebuild(self):
         from agent.orchestration.graph import build_support_graph, sqlite_checkpointer
 

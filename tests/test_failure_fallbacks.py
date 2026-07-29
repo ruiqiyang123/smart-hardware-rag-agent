@@ -19,12 +19,14 @@ from agent.orchestration.runtime import (
     CommandInProgressError,
     NO_CHECKPOINT_WRITES,
     LeaseFencedCheckpointer,
+    PersistenceFailureError,
     SupportOrchestrator,
 )
 from agent.orchestration.state import TicketState
 from agent.policies.security import IngressGuard, PolicyGuard
 from agent.security.trusted_sources import TrustedSourcePolicy
 from database.ticket_db import TicketRepository
+from tests.fault_harness import run_fault_case
 from utils.ui_command_state import (
     ACTION_ID_SESSION_PREFIX,
     REQUEST_ID_SESSION_KEY,
@@ -169,6 +171,25 @@ class FailureFallbackTest(unittest.TestCase):
         }
         values.update(overrides)
         return SupportOrchestrator(**values)
+
+    def test_reviewer_failure_never_persists_final_answer(self):
+        result = run_fault_case("reviewer_validation_error")
+        self.assertEqual(result.status, "escalated")
+        self.assertEqual(result.final_answer, "")
+
+    def test_rag_no_evidence_escalates(self):
+        result = run_fault_case("rag_empty")
+        self.assertEqual(result.status, "escalated")
+
+    def test_fault_matrix_expired_command_only_resumes_from_checkpoint(self):
+        result = run_fault_case("expired_command_lease")
+        self.assertEqual(result.graph_start_count, 0)
+        self.assertEqual(result.graph_resume_count, 1)
+
+    def test_fault_matrix_checkpoint_mismatch_fails_closed(self):
+        result = run_fault_case("checkpoint_status_mismatch")
+        self.assertEqual(result.status, "escalated")
+        self.assertIn("system.checkpoint_restore_failed", result.event_types)
 
     def seed_paused_ticket(self, status):
         request_id = f"seed-{status}"
@@ -527,13 +548,15 @@ class FailureFallbackTest(unittest.TestCase):
         self.assertEqual(graph.calls, 1)
 
     def test_confirmed_command_failure_raises_typed_error_and_does_not_rerun(self):
-        graph = FakeGraph([ValueError("provider detail")])
+        private_body = "provider detail must not escape"
+        graph = FakeGraph([ValueError(private_body)])
         runtime = self.runtime(graph)
 
         with self.assertRaises(CommandFailedError) as raised:
             runtime.submit("蓝牙连不上", "1001", request_id="req-failed")
 
-        self.assertIsInstance(raised.exception.__cause__, ValueError)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertNotIn(private_body, str(raised.exception))
         self.assertEqual(
             self.command_row("request:req-failed")["status"], "failed"
         )
@@ -542,20 +565,60 @@ class FailureFallbackTest(unittest.TestCase):
         self.assertIsNone(duplicate.exception.__cause__)
         self.assertEqual(graph.calls, 1)
 
-    def test_unconfirmed_failure_preserves_original_error(self):
-        graph = FakeGraph([ValueError("provider detail")])
+    def test_unconfirmed_failure_uses_stable_error_without_recursive_write(self):
+        private_body = "provider detail must not escape"
+        graph = FakeGraph([ValueError(private_body)])
         runtime = self.runtime(graph)
 
         with patch.object(
             self.repo,
             "fail_command",
             side_effect=RuntimeError("database status unknown"),
-        ), self.assertRaises(ValueError) as raised:
+        ) as fail_command, self.assertRaises(PersistenceFailureError) as raised:
             runtime.submit("蓝牙连不上", "1001", request_id="req-uncertain")
 
-        self.assertNotIsInstance(raised.exception, CommandFailedError)
+        fail_command.assert_called_once()
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertNotIn(private_body, str(raised.exception))
+        self.assertNotIn("database status unknown", str(raised.exception))
         self.assertEqual(
             self.command_row("request:req-uncertain")["status"], "in_progress"
+        )
+
+    def test_repository_commit_failure_stops_without_recursive_status_write(self):
+        graph = FakeGraph()
+        runtime = self.runtime(graph)
+        private_body = "database response contained private request body"
+
+        with patch.object(
+            self.repo,
+            "commit_command_result",
+            side_effect=RuntimeError(private_body),
+        ) as commit, patch.object(
+            self.repo, "fail_command", wraps=self.repo.fail_command
+        ) as fail_command, self.assertLogs(
+            "agent", level="ERROR"
+        ) as captured, self.assertRaises(
+            PersistenceFailureError
+        ) as raised:
+            runtime.submit(
+                "蓝牙连不上", "1001", request_id="commit-status-unknown"
+            )
+
+        commit.assert_called_once()
+        fail_command.assert_not_called()
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertNotIn(private_body, str(raised.exception))
+        self.assertNotIn(private_body, "\n".join(captured.output))
+        ticket_id = self.repo.list_tickets()[0]["ticket_id"]
+        self.assertEqual(
+            captured.records[-1].getMessage(),
+            "[orchestration] error_code=PERSISTENCE_FAILURE "
+            f"ticket_id={ticket_id} node_name=runtime exception_type=RuntimeError",
+        )
+        self.assertEqual(
+            self.command_row("request:commit-status-unknown")["status"],
+            "in_progress",
         )
 
     def test_runtime_serializes_distinct_actions_for_one_ticket(self):
@@ -1061,7 +1124,8 @@ class FailureFallbackTest(unittest.TestCase):
             self.runtime(graph).submit(
                 "连接失败", "1001", request_id="unsafe-final-answer"
             )
-        self.assertIn("Policy Guard", str(raised.exception.__cause__))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(str(raised.exception), "自动流程执行失败，草稿未发送。")
         ticket = self.repo.list_tickets()[0]
         self.assertEqual(ticket["status"], "new")
         self.assertIsNone(ticket["final_answer"])
@@ -1144,7 +1208,10 @@ class FailureFallbackTest(unittest.TestCase):
                         runtime.submit(
                             "连接失败", "1001", request_id=f"citation-{index}"
                         )
-                    self.assertIn("citation", str(raised.exception.__cause__))
+                    self.assertIsNone(raised.exception.__cause__)
+                    self.assertEqual(
+                        str(raised.exception), "自动流程执行失败，草稿未发送。"
+                    )
                     self.assertEqual(repo.list_tickets()[0]["status"], "new")
 
     def test_runtime_rejects_illegal_graph_transition_before_commit(self):
@@ -1162,7 +1229,8 @@ class FailureFallbackTest(unittest.TestCase):
             self.runtime(FakeGraph([illegal])).submit(
                 "连接失败", "1001", request_id="illegal-transition"
             )
-        self.assertIn("非法状态转移", str(raised.exception.__cause__))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(str(raised.exception), "自动流程执行失败，草稿未发送。")
         self.assertEqual(self.repo.list_tickets()[0]["status"], "new")
 
     def test_human_ask_or_reject_cannot_forge_resolved(self):
@@ -1225,7 +1293,10 @@ class FailureFallbackTest(unittest.TestCase):
                             action_id=f"forged-{action}",
                             **kwargs,
                         )
-                    self.assertIn("不得 resolved", str(raised.exception.__cause__))
+                    self.assertIsNone(raised.exception.__cause__)
+                    self.assertEqual(
+                        str(raised.exception), "自动流程执行失败，草稿未发送。"
+                    )
                     self.assertEqual(
                         repo.get_ticket(ticket["ticket_id"])["status"], "escalated"
                     )
@@ -1291,7 +1362,10 @@ class FailureFallbackTest(unittest.TestCase):
                             action_id=f"replace-{action}",
                             **kwargs,
                         )
-                    self.assertIn("人工审核文本", str(raised.exception.__cause__))
+                    self.assertIsNone(raised.exception.__cause__)
+                    self.assertEqual(
+                        str(raised.exception), "自动流程执行失败，草稿未发送。"
+                    )
                     stored = repo.get_ticket(ticket["ticket_id"])
                     self.assertEqual(stored["status"], "escalated")
                     self.assertIsNone(stored["final_answer"])
@@ -1387,7 +1461,8 @@ class FailureFallbackTest(unittest.TestCase):
             self.runtime(graph).submit(
                 "连接失败", "1001", request_id="untrusted-citation"
             )
-        self.assertIn("不可信", str(raised.exception.__cause__))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(str(raised.exception), "自动流程执行失败，草稿未发送。")
         self.assertNotIn(b"evil.example", self.db_path.read_bytes())
 
     def test_database_rejects_non_hex_payload_fingerprint(self):
@@ -1421,11 +1496,19 @@ class FailureFallbackTest(unittest.TestCase):
 
         with patch(
             "agent.orchestration.runtime.invoke_with_policy", side_effect=bounded
-        ), self.assertRaises(TimeoutError):
+        ), self.assertLogs("agent", level="ERROR") as captured, self.assertRaises(
+            TimeoutError
+        ) as raised:
             runtime.submit("连接失败", "1001", request_id="timeout-budget")
 
         ticket = self.repo.list_tickets()[0]
         self.assertEqual(observed, [(7.5, 0)])
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(
+            str(raised.exception),
+            "自动流程超时，未发送草稿，可用同一请求确认结果。",
+        )
+        self.assertNotIn("provider timeout", "\n".join(captured.output))
         self.assertIsNone(ticket["final_answer"])
         self.assertIsNone(ticket["draft_answer"])
 

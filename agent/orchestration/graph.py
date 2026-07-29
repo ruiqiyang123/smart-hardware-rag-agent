@@ -41,6 +41,7 @@ from agent.orchestration.state import (
 )
 from agent.security.secrets import contains_unredacted_secret
 from agent.security.trusted_sources import TrustedSourcePolicy
+from utils.logger_handler import logger
 
 
 _ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}", re.ASCII)
@@ -413,6 +414,26 @@ def _fail_closed(state: Mapping[str, object], node_name: str, code: str) -> dict
     )
 
 
+def _log_node_failure(
+    state: Mapping[str, object],
+    node_name: str,
+    error_code: str,
+    error: BaseException,
+) -> None:
+    """Log only stable orchestration metadata, never dependency error text."""
+
+    ticket_id = state.get("ticket_id")
+    if not isinstance(ticket_id, str) or _ID_PATTERN.fullmatch(ticket_id) is None:
+        ticket_id = "invalid_ticket_id"
+    logger.error(
+        "[orchestration] error_code=%s ticket_id=%s node_name=%s exception_type=%s",
+        error_code,
+        ticket_id,
+        node_name,
+        type(error).__name__,
+    )
+
+
 def _entry(state: TicketState) -> dict:
     _identifier(state.get("ticket_id"), "ticket_id")
     _identifier(state.get("command_id"), "command_id")
@@ -478,8 +499,14 @@ def _triage_node(dependency: Callable[[dict], object]) -> Callable[[TicketState]
                 event_type="triage_completed",
                 summary="分诊已完成",
             )
-        except Exception:
-            return _fail_closed(state, "triage", "TRIAGE_FAILURE")
+        except Exception as error:
+            error_code = (
+                "TRIAGE_TIMEOUT"
+                if isinstance(error, TimeoutError)
+                else "TRIAGE_FAILURE"
+            )
+            _log_node_failure(state, "triage", error_code, error)
+            return _fail_closed(state, "triage", error_code)
 
     return run
 
@@ -508,6 +535,20 @@ def _diagnosis_node(
             raw = _validated_diagnosis_update(
                 dependency(copy.deepcopy(dict(state))), trusted_sources
             )
+            tool_errors = raw.get("tool_errors", [])
+            if "no_evidence" in tool_errors:
+                error_code = "DIAGNOSIS_NO_EVIDENCE"
+            elif tool_errors:
+                error_code = "TOOL_FAILURE"
+            else:
+                error_code = ""
+            if error_code:
+                _log_node_failure(
+                    state, "diagnosis", error_code, RuntimeError(error_code)
+                )
+                failed = _fail_closed(state, "diagnosis", error_code)
+                failed["tool_errors"] = list(tool_errors)
+                return failed
             outcome = raw.get("outcome")
             outcomes = {
                 "draft": Status.REVIEWING,
@@ -544,7 +585,10 @@ def _diagnosis_node(
                 event_type="diagnosis_completed",
                 summary="诊断已完成",
             )
-        except Exception:
+        except Exception as error:
+            _log_node_failure(
+                state, "diagnosis", "DIAGNOSIS_FAILURE", error
+            )
             return _fail_closed(state, "diagnosis", "DIAGNOSIS_FAILURE")
 
     return run
@@ -582,7 +626,8 @@ def _review_node(dependency: Callable[[dict], object]) -> Callable[[TicketState]
                 event_type="review_completed",
                 summary="独立审核已完成",
             )
-        except Exception:
+        except Exception as error:
+            _log_node_failure(state, "review", "REVIEW_FAILURE", error)
             failed = _fail_closed(state, "review", "REVIEW_FAILURE")
             failed.update(
                 {
