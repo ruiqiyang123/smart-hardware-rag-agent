@@ -82,14 +82,12 @@ def _copy_json_value(
 ) -> JSONValue:
     if depth > _MAX_JSON_DEPTH:
         raise ValueError("metadata 嵌套过深")
-    if isinstance(value, TransactionHash):
-        if allow_serialized_transaction_hash or path != ("transaction_hash",):
-            raise ValueError(
-                "TransactionHash 只能在事件入口的顶层 transaction_hash 使用"
-            )
-        return value.value
-    if isinstance(value, str):
-        if path == ("transaction_hash",):
+    if path == ("transaction_hash",):
+        if isinstance(value, TransactionHash):
+            if allow_serialized_transaction_hash:
+                raise ValueError("检查点事件不得包含 TransactionHash 对象")
+            return value.value
+        if isinstance(value, str):
             if not allow_serialized_transaction_hash:
                 raise ValueError(
                     "transaction_hash 必须使用显式 TransactionHash 类型"
@@ -98,6 +96,12 @@ def _copy_json_value(
                 return TransactionHash(value).value
             except ValueError as error:
                 raise ValueError("transaction_hash 非法") from error
+        raise ValueError("transaction_hash 非法")
+    if isinstance(value, TransactionHash):
+        raise ValueError(
+            "TransactionHash 只能在事件入口的顶层 transaction_hash 使用"
+        )
+    if isinstance(value, str):
         if path and path[-1].lower() in _SENSITIVE_METADATA_KEYS:
             if not is_fully_redacted(value):
                 raise ValueError("事件包含未脱敏的敏感信息")
@@ -213,13 +217,15 @@ def make_event(
     )
 
 
-def to_repository_event(event: Mapping[str, object]) -> RepositoryEvent:
+def to_repository_event(
+    event: Mapping[str, object],
+    transaction_hash: Optional[TransactionHash] = None,
+) -> RepositoryEvent:
     """Validate a checkpoint event and adapt it to repository-only types.
 
-    This is a trusted internal boundary: callers must supply the output of
-    :func:`make_event`, optionally after a JSON checkpoint round trip. The
-    serialized top-level transaction hash is restored to ``TransactionHash``
-    only after the complete event contract has been revalidated.
+    Callers must supply the output of :func:`make_event`, optionally after a
+    JSON checkpoint round trip. A serialized transaction hash is restored only
+    when the caller also presents the same explicitly validated value.
     """
 
     if not isinstance(event, Mapping) or set(event) != _EVENT_FIELDS:
@@ -237,9 +243,15 @@ def to_repository_event(event: Mapping[str, object]) -> RepositoryEvent:
     )
     repository_metadata: Dict[str, object] = dict(normalized["metadata"])
     if "transaction_hash" in repository_metadata:
-        repository_metadata["transaction_hash"] = TransactionHash(
-            cast(str, repository_metadata["transaction_hash"])
-        )
+        serialized_hash = cast(str, repository_metadata["transaction_hash"])
+        if (
+            not isinstance(transaction_hash, TransactionHash)
+            or transaction_hash.value != serialized_hash
+        ):
+            raise ValueError("transaction_hash 缺少匹配的显式能力值")
+        repository_metadata["transaction_hash"] = transaction_hash
+    elif transaction_hash is not None:
+        raise ValueError("事件未声明 transaction_hash")
     return {
         "step_index": normalized["step_index"],
         "node_name": normalized["node_name"],

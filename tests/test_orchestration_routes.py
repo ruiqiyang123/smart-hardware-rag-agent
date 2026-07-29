@@ -1,13 +1,22 @@
 import math
 import tempfile
+import threading
 import time
+import traceback
 import unittest
 from pathlib import Path
 
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from agent.orchestration.events import make_event, to_repository_event
-from agent.orchestration.invoke import OutputValidationError, invoke_with_policy
+from agent.orchestration.invoke import (
+    _EXECUTION_CAPACITY,
+    _active_execution_count,
+    _active_execution_threads,
+    ExecutionCapacityError,
+    OutputValidationError,
+    invoke_with_policy,
+)
 from agent.orchestration.routes import (
     ALLOWED_TRANSITIONS,
     IllegalRoute,
@@ -198,6 +207,8 @@ class OrchestrationRoutesTest(unittest.TestCase):
             {"status": "new"},
             {"status": "reviewing", "risk_level": "unknown"},
             {"status": "reviewing", "requires_human": "yes"},
+            {"status": "new", "risk_level": "high"},
+            {"status": "resolved", "requires_human": True},
         ):
             with self.subTest(state_keys=sorted(state)), self.assertRaises(
                 IllegalRoute
@@ -271,6 +282,8 @@ class OrchestrationRoutesTest(unittest.TestCase):
             {**base, "revision_count": True},
             {**base, "requires_human": 0},
             {**base, "risk_level": "unknown"},
+            {**base, "status": "new", "risk_level": "high"},
+            {**base, "status": "resolved", "requires_human": True},
         )
         for index, state in enumerate(cases):
             with self.subTest(case=index), self.assertRaises(IllegalRoute):
@@ -391,6 +404,10 @@ class OrchestrationEventTest(unittest.TestCase):
         for metadata in (
             {"transaction_hash": TRANSACTION_HASH},
             {"transaction_hash": "not-a-transaction-hash"},
+            {"transaction_hash": None},
+            {"transaction_hash": 1},
+            {"transaction_hash": False},
+            {"transaction_hash": []},
             {"nested": {"transaction_hash": TransactionHash(TRANSACTION_HASH)}},
             {"hashes": [TransactionHash(TRANSACTION_HASH)]},
         ):
@@ -446,7 +463,8 @@ class OrchestrationEventTest(unittest.TestCase):
         restored = serializer.loads_typed(serializer.dumps_typed(event))
 
         self.assertEqual(restored["metadata"]["transaction_hash"], TRANSACTION_HASH)
-        payload = to_repository_event(restored)
+        transaction_hash = TransactionHash(TRANSACTION_HASH)
+        payload = to_repository_event(restored, transaction_hash=transaction_hash)
         self.assertIsInstance(
             payload["metadata"]["transaction_hash"], TransactionHash
         )
@@ -467,6 +485,25 @@ class OrchestrationEventTest(unittest.TestCase):
             )
 
         self.assertGreater(event_id, 0)
+
+    def test_repository_adapter_requires_matching_transaction_hash_capability(self):
+        transaction_hash = TransactionHash(TRANSACTION_HASH)
+        event = self._event(metadata={"transaction_hash": transaction_hash})
+        altered_hash = TransactionHash("0x" + "b" * 64)
+
+        with self.assertRaises(ValueError):
+            to_repository_event(event)
+        with self.assertRaises(ValueError):
+            to_repository_event(event, transaction_hash=altered_hash)
+        with self.assertRaises(ValueError):
+            to_repository_event(self._event(), transaction_hash=transaction_hash)
+        with self.assertRaises(ValueError):
+            to_repository_event(event, transaction_hash=TRANSACTION_HASH)
+
+        tampered = dict(event)
+        tampered["metadata"] = {"transaction_hash": altered_hash.value}
+        with self.assertRaises(ValueError):
+            to_repository_event(tampered, transaction_hash=transaction_hash)
 
     def test_repository_adapter_revalidates_tampered_events(self):
         safe_event = self._event()
@@ -504,7 +541,7 @@ class InvokeWithPolicyTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_retries_only_declared_retryable_errors(self):
-        retryable_types = (TimeoutError, ValueError, TypeError, OutputValidationError)
+        retryable_types = (ValueError, TypeError, OutputValidationError)
         for error_type in retryable_types:
             calls = []
 
@@ -531,9 +568,15 @@ class InvokeWithPolicyTest(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertNotIn("payload", str(captured.exception))
         self.assertNotIn("123456", str(captured.exception))
-        self.assertIsInstance(captured.exception.__cause__, ValueError)
-        self.assertNotIn("payload", str(captured.exception.__cause__))
-        self.assertNotIn("123456", str(captured.exception.__cause__))
+        self.assertIsNone(captured.exception.__cause__)
+        rendered = "".join(
+            traceback.format_exception(
+                type(captured.exception),
+                captured.exception,
+                captured.exception.__traceback__,
+            )
+        )
+        self.assertNotIn("private payload 123456", rendered)
 
     def test_non_retryable_exception_is_not_retried_and_is_sanitized(self):
         calls = []
@@ -548,24 +591,105 @@ class InvokeWithPolicyTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertNotIn("payload", str(captured.exception))
         self.assertNotIn("123456", str(captured.exception))
-        self.assertIsInstance(captured.exception.__cause__, RuntimeError)
-        self.assertNotIn("payload", str(captured.exception.__cause__))
-        self.assertNotIn("123456", str(captured.exception.__cause__))
+        self.assertIsNone(captured.exception.__cause__)
+        self.assertNotIn("secret", repr(vars(captured.exception)))
+        rendered = "".join(
+            traceback.format_exception(
+                type(captured.exception),
+                captured.exception,
+                captured.exception.__traceback__,
+            )
+        )
+        self.assertNotIn("secret payload 123456", rendered)
 
-    def test_timeout_returns_quickly_and_retries_exactly(self):
+    def test_custom_exception_is_recreated_without_original_object_or_traceback(self):
+        secret_value = "CUSTOM_PAYLOAD_8675309"
+
+        class PayloadError(Exception):
+            def __init__(self, payload):
+                self.payload = payload
+                super().__init__(payload)
+
+        def fail_in_worker():
+            raise PayloadError(secret_value)
+
+        with self.assertRaises(PayloadError) as captured:
+            invoke_with_policy(fail_in_worker, 0.1, 0)
+
+        error = captured.exception
+        self.assertIsNone(error.__cause__)
+        self.assertIsNone(error.__context__)
+        self.assertNotIn(secret_value, str(error))
+        self.assertNotIn(secret_value, repr(vars(error)))
+        frames = traceback.extract_tb(error.__traceback__)
+        self.assertNotIn("fail_in_worker", {frame.name for frame in frames})
+
+    def test_completed_timeout_error_is_not_retried(self):
         calls = []
+
+        def timeout_from_worker():
+            calls.append(1)
+            raise TimeoutError("upstream timeout payload")
+
+        with self.assertRaises(TimeoutError) as captured:
+            invoke_with_policy(timeout_from_worker, 0.1, 4)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(captured.exception.__cause__)
+        self.assertNotIn("payload", str(captured.exception))
+
+    def test_timeout_returns_quickly_and_never_retries(self):
+        calls = []
+        started = threading.Event()
+        release = threading.Event()
 
         def slow():
             calls.append(1)
-            time.sleep(0.05)
+            started.set()
+            release.wait()
 
-        started = time.monotonic()
-        with self.assertRaises(TimeoutError):
-            invoke_with_policy(slow, 0.002, 1)
-        elapsed = time.monotonic() - started
+        before = time.monotonic()
+        try:
+            with self.assertRaises(TimeoutError) as captured:
+                invoke_with_policy(slow, 0.01, 3)
+            elapsed = time.monotonic() - before
 
-        self.assertEqual(len(calls), 2)
-        self.assertLess(elapsed, 0.04)
+            self.assertTrue(started.is_set())
+            self.assertEqual(len(calls), 1)
+            self.assertLess(elapsed, 0.08)
+            self.assertIsNone(captured.exception.__cause__)
+        finally:
+            release.set()
+            deadline = time.monotonic() + 1
+            while _active_execution_count() and time.monotonic() < deadline:
+                time.sleep(0.005)
+
+    def test_worker_capacity_is_bounded_daemon_and_fails_fast(self):
+        release = threading.Event()
+
+        def blocked():
+            release.wait()
+
+        try:
+            for _ in range(_EXECUTION_CAPACITY):
+                with self.assertRaises(TimeoutError):
+                    invoke_with_policy(blocked, 0.01, 9)
+
+            self.assertEqual(_active_execution_count(), _EXECUTION_CAPACITY)
+            active_threads = _active_execution_threads()
+            self.assertEqual(len(active_threads), _EXECUTION_CAPACITY)
+            self.assertTrue(all(thread.daemon for thread in active_threads))
+            before = time.monotonic()
+            with self.assertRaises(ExecutionCapacityError) as captured:
+                invoke_with_policy(lambda: "never submitted", 1, 0)
+            self.assertLess(time.monotonic() - before, 0.05)
+            self.assertIsNone(captured.exception.__cause__)
+        finally:
+            release.set()
+            deadline = time.monotonic() + 1
+            while _active_execution_count() and time.monotonic() < deadline:
+                time.sleep(0.005)
+        self.assertEqual(_active_execution_count(), 0)
 
     def test_rejects_invalid_policy_parameters(self):
         invalid_timeouts = (0, -1, True, "1", math.nan, math.inf)

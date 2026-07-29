@@ -187,9 +187,6 @@ def route_after_diagnosis(state: object) -> str:
     status = _status(_required(values, "status"))
     risk_level = _optional_risk(values)
     requires_human = _optional_bool(values, "requires_human")
-
-    if _human_required(risk_level, requires_human):
-        return "human_review"
     routes = {
         Status.PENDING_USER: "await_user",
         Status.REVIEWING: "review",
@@ -197,11 +194,16 @@ def route_after_diagnosis(state: object) -> str:
     }
     if status not in routes:
         raise IllegalRoute("诊断后的状态非法")
+    if _human_required(risk_level, requires_human):
+        return "human_review"
     return routes[status]
 
 
 def route_after_review(state: object) -> str:
     values = _state_mapping(state)
+    status = _status(values["status"]) if "status" in values else None
+    if status not in {None, Status.REVIEWING, Status.ESCALATED}:
+        raise IllegalRoute("审核后的状态非法")
     decision = _required(values, "review_decision")
     if not isinstance(decision, str) or decision not in _REVIEW_DECISIONS:
         raise IllegalRoute("审核决定非法")
@@ -217,7 +219,9 @@ def route_after_review(state: object) -> str:
         raise IllegalRoute("人工门禁字段非法")
     risk_level = _optional_risk(values)
 
-    if _human_required(risk_level, requires_human):
+    if status == Status.ESCALATED or _human_required(
+        risk_level, requires_human
+    ):
         return "escalate"
     if decision == "approve":
         return "finalize"
