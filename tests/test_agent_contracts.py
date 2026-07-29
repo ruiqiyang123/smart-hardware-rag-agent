@@ -5,9 +5,11 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+import agent.nodes.triage as triage_module
 from agent.nodes.triage import TriageAgent
 from agent.orchestration.state import RiskFlag, TriageResult
 
@@ -80,6 +82,7 @@ class AgentContractTest(unittest.TestCase):
 
         invalid_values = (
             [],
+            {},
             {"unknown": ["device_model"]},
             {"firmware_repair": "device_model"},
             {"firmware_repair": ["unknown"]},
@@ -94,6 +97,51 @@ class AgentContractTest(unittest.TestCase):
                     runner=FakeStructuredRunner(triage_result()),
                     required_fields=required_fields,
                 )
+
+    def test_default_required_fields_load_validated_orchestration_config(self):
+        original = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                agent = TriageAgent(
+                    runner=FakeStructuredRunner(triage_result())
+                )
+            finally:
+                os.chdir(original)
+
+        self.assertEqual(
+            {
+                category: [field.value for field in fields]
+                for category, fields in agent.required_fields.items()
+            },
+            {
+                "firmware_repair": ["device_model", "error_state"],
+                "warranty_service": ["serial_last4"],
+                "transaction_boundary": ["transaction_hash", "chain_name"],
+            },
+        )
+
+    def test_prompt_rejects_oversize_controls_and_secrets_without_echo(self):
+        invalid_prompts = (
+            "x" * (16 * 1024 + 1),
+            "triage\x00POLICY_PAYLOAD",
+            "triage\rPOLICY_PAYLOAD",
+            "triage\x85POLICY_PAYLOAD",
+            "private key: " + "1" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            prompt_path = Path(directory) / "triage_prompt.txt"
+            for prompt in invalid_prompts:
+                prompt_path.write_text(prompt, encoding="utf-8")
+                with self.subTest(prompt_length=len(prompt)), patch.object(
+                    triage_module, "_PROMPT_PATH", prompt_path
+                ), self.assertRaises((ValueError, RuntimeError)) as captured:
+                    TriageAgent(
+                        runner=FakeStructuredRunner(triage_result()),
+                        required_fields={"firmware_repair": ["device_model"]},
+                    )
+                self.assertNotIn("POLICY_PAYLOAD", str(captured.exception))
+                self.assertNotIn("111111", str(captured.exception))
 
     def test_triage_cannot_lower_ingress_critical_risk(self):
         runner = FakeStructuredRunner(triage_result())
@@ -283,6 +331,26 @@ class AgentContractTest(unittest.TestCase):
                 self._state()
             )
         self.assertEqual(str(captured.exception), "调用值校验失败")
+
+    def test_summary_whitespace_is_normalized_and_controls_fail_closed(self):
+        normalized = TriageAgent(
+            runner=FakeStructuredRunner(
+                triage_result(summary=" 第一行\n\t第二行  ")
+            )
+        ).run(self._state())
+        self.assertEqual(normalized["summary"], "第一行 第二行")
+
+        invalid_summaries = ("   ", "摘要\x00RAW_PAYLOAD", "摘要\rRAW_PAYLOAD")
+        for summary in invalid_summaries:
+            raw = triage_result().model_dump(mode="json")
+            raw["summary"] = summary
+            with self.subTest(summary=repr(summary)), self.assertRaises(
+                ValueError
+            ) as captured:
+                TriageAgent(
+                    runner=FakeStructuredRunner(raw), retries=0
+                ).run(self._state())
+            self.assertNotIn("RAW_PAYLOAD", str(captured.exception))
 
     def test_raw_secret_input_is_rejected_before_runner_invocation(self):
         runner = FakeStructuredRunner(triage_result())

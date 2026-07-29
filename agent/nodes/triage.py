@@ -3,6 +3,7 @@
 import copy
 import json
 import math
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from agent.security.secrets import contains_unredacted_secret
 
 
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "triage_prompt.txt"
+_MAX_PROMPT_SIZE = 16 * 1024
 _CATEGORY_VALUES = frozenset(
     {
         "power",
@@ -113,6 +115,8 @@ def _validate_required_fields(
 ) -> dict[str, list[MissingField]]:
     if not isinstance(required_fields, dict):
         raise TypeError("required_fields 必须是 category 到字段列表的映射")
+    if not required_fields:
+        raise ValueError("required_fields 不能为空")
     validated: dict[str, list[MissingField]] = {}
     for category, fields in copy.deepcopy(required_fields).items():
         if not isinstance(category, str) or category not in _CATEGORY_VALUES:
@@ -137,6 +141,42 @@ def _validate_required_fields(
             normalized.append(item)
         validated[category] = normalized
     return validated
+
+
+def _contains_forbidden_control(value: str) -> bool:
+    return any(
+        (ord(character) < 0x20 and character not in {"\n", "\t"})
+        or 0x7F <= ord(character) <= 0x9F
+        for character in value
+    )
+
+
+def _load_prompt(path: Path) -> str:
+    try:
+        metadata = path.stat()
+    except OSError:
+        raise RuntimeError("Triage prompt 不可用") from None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size <= 0
+        or metadata.st_size > _MAX_PROMPT_SIZE
+    ):
+        raise RuntimeError("Triage prompt 不可用") from None
+    try:
+        with path.open("r", encoding="utf-8", newline="") as prompt_file:
+            prompt = prompt_file.read(_MAX_PROMPT_SIZE + 1)
+    except (OSError, UnicodeError):
+        raise RuntimeError("Triage prompt 不可用") from None
+    if (
+        len(prompt) > _MAX_PROMPT_SIZE
+        or _contains_forbidden_control(prompt)
+        or contains_unredacted_secret(prompt)
+    ):
+        raise ValueError("Triage prompt 内容非法") from None
+    prompt = prompt.strip()
+    if not prompt:
+        raise ValueError("Triage prompt 内容非法") from None
+    return prompt
 
 
 def _safe_history(value: object) -> list[dict[str, str]]:
@@ -180,8 +220,12 @@ def _validate_runner_result(
         raise TypeError("分诊输出类型非法")
     result = TriageResult.model_validate(candidate)
 
-    if contains_unredacted_secret(result.summary):
+    if _contains_forbidden_control(result.summary):
+        raise ValueError("分诊摘要包含非法控制字符")
+    summary = " ".join(result.summary.split())
+    if not summary or contains_unredacted_secret(summary):
         raise ValueError("分诊摘要包含未脱敏内容")
+    result = result.model_copy(update={"summary": summary})
     allowed_missing = set(required_fields.get(result.category, []))
     if not set(result.missing_fields).issubset(allowed_missing):
         raise ValueError("分诊输出包含该 category 不需要的字段")
@@ -225,15 +269,12 @@ class TriageAgent:
         self.runner = runner
         self.timeout_seconds = timeout_seconds
         self.retries = retries
-        self.required_fields = _validate_required_fields(
-            {} if required_fields is None else required_fields
-        )
-        try:
-            self.prompt = _PROMPT_PATH.read_text(encoding="utf-8").strip()
-        except OSError as error:
-            raise RuntimeError("Triage prompt 不可用") from error
-        if not self.prompt:
-            raise RuntimeError("Triage prompt 不可用")
+        if required_fields is None:
+            from utils.config_handler import load_orchestration_config
+
+            required_fields = load_orchestration_config()["required_fields"]
+        self.required_fields = _validate_required_fields(required_fields)
+        self.prompt = _load_prompt(_PROMPT_PATH)
 
     def run(self, state: dict) -> dict:
         if not isinstance(state, dict):
