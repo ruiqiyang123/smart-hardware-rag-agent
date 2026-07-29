@@ -1,80 +1,108 @@
-# 🚀 Streamlit Cloud 部署指南
+# KeyGuard 2.0 部署与复现
 
-本指南帮助你将智扫通 AI Hardware CS Agent 部署到 Streamlit Cloud，实现零门槛在线体验。
+这份说明用于本地演示和 Streamlit Cloud 求职 Demo。KeyGuard 2.0 使用虚构品牌、模拟业务数据、SQLite 工单库和 checkpoint；部署完成不等于满足生产安全、可用性或持久化要求。
 
-## 前置准备
+## 本地复现
 
-1. **Streamlit Cloud 账号**：访问 [share.streamlit.io](https://share.streamlit.io/) 注册
-2. **GitHub 仓库**：确保项目代码已推送到 GitHub
-3. **API Key**：准备 MiMo API Key
-
-## 部署步骤
-
-### 1. 确保 GitHub 仓库更新
+推荐 Python 3.11。在仓库根目录执行：
 
 ```bash
-git add .
-git commit -m "feat: 添加 Streamlit Cloud 部署配置"
-git push origin main
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+python scripts/init_knowledge_base.py
+pytest -q
+streamlit run app.py
 ```
 
-### 2. 登录 Streamlit Cloud
+浏览器打开 `http://localhost:8501`。第一次初始化会生成本地 Chroma 缓存；不要把缓存、数据库或 Secrets 提交到仓库。
 
-访问 [share.streamlit.io](https://share.streamlit.io/)，选择 "Sign in with GitHub"。
+## 配置项
 
-### 3. 创建新应用
+`.env` 或 Streamlit Secrets 至少需要以下聊天模型配置：
 
-1. 点击 "New app"
-2. 选择你的 GitHub 仓库：`ruiqiyang123/ai-hardware-cs-agent`
-3. 分支选择：`main`
-4. Main file path：`app.py`
-5. Python version：`3.11`
-
-### 4. 配置后台环境变量
-
-如果你希望部署后开箱即用，可以在 "Advanced settings" 中设置：
-
-```bash
-MIMO_API_KEY=your-mimo-key
+```dotenv
+MIMO_API_KEY=your-mimo-api-key
 MIMO_BASE_URL=https://token-plan-sgp.xiaomimimo.com/v1
 MIMO_CHAT_MODEL=mimo-v2.5-pro
-CHAT_PROVIDER=mimo
-EMBEDDING_PROVIDER=local
-LOCAL_EMBEDDING_DIMENSION=1024
 ```
 
-**推荐做法**：求职 Demo 期间设置 MiMo 共享 Key，让面试官打开页面即可试用。
+V2 和人工工作台配置：
 
-### 5. 点击 Deploy
-
-等待几分钟后，应用即可部署成功。你会得到一个类似这样的 URL：
-
+```dotenv
+KEYGUARD_AGENT_VERSION=v2
+KEYGUARD_OPERATOR_TOKEN=replace-with-a-long-random-token
+KEYGUARD_TICKET_DB=data/keyguard_v2.db
+KEYGUARD_CHECKPOINT_DB=data/keyguard_v2_checkpoints.sqlite3
 ```
-https://ai-hardware-cs-agent.streamlit.app
+
+- `KEYGUARD_OPERATOR_TOKEN` 未配置时，工单工作台默认关闭；这是一条 fail-closed 边界。
+- `KEYGUARD_TICKET_DB` 保存业务工单和审计事件，`KEYGUARD_CHECKPOINT_DB` 保存 LangGraph 恢复点。两者**必须使用不同文件**，应用会拒绝相同的解析路径。
+- 两个数据库路径是可选覆盖项；默认值分别为 `data/keyguard_v2.db` 和 `data/keyguard_v2_checkpoints.sqlite3`。
+- 本地 Hash Embedding 可通过 `EMBEDDING_PROVIDER=local` 和 `LOCAL_EMBEDDING_DIMENSION=1024` 配置，不需要额外 Embedding Key。
+- `LANGGRAPH_STRICT_MSGPACK=true` 用于收紧 checkpoint 序列化边界。
+
+## Streamlit Cloud
+
+1. 在 Streamlit Cloud 创建应用，选择仓库 `ruiqiyang123/ai-hardware-cs-agent`、目标分支和入口 `app.py`。
+2. Python 版本选择 3.11。
+3. 在应用的 Secrets 管理页填写配置，不要把真实 Key 写进代码或提交到 Git。
+4. 完成部署后查看 Logs，确认知识库初始化、模型连接和数据库路径没有报错。
+
+Secrets 示例采用 TOML 语法：
+
+```toml
+MIMO_API_KEY = "your-mimo-api-key"
+MIMO_BASE_URL = "https://token-plan-sgp.xiaomimimo.com/v1"
+MIMO_CHAT_MODEL = "mimo-v2.5-pro"
+KEYGUARD_AGENT_VERSION = "v2"
+KEYGUARD_OPERATOR_TOKEN = "replace-with-a-long-random-token"
+KEYGUARD_TICKET_DB = "data/keyguard_v2.db"
+KEYGUARD_CHECKPOINT_DB = "data/keyguard_v2_checkpoints.sqlite3"
+LANGGRAPH_STRICT_MSGPACK = "true"
 ```
 
-## 自动更新
+在线示例地址为 [https://ai-hardware-cs-agent.streamlit.app/](https://ai-hardware-cs-agent.streamlit.app/)。线上行为由实际部署的分支、提交和 Secrets 决定；发布前应在页面中再次确认版本和四条演示路径。
 
-每次你推送新代码到 GitHub，Streamlit Cloud 会自动重新部署最新版本。
+## 持久化边界
 
-## 常见问题
+Streamlit Cloud 的本地文件系统是**易失**环境，实例休眠、迁移或重新部署后，SQLite 工单、checkpoint 和向量缓存都可能丢失。因此这种文件持久化只适合 Demo，**不能视为生产持久化**。
 
-### Q: 部署后页面加载很慢？
-A: 首次启动需要初始化知识库，之后访问速度会快很多。建议设置固定环境变量避免重复初始化。
+生产化至少需要把工单、checkpoint 和审计事件迁移到受控的外部数据库，增加备份恢复、并发控制、密钥轮换、企业身份认证、最小权限和数据保留策略。本项目没有实现这些能力。
 
-### Q: 如何查看部署日志？
-A: 在 Streamlit Cloud 控制台点击你的应用，选择 "Logs" 标签。
+## 部署前检查
 
-### Q: 部署失败怎么办？
-A: 检查以下内容：
-- Python 版本是否为 3.11
-- `requirements.txt` 是否正确
-- 环境变量格式是否正确
+```bash
+pip install -r requirements.txt
+python scripts/init_knowledge_base.py
+pytest -q
+streamlit run app.py
+```
 
-### Q: 如何保护 API Key？
-A: 不要在代码中硬编码 API Key，使用 Streamlit Cloud 的环境变量功能。
+随后人工检查：
 
-## 技术支持
+- “客户对话”和“工单工作台”两个标签页可见。
+- 未配置或输入错误的操作员令牌时，工作台不可访问。
+- 蓝牙案例能够自动完成并给出证据引用。
+- 固件信息不足时停在 `pending_user`，补充信息后可以继续。
+- 测试助记词在持久化前被脱敏，并进入 `escalated`。
+- `A1B2` 保修案例能看到模拟证据，但结论仍受人工门禁约束。
 
-- Streamlit Cloud 文档：https://docs.streamlit.io/streamlit-cloud
-- 本项目 Issues：https://github.com/ruiqiyang123/ai-hardware-cs-agent/issues
+## 常见故障
+
+### 页面启动但模型不可用
+
+检查 `MIMO_API_KEY`、`MIMO_BASE_URL`、`MIMO_CHAT_MODEL` 是否在当前部署环境生效。应用读取运行环境优先，不应在日志里打印 Key。
+
+### 工单工作台打不开
+
+这是未配置 `KEYGUARD_OPERATOR_TOKEN` 时的预期行为。配置令牌并重启应用后，用相同令牌进入工作台。
+
+### 应用拒绝数据库配置
+
+检查 `KEYGUARD_TICKET_DB` 和 `KEYGUARD_CHECKPOINT_DB`。它们必须使用不同文件，也不要通过 `..`、符号链接等方式让两个值解析到同一路径。
+
+### 重部署后历史工单消失
+
+这是 Streamlit Cloud 易失文件系统的限制，不应把本地 SQLite 当作远程可靠数据库。求职演示前重新执行初始化与冒烟检查；正式服务应改用外部持久化。

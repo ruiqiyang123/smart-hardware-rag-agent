@@ -114,29 +114,129 @@ class DemoReadinessTest(unittest.TestCase):
         self.assertIn("在线体验", readme)
         self.assertIn("本地启动", readme)
 
-    def test_readme_has_demo_script_without_internal_positioning_sections(self):
+    def test_readme_documents_v2_evidence_chain(self):
         readme = read_text("README.md")
 
+        self.assertIn(
+            "KeyGuard 2.0｜多 Agent 硬件钱包售后工单协同系统",
+            readme,
+        )
+        for heading in (
+            "V1 → V2",
+            "为什么是三个 Agent",
+            "Agent 与 Tool 边界",
+            "Human-in-the-loop",
+            "48 条离线评测",
+            "已知限制",
+        ):
+            self.assertIn(heading, readme)
+        for evidence in (
+            "Triage Agent",
+            "Diagnosis Agent",
+            "Review Agent",
+            "Router 不是 Agent",
+            "Ingress Guard",
+            "Policy Guard",
+            "风险粘性",
+            "最多一次返工",
+            "客户对话",
+            "工单工作台",
+            "30 条继承 + 18 条新增",
+            "KEYGUARD_OPERATOR_TOKEN",
+            "KEYGUARD_ORCHESTRATION_EVAL_RUNNER=module:attribute",
+        ):
+            self.assertIn(evidence, readme)
+        self.assertIn("stateDiagram-v2", readme)
+        self.assertIn("flowchart", readme)
+        self.assertIn("模拟", readme)
         self.assertIn("72 条 source-backed 客服条目", readme)
-        self.assertIn("设备丢了或坏了，资产还能恢复吗？", readme)
-        self.assertIn("Passphrase 忘了，为什么恢复后余额为零？", readme)
         self.assertNotIn("作品集 / 简历口径", readme)
-        self.assertNotIn("适合在简历或面试中强调的表达", readme)
-        self.assertNotIn("产品边界", readme)
+        self.assertNotIn("83.3% 回答准确率", readme)
+        self.assertNotIn("当前线上已是 V2", readme)
 
-    def test_only_readme_markdown_is_changed_for_wallet_migration(self):
-        protected_docs = [
-            "PROJECT_ANCHOR_CARD.md",
-            "PROJECT_CHAIN_CARD.md",
-            "PROJECT_EVAL_BADCASE_CARD.md",
-            "MEMORY_IMPLEMENTATION.md",
+    def test_portfolio_document_changes_stay_in_task_scope(self):
+        allowed_docs = {
+            "README.md",
             "DEPLOYMENT.md",
-        ]
+            "docs/DEMO_SCRIPT.md",
+            "docs/superpowers/plans/2026-07-28-keyguard-v2-multi-agent-support.md",
+        }
         changed_markdown = set(
             p for p in os.popen("git diff --name-only -- '*.md'").read().splitlines()
         )
 
-        self.assertFalse(changed_markdown.intersection(protected_docs))
+        self.assertFalse(changed_markdown - allowed_docs)
+
+    def test_deployment_documents_v2_secrets_and_ephemeral_storage(self):
+        deployment = read_text("DEPLOYMENT.md")
+
+        for command in (
+            "pip install -r requirements.txt",
+            "python scripts/init_knowledge_base.py",
+            "pytest -q",
+            "streamlit run app.py",
+        ):
+            self.assertIn(command, deployment)
+        for secret in (
+            "MIMO_API_KEY",
+            "MIMO_BASE_URL",
+            "MIMO_CHAT_MODEL",
+            "KEYGUARD_OPERATOR_TOKEN",
+            "KEYGUARD_TICKET_DB",
+            "KEYGUARD_CHECKPOINT_DB",
+        ):
+            self.assertIn(secret, deployment)
+        self.assertIn("必须使用不同文件", deployment)
+        self.assertIn("Streamlit Cloud", deployment)
+        self.assertIn("易失", deployment)
+        self.assertIn("不能视为生产持久化", deployment)
+
+    def test_five_minute_demo_script_has_honest_fixed_sections(self):
+        script = read_text("docs/DEMO_SCRIPT.md")
+
+        for timestamp in (
+            "0:00–0:40",
+            "0:40–2:00",
+            "2:00–3:40",
+            "3:40–4:30",
+            "4:30–5:00",
+        ):
+            self.assertIn(timestamp, script)
+        for scenario in (
+            "蓝牙",
+            "固件",
+            "助记词",
+            "A1B2",
+        ):
+            self.assertIn(scenario, script)
+        self.assertIn("不得声称真实客户", script)
+        self.assertIn("不得声称真实资产", script)
+        self.assertIn("不得声称企业降本", script)
+        self.assertIn("不得声称生产 SLA", script)
+        self.assertIn("不得预填 V2", script)
+
+    def test_portfolio_docs_do_not_fabricate_evaluation_or_production_claims(self):
+        documents = "\n".join(
+            read_text(path)
+            for path in ("README.md", "DEPLOYMENT.md", "docs/DEMO_SCRIPT.md")
+        )
+
+        self.assertNotIn("83.3% 回答准确率", documents)
+        for fabricated_claim in (
+            "已服务真实客户",
+            "使用真实客户数据",
+            "处理真实客户资产",
+            "已降低企业客服成本",
+            "已达到生产 SLA",
+        ):
+            self.assertNotIn(fabricated_claim, documents)
+        self.assertFalse((ROOT / "eval/eval_results/keyguard-v2.json").exists())
+        self.assertIn(
+            "KEYGUARD_ORCHESTRATION_EVAL_RUNNER=module:attribute",
+            read_text("README.md"),
+        )
+        self.assertIn("fail closed", read_text("README.md"))
+        self.assertIn("零输出", read_text("README.md"))
 
     def test_root_license_file_is_not_exposed(self):
         self.assertFalse((ROOT / "LICENSE").exists())
