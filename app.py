@@ -1071,7 +1071,6 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
                 st.link_button(
                     f"📚 {_escape_markdown_text(citation['source_title'])}",
                     _escape_markdown_url(citation["source_url"]),
-                    key=f"source_{ticket_id}_{citation['source_id']}",
                 )
 
             if ticket.get("status") != "escalated":
