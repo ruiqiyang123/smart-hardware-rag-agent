@@ -739,6 +739,9 @@ class DiagnosisContractTest(unittest.TestCase):
         self.assertIn("outcome=draft 时 remaining_unknowns 必须为空数组", prompt)
         self.assertIn("warranty_decision 只能用于 warranty_service", prompt)
         self.assertIn("其他普通分类只能使用 generic_troubleshooting", prompt)
+        self.assertIn("提供的设备型号是本工单事实", prompt)
+        self.assertIn("不得引用固件升级专属条目", prompt)
+        self.assertIn("不要在正文中展开任何 URL", prompt)
 
     def test_disallowed_missing_registry_and_invalid_special_queries_fail_closed(self):
         cases = (

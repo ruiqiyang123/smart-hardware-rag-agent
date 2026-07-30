@@ -53,6 +53,10 @@ _MANUAL_ACTIONS = frozenset(
     {"device_reset", "bootloader_recovery", "wallet_recovery", "warranty_decision"}
 )
 _RESUME_ACTIONS = frozenset({"approve", "edit_send", "ask_user", "reject"})
+_CONNECTION_CATEGORIES = frozenset(
+    {"usb_connection", "mobile_connection", "bluetooth_connection"}
+)
+_FIRMWARE_QUERY_MARKERS = frozenset({"固件", "升级", "更新", "恢复模式", "bootloader"})
 _TRIAGE_FIELDS = frozenset(
     {
         "intent",
@@ -78,6 +82,34 @@ _DIAGNOSIS_FIELDS = frozenset(
         "tool_errors",
     }
 )
+
+
+def _filter_connection_evidence(
+    state: Mapping[str, object], evidence: list[object]
+) -> list[object]:
+    """Drop firmware-only chunks from a non-firmware connection investigation."""
+    if not isinstance(state, Mapping) or not isinstance(evidence, list):
+        return evidence
+    category = state.get("category")
+    query = state.get("sanitized_input")
+    if category not in _CONNECTION_CATEGORIES or not isinstance(query, str):
+        return evidence
+    if any(marker in query.lower() for marker in _FIRMWARE_QUERY_MARKERS):
+        return evidence
+    filtered: list[object] = []
+    for item in evidence:
+        if not isinstance(item, Mapping):
+            filtered.append(item)
+            continue
+        title = item.get("source_title")
+        evidence_id = item.get("evidence_id")
+        if any(
+            isinstance(value, str) and "固件升级" in value
+            for value in (title, evidence_id)
+        ):
+            continue
+        filtered.append(item)
+    return filtered
 _REVIEW_FIELDS = frozenset(
     {"review_decision", "review_reasons", "review_issues", "required_changes"}
 )
@@ -1225,7 +1257,7 @@ def build_configured_graph(
         result = search_evidence(query)
         if not isinstance(result, list):
             raise TypeError("knowledge adapter 输出非法")
-        return result
+        return _filter_connection_evidence(_state, result)
 
     def profile_tool(state: dict, _query: str) -> list[object]:
         user_id = _identifier(state.get("user_id"), "user_id")

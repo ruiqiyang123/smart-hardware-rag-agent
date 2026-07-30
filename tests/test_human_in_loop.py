@@ -86,6 +86,27 @@ def _review(_state):
 
 
 class HumanInLoopTest(unittest.TestCase):
+    def test_connection_evidence_drops_firmware_only_chunks_without_upgrade_context(self):
+        from agent.orchestration.graph import _filter_connection_evidence
+
+        evidence = [
+            {"evidence_id": "kb:故障排除.txt:usb", "source_title": "故障排除.txt"},
+            {"evidence_id": "kb:固件升级.txt:11", "source_title": "固件升级.txt"},
+        ]
+        state = {
+            "category": "usb_connection",
+            "sanitized_input": "电脑识别不到设备，换线后仍无反应",
+        }
+        self.assertEqual(
+            _filter_connection_evidence(state, evidence), evidence[:1]
+        )
+        self.assertEqual(
+            _filter_connection_evidence(
+                {**state, "sanitized_input": "固件升级后电脑识别不到设备"}, evidence
+            ),
+            evidence,
+        )
+
     def test_support_graph_module_exists(self):
         from agent.orchestration.graph import build_support_graph
 
