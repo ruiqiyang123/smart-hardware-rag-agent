@@ -699,6 +699,22 @@ class DiagnosisContractTest(unittest.TestCase):
         self.assertNotIn("reasoning", json.dumps(answer_payload))
         self.assertEqual(output["tool_errors"], [])
 
+    def test_revision_feedback_is_bound_to_both_structured_calls(self):
+        agent = self._agent()
+        agent.run(
+            self._state(
+                revision_count=1,
+                review_reasons=["incomplete_steps"],
+                required_changes=["补充 USB 重连后的系统检查步骤"],
+            )
+        )
+        plan_system = agent.plan_runner.calls[0][0].content
+        answer_system = agent.answer_runner.calls[0][0].content
+        for system_prompt in (plan_system, answer_system):
+            self.assertIn("受限返工", system_prompt)
+            self.assertIn("required_changes", system_prompt)
+            self.assertIn("remaining_unknowns", system_prompt)
+
     def test_diagnosis_schema_and_prompt_bind_draft_to_no_unknowns(self):
         from agent.orchestration.state import DiagnosisAction, DiagnosisResult
 

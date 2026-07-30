@@ -24,6 +24,12 @@ from agent.policies.security import IngressGuard, PolicyGuard
 from agent.react_agent import ReactAgent
 from agent.security.trusted_sources import TrustedSourcePolicy
 from agent.tools.agent_tools import configure_rag_model
+from agent.ui_progress import (
+    append_processing_turn,
+    project_customer_phases,
+    project_workbench_events,
+    replace_processing_answer,
+)
 from database.profile_db import ProfileDatabase, UserProfile
 from database.ticket_db import IdempotencyConflictError, TicketRepository
 from model.factory import build_chat_model
@@ -111,6 +117,8 @@ RECOVERED_REQUEST_NOTICE = (
     "已按原内容恢复上次请求；本次输入未作为新问题处理。"
 )
 RECOVERY_NOTICE_SESSION_KEY = "keyguard_v2_recovery_notice"
+PENDING_UI_REQUEST_SESSION_KEY = "keyguard_v2_pending_ui_request"
+PROCESSING_UI_NOTICE = "⏳ 正在安全检查、取证并生成回复…"
 OPERATOR_AUTH_SESSION_KEY = "keyguard_operator_auth"
 _UI_ID_PATTERN = re.compile(r"[0-9a-f]{32}", re.ASCII)
 _MARKDOWN_SPECIALS = frozenset(r"\`*_{}[]()#+-.!|<>")
@@ -139,6 +147,7 @@ def _clear_customer_workflow_state() -> None:
     clear_frozen_actions(st.session_state)
     clear_editor_state(st.session_state)
     st.session_state.pop(RECOVERY_NOTICE_SESSION_KEY, None)
+    st.session_state.pop(PENDING_UI_REQUEST_SESSION_KEY, None)
     st.session_state.pop("pending_prompt", None)
 
 
@@ -686,6 +695,17 @@ def _answer_with_citations(result) -> str:
 def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str) -> None:
     active_ticket_id = st.session_state.get("active_ticket_id")
     restoring = False
+    request_id = _stable_request_id()
+
+    def _finish_ui_message(content: str) -> None:
+        if st.session_state.get(PENDING_UI_REQUEST_SESSION_KEY) == request_id:
+            replace_processing_answer(st.session_state["messages"], content)
+            st.session_state.pop(PENDING_UI_REQUEST_SESSION_KEY, None)
+        else:
+            st.session_state["messages"].append(
+                {"role": "assistant", "content": content}
+            )
+
     try:
         active_ticket = (
             orchestrator.repository.get_ticket(active_ticket_id)
@@ -698,7 +718,6 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
             _clear_customer_workflow_state()
             active_ticket_id = None
             active_ticket = None
-        request_id = _stable_request_id()
         request_route = (
             ("resume_user", active_ticket_id)
             if active_ticket and active_ticket.get("status") == "pending_user"
@@ -719,23 +738,41 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
             raise ValueError("冻结请求结构非法")
         frozen_route, prepared = frozen_command
         route_kind, route_ticket_id = frozen_route
-        if route_kind == "resume_user":
-            if route_ticket_id != active_ticket_id:
-                raise ValueError("冻结请求工单不一致")
-            result = orchestrator.resume_user_prepared(
-                route_ticket_id,
-                prepared,
-                request_id=request_id,
+        if st.session_state.get(PENDING_UI_REQUEST_SESSION_KEY) != request_id:
+            append_processing_turn(
+                st.session_state["messages"],
+                prepared.sanitized_input,
+                PROCESSING_UI_NOTICE,
             )
-        elif route_kind == "submit" and route_ticket_id is None:
-            result = orchestrator.submit_prepared(
-                prepared,
-                user_id=user_id,
-                request_id=request_id,
-                safe_history=safe_history,
-            )
-        else:
-            raise ValueError("冻结请求路由非法")
+            st.session_state[PENDING_UI_REQUEST_SESSION_KEY] = request_id
+            with st.chat_message("user", avatar="🧑"):
+                st.markdown(prepared.sanitized_input)
+            with st.chat_message("assistant", avatar="🔐"):
+                st.markdown(PROCESSING_UI_NOTICE)
+
+        with st.status("正在安全处理工单…", expanded=True) as processing_status:
+            try:
+                if route_kind == "resume_user":
+                    if route_ticket_id != active_ticket_id:
+                        raise ValueError("冻结请求工单不一致")
+                    result = orchestrator.resume_user_prepared(
+                        route_ticket_id,
+                        prepared,
+                        request_id=request_id,
+                    )
+                elif route_kind == "submit" and route_ticket_id is None:
+                    result = orchestrator.submit_prepared(
+                        prepared,
+                        user_id=user_id,
+                        request_id=request_id,
+                        safe_history=safe_history,
+                    )
+                else:
+                    raise ValueError("冻结请求路由非法")
+            except Exception:
+                processing_status.update(label="安全处理未完成", state="error")
+                raise
+            processing_status.update(label="安全处理完成", state="complete")
     except IdempotencyConflictError as error:
         if restoring:
             st.session_state[RECOVERY_NOTICE_SESSION_KEY] = (
@@ -745,9 +782,7 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
             "[app]V2 恢复状态异常 stage=runtime error_type=%s",
             type(error).__name__,
         )
-        st.session_state["messages"].append(
-            {"role": "assistant", "content": SAFE_FAILURE_NOTICE}
-        )
+        _finish_ui_message(SAFE_FAILURE_NOTICE)
         st.rerun()
         return
     except (CommandFailedError, CheckpointRestoreError) as error:
@@ -757,9 +792,7 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
             "[app]V2 请求终止 stage=runtime error_type=%s",
             type(error).__name__,
         )
-        st.session_state["messages"].append(
-            {"role": "assistant", "content": SAFE_FAILURE_NOTICE}
-        )
+        _finish_ui_message(SAFE_FAILURE_NOTICE)
         st.rerun()
         return
     except (CommandInProgressError, TimeoutError) as error:
@@ -771,9 +804,7 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
             "[app]V2 请求待恢复 stage=runtime error_type=%s",
             type(error).__name__,
         )
-        st.session_state["messages"].append(
-            {"role": "assistant", "content": SAFE_FAILURE_NOTICE}
-        )
+        _finish_ui_message(SAFE_FAILURE_NOTICE)
         st.rerun()
         return
     except Exception as error:
@@ -785,9 +816,7 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
             "[app]V2 请求失败 stage=runtime error_type=%s",
             type(error).__name__,
         )
-        st.session_state["messages"].append(
-            {"role": "assistant", "content": SAFE_FAILURE_NOTICE}
-        )
+        _finish_ui_message(SAFE_FAILURE_NOTICE)
         st.rerun()
         return
 
@@ -795,12 +824,16 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
     if restoring:
         st.session_state[RECOVERY_NOTICE_SESSION_KEY] = RECOVERED_REQUEST_NOTICE
     st.session_state["active_ticket_id"] = result.ticket_id
-    st.session_state["messages"].append(
-        {"role": "user", "content": result.sanitized_input}
+    safe_result_message = {"role": "user", "content": result.sanitized_input}
+    if (
+        st.session_state["messages"][-2].get("content")
+        != safe_result_message["content"]
+    ):
+        raise ValueError("安全结果与已展示问题不一致")
+    replace_processing_answer(
+        st.session_state["messages"], _answer_with_citations(result)
     )
-    st.session_state["messages"].append(
-        {"role": "assistant", "content": _answer_with_citations(result)}
-    )
+    st.session_state.pop(PENDING_UI_REQUEST_SESSION_KEY, None)
     st.rerun()
 
 
@@ -938,13 +971,9 @@ def _render_active_ticket(
         f"当前工单 `{ticket_id}` · 状态 `{ticket.get('status') or '-'}` · "
         f"优先级 `{ticket.get('priority') or 'P2'}` · 风险 `{ticket.get('risk_level') or '-'}`"
     )
-    completed_phases = [
-        PHASE_LABELS[event.get("event_type")]
-        for event in events
-        if event.get("event_type") in PHASE_LABELS
-    ]
+    completed_phases = project_customer_phases(events)
     if completed_phases:
-        st.caption(" · ".join(dict.fromkeys(completed_phases)))
+        st.caption(" · ".join(item["label"] for item in completed_phases))
 
 
 def _render_operator_gate() -> bool:
@@ -1020,12 +1049,15 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
             )
             try:
                 events = orchestrator.repository.list_events(ticket_id)
-                for event in events:
+                for event in project_workbench_events(events):
+                    event_type = event["event_type"]
+                    summary = event["summary"]
+                    from_status = event["from_status"]
+                    to_status = event["to_status"]
                     st.text(
-                        f"{event.get('event_type') or '-'} · "
-                        f"{event.get('summary') or '-'} · "
-                        f"{event.get('from_status') or '-'} → "
-                        f"{event.get('to_status') or '-'}"
+                        f"{event['label']} · {event['node_name']} · "
+                        f"{event_type} · {summary} · "
+                        f"{from_status} → {to_status}"
                     )
                 citations = orchestrator.get_verified_citations(ticket_id)
             except Exception as error:

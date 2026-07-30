@@ -311,6 +311,18 @@ class AppV2ContractTest(unittest.TestCase):
         ):
             self.assertIn(f'"{event_type}"', self.source)
 
+    def test_customer_progress_has_persisted_placeholder_and_safe_projection(self):
+        submit = self.function_source("_run_v2_prompt")
+        render = self.function_source("_render_active_ticket")
+        self.assertIn("append_processing_turn", submit)
+        self.assertIn("replace_processing_answer", submit)
+        self.assertIn("PENDING_UI_REQUEST_SESSION_KEY", submit)
+        self.assertIn('st.chat_message("user"', submit)
+        self.assertIn('st.chat_message("assistant"', submit)
+        self.assertIn("st.status(", submit)
+        self.assertIn("project_customer_phases", render)
+        self.assertIn("project_workbench_events", self.function_source("_render_workbench"))
+
     def test_configured_graph_rejects_mismatched_policy_identity(self):
         from agent.orchestration.graph import build_configured_graph
         from agent.policies.security import PolicyGuard
