@@ -15,6 +15,7 @@ CUSTOMER_PHASE_LABELS = {
     "triage_completed": "🧭 问题分诊完成",
     "diagnosis_completed": "📚 诊断取证完成",
     "review_completed": "✅ 安全复核完成",
+    "guidance_finalized": "💬 基础建议已生成，等待补充",
     "escalated": "👩‍💼 已转人工审核",
     "response_finalized": "📨 安全回复已完成",
 }
@@ -34,6 +35,7 @@ _WORKBENCH_EVENT_TYPES = frozenset(
         "human_requested_information",
         "human_rejected",
         "ticket.escalated",
+        "ticket.pending_user",
         "ticket.resolved",
     }
 )

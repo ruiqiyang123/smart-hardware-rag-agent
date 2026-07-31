@@ -21,11 +21,14 @@ class TicketStateContractTest(unittest.TestCase):
         values = {
             "intent": "troubleshoot",
             "category": "bluetooth_connection",
-            "priority": "P2",
-            "risk_level": "low",
-            "risk_flags": [],
-            "missing_fields": [],
-            "suggested_route": "diagnose",
+        "priority": "P2",
+        "risk_level": "low",
+        "risk_flags": [],
+        "clarity": "clear",
+        "clarification_question": "",
+        "clarification_options": [],
+        "missing_fields": [],
+        "suggested_route": "diagnose",
             "summary": "蓝牙连接失败",
         }
         values.update(overrides)

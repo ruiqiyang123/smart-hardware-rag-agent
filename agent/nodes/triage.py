@@ -200,17 +200,30 @@ def _validate_runner_result(
     summary = " ".join(result.summary.split())
     if not summary or contains_unredacted_secret(summary):
         raise ValueError("分诊摘要包含未脱敏内容")
-    result = result.model_copy(update={"summary": summary})
+    clarification_question = " ".join(result.clarification_question.split())
+    clarification_options = [
+        " ".join(option.split()) for option in result.clarification_options
+    ]
+    clarification_texts = [clarification_question, *clarification_options]
+    if any(
+        not text
+        or len(text) > 300
+        or _contains_forbidden_control(text)
+        or contains_unredacted_secret(text)
+        for text in clarification_texts
+        if result.clarity == "ambiguous"
+    ):
+        raise ValueError("澄清内容不可安全展示")
+    result = result.model_copy(
+        update={
+            "summary": summary,
+            "clarification_question": clarification_question,
+            "clarification_options": clarification_options,
+        }
+    )
     allowed_missing = set(required_fields.get(result.category, []))
     if not set(result.missing_fields).issubset(allowed_missing):
         raise ValueError("分诊输出包含该 category 不需要的字段")
-    if (
-        result.risk_level in {RiskLevel.LOW, RiskLevel.MEDIUM}
-        and result.category not in {"security_incident", "security_report"}
-        and not result.missing_fields
-        and result.suggested_route == "ask_user"
-    ):
-        raise ValueError("ask_user 必须包含缺失字段")
     return result
 
 
@@ -322,16 +335,27 @@ class TriageAgent:
             output["priority"] = "P0"
             output["suggested_route"] = "escalate"
             output["missing_fields"] = []
+            output["clarity"] = "clear"
+            output["clarification_question"] = ""
+            output["clarification_options"] = []
         elif effective_risk == RiskLevel.HIGH:
             output["priority"] = "P1"
             output["suggested_route"] = "escalate"
             output["missing_fields"] = []
+            output["clarity"] = "clear"
+            output["clarification_question"] = ""
+            output["clarification_options"] = []
         else:
             output["priority"] = "P2"
-            if output["missing_fields"]:
-                output["suggested_route"] = "ask_user"
+            if output["clarity"] == "ambiguous":
+                output["missing_fields"] = []
+                output["suggested_route"] = "clarify"
+            elif output["missing_fields"]:
+                output["clarity"] = "partial"
+                output["suggested_route"] = "diagnose"
             elif output["category"] in {"security_incident", "security_report"}:
                 output["suggested_route"] = "escalate"
             else:
+                output["clarity"] = "clear"
                 output["suggested_route"] = "diagnose"
         return TriageResult.model_validate(output).model_dump(mode="json")

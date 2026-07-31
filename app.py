@@ -98,6 +98,8 @@ def _runtime_secret(name: str) -> Optional[str]:
         return value if value else None
 
     try:
+        if not st.secrets.load_if_toml_exists():
+            return None
         secret_value = st.secrets.get(name)
     except Exception:
         return None
@@ -660,6 +662,7 @@ PHASE_LABELS = {
     "triage_completed": "🧭 问题分诊完成",
     "diagnosis_completed": "📚 诊断取证完成",
     "review_completed": "✅ 安全复核完成",
+    "guidance_finalized": "💬 基础建议已生成，等待补充",
     "escalated": "👩‍💼 已转人工审核",
     "response_finalized": "📨 安全回复已完成",
     "ingress_guard.redacted": "🛡️ 安全检查完成",
@@ -702,10 +705,49 @@ WORKBENCH_GATE_REASON_LABELS = {
     "TOOL_FAILURE": "诊断工具失败",
     "DIAGNOSIS_NO_EVIDENCE": "没有足够诊断证据",
 }
+MISSING_FIELD_GUIDANCE = {
+    "device_model": ("设备型号", "例如 KeyGuard Mini"),
+    "app_os": ("手机或电脑系统", "例如 iOS 18、Android 15、Windows 11"),
+    "connection_type": ("连接方式", "例如 USB-C 或蓝牙"),
+    "firmware_version": ("当前固件版本", "可在官方应用的设备信息中查看"),
+    "error_state": ("屏幕提示或错误码", "请原样描述屏幕文字"),
+    "serial_last4": ("序列号后四位", "只提供最后四位即可"),
+    "purchase_date": ("购买日期", "例如 2026-05-01"),
+    "transaction_hash": ("交易哈希", "请勿提供私钥或助记词"),
+    "chain_name": ("区块链网络", "例如 Bitcoin 或 Ethereum"),
+}
+
+
+def _missing_fields_message(fields: list[str]) -> str:
+    lines = []
+    for index, field in enumerate(fields, start=1):
+        label, example = MISSING_FIELD_GUIDANCE.get(
+            field, (field, "请描述相关信息")
+        )
+        lines.append(f"{index}. **{label}**：{example}")
+    if not lines:
+        return ""
+    return "如果问题仍未解决，请继续补充：\n" + "\n".join(lines)
+
+
+def _clarification_message(question: str, options: list[str]) -> str:
+    if not question:
+        return ""
+    option_lines = [f"- {option}" for option in options]
+    return question + ("\n\n你可以直接回复：\n" + "\n".join(option_lines) if option_lines else "")
 
 
 def _answer_with_citations(result) -> str:
     answer = result.user_notice or result.final_answer
+    if result.status == "pending_user":
+        clarification = _clarification_message(
+            result.clarification_question,
+            result.clarification_options,
+        )
+        missing = _missing_fields_message(result.missing_fields)
+        guidance = clarification or missing
+        if guidance:
+            answer = f"{answer}\n\n{guidance}" if answer else guidance
     if not answer and result.status == "pending_user":
         answer = PENDING_USER_NOTICE
     if not answer and result.status == "escalated":
@@ -728,7 +770,7 @@ def _sync_human_result_to_customer_chat(result) -> None:
     if result.status == "resolved" and result.final_answer:
         content = _answer_with_citations(result)
     elif result.status == "pending_user":
-        content = PENDING_USER_NOTICE
+        content = _answer_with_citations(result)
     else:
         return
     if st.session_state.get("active_ticket_id") != result.ticket_id:
@@ -1045,6 +1087,29 @@ def _render_active_ticket(
     completed_phases = project_customer_phases(events)
     if completed_phases:
         st.caption(" · ".join(item["label"] for item in completed_phases))
+    if ticket.get("status") == "pending_user":
+        question = ticket.get("clarification_question") or ""
+        try:
+            options = json.loads(ticket.get("clarification_options_json") or "[]")
+            missing_fields = json.loads(ticket.get("missing_fields_json") or "[]")
+        except (TypeError, ValueError):
+            options = []
+            missing_fields = []
+        if question:
+            st.info(_clarification_message(question, options))
+            if options:
+                columns = st.columns(min(len(options), 3))
+                for index, option in enumerate(options):
+                    with columns[index % len(columns)]:
+                        if st.button(
+                            option,
+                            key=f"clarify_{ticket_id}_{index}",
+                            use_container_width=True,
+                        ):
+                            st.session_state["pending_prompt"] = option
+                            st.rerun()
+        elif missing_fields:
+            st.info(_missing_fields_message(missing_fields))
 
 
 def _render_operator_gate() -> bool:
@@ -1104,16 +1169,23 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
         st.info("暂无工单。先在“客户对话”中提交一个问题。")
         return
 
-    pending_tickets = [
+    human_tickets = [
         ticket
         for ticket in all_tickets
-        if ticket.get("status") in {"escalated", "pending_user"}
+        if ticket.get("status") == "escalated"
     ]
+    customer_tickets = [
+        ticket
+        for ticket in all_tickets
+        if ticket.get("status") == "pending_user"
+    ]
+    pending_tickets = human_tickets + customer_tickets
     resolved_tickets = [
         ticket for ticket in all_tickets if ticket.get("status") == "resolved"
     ]
     st.caption(
-        f"待处理 {len(pending_tickets)} · 已解决 {len(resolved_tickets)} · "
+        f"待人工处理 {len(human_tickets)} · 待客户补充 {len(customer_tickets)} · "
+        f"已解决 {len(resolved_tickets)} · "
         "低风险问题通常会自动结案"
     )
     view = st.selectbox(
@@ -1149,6 +1221,22 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
             )
             if ticket.get("parent_ticket_id"):
                 st.caption(f"🔗 这是后续工单，上一张工单：`{ticket['parent_ticket_id']}`")
+            if ticket.get("clarity"):
+                clarity_label = {
+                    "ambiguous": "问题含糊，等待澄清",
+                    "partial": "意图明确，信息不完整",
+                    "clear": "信息足够",
+                }.get(ticket["clarity"], ticket["clarity"])
+                st.caption(f"🧭 问题清晰度：{clarity_label}")
+            if ticket.get("clarification_question"):
+                st.info(
+                    _clarification_message(
+                        ticket["clarification_question"],
+                        ticket.get("clarification_options") or [],
+                    )
+                )
+            elif ticket.get("missing_fields"):
+                st.info(_missing_fields_message(ticket["missing_fields"]))
             if ticket.get("manual_gate_reason"):
                 reason = ticket["manual_gate_reason"]
                 st.warning(

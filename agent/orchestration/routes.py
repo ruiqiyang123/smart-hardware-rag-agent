@@ -25,7 +25,12 @@ ALLOWED_TRANSITIONS: Mapping[Status, FrozenSet[Status]] = MappingProxyType(
             {Status.PENDING_USER, Status.REVIEWING, Status.ESCALATED}
         ),
         Status.REVIEWING: frozenset(
-            {Status.RESOLVED, Status.DIAGNOSING, Status.ESCALATED}
+            {
+                Status.PENDING_USER,
+                Status.RESOLVED,
+                Status.DIAGNOSING,
+                Status.ESCALATED,
+            }
         ),
         Status.ESCALATED: frozenset(
             {Status.RESOLVED, Status.PENDING_USER, Status.ESCALATED}
@@ -52,7 +57,8 @@ _CATEGORY_VALUES = frozenset(
         "other",
     }
 )
-_SUGGESTED_ROUTES = frozenset({"ask_user", "diagnose", "escalate"})
+_SUGGESTED_ROUTES = frozenset({"clarify", "diagnose", "escalate"})
+_CLARITY_VALUES = frozenset({"ambiguous", "partial", "clear"})
 _REVIEW_DECISIONS = frozenset({"approve", "revise", "escalate"})
 _MISSING_FIELD_VALUES = frozenset(field.value for field in MissingField)
 _HUMAN_RISK_LEVELS = frozenset({RiskLevel.HIGH, RiskLevel.CRITICAL})
@@ -166,9 +172,24 @@ def route_after_triage(state: object) -> str:
             for field in missing_fields
         ) or len(missing_fields) != len(set(missing_fields)):
             raise IllegalRoute("缺失字段列表非法")
-
     if status == Status.ESCALATED:
         return "human_review"
+
+    clarity = values.get("clarity")
+    if not isinstance(clarity, str) or clarity not in _CLARITY_VALUES:
+        raise IllegalRoute("问题清晰度非法")
+    clarification_question = values.get("clarification_question")
+    clarification_options = values.get("clarification_options")
+    if not isinstance(clarification_question, str) or not isinstance(
+        clarification_options, list
+    ):
+        raise IllegalRoute("澄清内容非法")
+    if any(
+        not isinstance(option, str) or not option
+        for option in clarification_options
+    ) or len(clarification_options) != len(set(clarification_options)):
+        raise IllegalRoute("澄清选项非法")
+
     if status != Status.TRIAGED:
         raise IllegalRoute("分诊后的状态非法")
     if risk_level is None or suggested_route is None or missing_fields is None:
@@ -178,11 +199,22 @@ def route_after_triage(state: object) -> str:
         return "escalate"
     if category == "security_report" or suggested_route == "escalate":
         return "escalate"
-    if suggested_route == "ask_user":
-        if not missing_fields:
+    if suggested_route == "clarify":
+        if (
+            clarity != "ambiguous"
+            or missing_fields
+            or not clarification_question
+            or not 2 <= len(clarification_options) <= 5
+        ):
             raise IllegalRoute("分诊结果互相矛盾")
         return "pending_user"
-    if missing_fields:
+    if clarification_question or clarification_options:
+        raise IllegalRoute("分诊结果互相矛盾")
+    if clarity == "partial":
+        if suggested_route != "diagnose" or not missing_fields:
+            raise IllegalRoute("分诊结果互相矛盾")
+        return "start_diagnosis"
+    if clarity != "clear" or missing_fields:
         raise IllegalRoute("分诊结果互相矛盾")
     return "start_diagnosis"
 

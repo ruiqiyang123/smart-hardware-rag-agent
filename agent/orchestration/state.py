@@ -114,16 +114,24 @@ class TriageResult(StrictModel):
     priority: Literal["P0", "P1", "P2"]
     risk_level: RiskLevel
     risk_flags: List[RiskFlag]
+    clarity: Literal["ambiguous", "partial", "clear"] = Field(
+        description=(
+            "无法确定唯一问题方向时为 ambiguous；意图明确但缺少精确诊断字段时为 "
+            "partial；问题足以直接诊断时为 clear。"
+        )
+    )
+    clarification_question: str = Field(max_length=300)
+    clarification_options: List[str] = Field(max_length=5)
     missing_fields: List[MissingField] = Field(
         description=(
             "只能包含输入 required_fields 中当前 category 对应列表里的字段；"
             "如果当前分类未出现在 required_fields 映射中，必须返回空数组。"
         )
     )
-    suggested_route: Literal["ask_user", "diagnose", "escalate"] = Field(
+    suggested_route: Literal["clarify", "diagnose", "escalate"] = Field(
         description=(
-            "只有 missing_fields 非空时才可使用 ask_user；missing_fields 为空的普通"
-            "低风险问题不得使用 ask_user，应使用 diagnose；高风险问题使用 escalate。"
+            "ambiguous 使用 clarify；partial 和 clear 的低风险问题使用 diagnose；"
+            "高风险问题使用 escalate。"
         )
     )
     summary: str = Field(min_length=1, max_length=300)
@@ -132,10 +140,43 @@ class TriageResult(StrictModel):
     def validate_risk_consistency(self):
         _reject_duplicates(self.risk_flags, "risk_flags")
         _reject_duplicates(self.missing_fields, "missing_fields")
+        _reject_duplicates(self.clarification_options, "clarification_options")
 
         if self.risk_level in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
             if self.suggested_route != "escalate":
                 raise ValueError("high/critical 风险必须升级人工处理")
+        elif self.category in {"security_incident", "security_report"}:
+            if (
+                self.suggested_route not in {"diagnose", "escalate"}
+                or self.clarity != "clear"
+                or self.missing_fields
+                or self.clarification_question
+                or self.clarification_options
+            ):
+                raise ValueError("安全事件不得等待澄清")
+        elif self.clarity == "ambiguous":
+            if (
+                self.suggested_route != "clarify"
+                or self.missing_fields
+                or not self.clarification_question
+                or not 2 <= len(self.clarification_options) <= 5
+            ):
+                raise ValueError("ambiguous 必须提供单个澄清问题和 2-5 个选项")
+        elif self.clarity == "partial":
+            if (
+                self.suggested_route != "diagnose"
+                or not self.missing_fields
+                or self.clarification_question
+                or self.clarification_options
+            ):
+                raise ValueError("partial 必须带缺失字段并继续诊断")
+        elif (
+            self.suggested_route != "diagnose"
+            or self.missing_fields
+            or self.clarification_question
+            or self.clarification_options
+        ):
+            raise ValueError("clear 必须直接诊断且不得携带澄清字段")
         if self.risk_level == RiskLevel.CRITICAL and self.priority != "P0":
             raise ValueError("critical 风险必须使用 P0 优先级")
         if self.risk_level == RiskLevel.HIGH and self.priority not in {"P0", "P1"}:
@@ -199,7 +240,8 @@ class DiagnosisResult(StrictModel):
     outcome: Literal["draft", "need_user", "escalate"] = Field(
         description=(
             "有充分证据生成回答时使用 draft，且 remaining_unknowns 必须为空；"
-            "仅在确有必要未知字段时使用 need_user；无法安全支持时使用 escalate。"
+            "意图明确但仍需客户补充时使用 need_user，并可携带经证据支持的基础回答；"
+            "无法安全支持时使用 escalate。"
         )
     )
     diagnosis_summary: str = Field(min_length=1, max_length=500)
@@ -233,8 +275,12 @@ class DiagnosisResult(StrictModel):
             if self.remaining_unknowns:
                 raise ValueError("draft 不得保留必要未知字段")
         if self.outcome == "need_user":
-            if not self.remaining_unknowns or self.draft_answer:
-                raise ValueError("need_user 必须有未知字段且不能生成草稿")
+            if not self.remaining_unknowns:
+                raise ValueError("need_user 必须有未知字段")
+            if self.draft_answer and (
+                not self.recommended_actions or not self.evidence_refs
+            ):
+                raise ValueError("带基础回答的 need_user 必须包含动作和证据")
         if self.outcome == "escalate" and self.draft_answer:
             raise ValueError("escalate 草稿不得自动发送")
         return self
@@ -324,6 +370,9 @@ class TicketState(TypedDict, total=False):
     priority: str
     risk_level: str
     risk_flags: List[str]
+    clarity: str
+    clarification_question: str
+    clarification_options: List[str]
     missing_fields: List[str]
     suggested_route: str
     summary: str

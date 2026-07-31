@@ -182,6 +182,85 @@ class FailureFallbackTest(unittest.TestCase):
         result = run_fault_case("rag_empty")
         self.assertEqual(result.status, "escalated")
 
+    def test_reviewed_partial_guidance_is_persisted_and_returned_while_waiting(self):
+        def partial_result(graph_input, _config):
+            answer = "请保持设备供电，并从官方应用重新进入恢复流程。"
+            command_id = graph_input["command_id"]
+            return {
+                **graph_input,
+                "event_step": 4,
+                "status": "pending_user",
+                "category": "firmware_repair",
+                "priority": "P2",
+                "risk_level": "low",
+                "clarity": "partial",
+                "clarification_question": "",
+                "clarification_options": [],
+                "missing_fields": ["device_model", "error_state"],
+                "suggested_route": "diagnose",
+                "summary": "固件升级中断，需要补充设备信息",
+                "outcome": "need_user",
+                "diagnosis_summary": "先保持供电并使用官方恢复流程",
+                "recommended_actions": [
+                    {
+                        "action_code": "generic_troubleshooting",
+                        "text": "保持设备供电并重新进入官方恢复流程",
+                        "evidence_refs": ["device-1"],
+                    }
+                ],
+                "evidence_refs": ["device-1"],
+                "evidence": [
+                    {
+                        "evidence_id": "device-1",
+                        "kind": "device",
+                        "content": "固件恢复流程需要稳定供电",
+                        "source_title": "设备状态",
+                        "source_url": None,
+                    }
+                ],
+                "citations": [],
+                "draft_answer": answer,
+                "final_answer": answer,
+                "remaining_unknowns": ["device_model", "error_state"],
+                "review_decision": "approve",
+                "requires_human": False,
+                "response_version": 1,
+                "status_events": [
+                    graph_event(command_id, 1, "new", "triaged"),
+                    graph_event(command_id, 2, "triaged", "diagnosing"),
+                    graph_event(command_id, 3, "diagnosing", "reviewing"),
+                    graph_event(
+                        command_id,
+                        4,
+                        "reviewing",
+                        "pending_user",
+                        "guidance_finalized",
+                    ),
+                ],
+            }
+
+        result = self.runtime(
+            FakeGraph(side_effects=[partial_result])
+        ).submit(
+            "固件升级中断了怎么办？",
+            "1001",
+            request_id="partial-guidance",
+        )
+
+        self.assertEqual(result.status, "pending_user")
+        self.assertEqual(result.clarity, "partial")
+        self.assertEqual(
+            result.missing_fields, ["device_model", "error_state"]
+        )
+        self.assertEqual(
+            result.final_answer,
+            "请保持设备供电，并从官方应用重新进入恢复流程。",
+        )
+        stored = self.repo.get_ticket(result.ticket_id)
+        self.assertEqual(stored["status"], "pending_user")
+        self.assertEqual(stored["review_decision"], "approve")
+        self.assertEqual(stored["clarity"], "partial")
+
     def test_fault_matrix_expired_command_only_resumes_from_checkpoint(self):
         result = run_fault_case("expired_command_lease")
         self.assertEqual(result.graph_start_count, 0)

@@ -246,12 +246,13 @@ class DemoReadinessTest(unittest.TestCase):
         readme = read_text("README.md")
 
         for edge in (
-            'R2 -->|信息仍不足| PU',
+            'R2 -->|只能先澄清| PU',
             'RV --> R3{"确定性 Review Router"}',
             'R3 -->|一次返工| D',
             'R3 -->|升级人工| ES',
             'R3 -->|审查通过| PG',
-            'PG -->|通过| OK',
+            'PG -->|完整答复通过| OK',
+            'PG -->|基础建议通过| PU',
             'PG -->|阻断| ES',
         ):
             self.assertIn(edge, readme)

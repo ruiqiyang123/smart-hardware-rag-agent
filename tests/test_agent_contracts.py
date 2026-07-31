@@ -21,6 +21,9 @@ def triage_result(**overrides):
         "priority": "P2",
         "risk_level": "low",
         "risk_flags": [],
+        "clarity": "clear",
+        "clarification_question": "",
+        "clarification_options": [],
         "missing_fields": [],
         "suggested_route": "diagnose",
         "summary": "普通设备问题",
@@ -245,8 +248,9 @@ class AgentContractTest(unittest.TestCase):
     def test_normal_classification_uses_p2_and_configured_missing_fields(self):
         model_result = triage_result(
             category="firmware_repair",
+            clarity="partial",
             missing_fields=["device_model"],
-            suggested_route="ask_user",
+            suggested_route="diagnose",
         )
         result = TriageAgent(
             runner=FakeStructuredRunner(model_result),
@@ -265,20 +269,35 @@ class AgentContractTest(unittest.TestCase):
         self.assertEqual(result["risk_level"], "medium")
         self.assertEqual(result["priority"], "P2")
         self.assertEqual(result["missing_fields"], ["device_model"])
-        self.assertEqual(result["suggested_route"], "ask_user")
+        self.assertEqual(result["clarity"], "partial")
+        self.assertEqual(result["suggested_route"], "diagnose")
 
-    def test_missing_field_outside_category_and_empty_ask_user_are_rejected(self):
+    def test_missing_field_outside_category_and_empty_clarification_are_rejected(self):
+        empty_clarification = triage_result().model_dump(mode="json")
+        empty_clarification.update(
+            {
+                "clarity": "ambiguous",
+                "suggested_route": "clarify",
+                "clarification_question": "",
+                "clarification_options": [],
+            }
+        )
         cases = (
             triage_result(
                 category="firmware_repair",
+                clarity="partial",
                 missing_fields=["chain_name"],
-                suggested_route="ask_user",
+                suggested_route="diagnose",
             ),
-            triage_result(missing_fields=[], suggested_route="ask_user"),
+            empty_clarification,
         )
         for result in cases:
             with self.subTest(
-                result=result.model_dump(mode="json")
+                result=(
+                    result.model_dump(mode="json")
+                    if isinstance(result, TriageResult)
+                    else result
+                )
             ), self.assertRaises(ValueError):
                 TriageAgent(
                     runner=FakeStructuredRunner(result),
@@ -421,8 +440,8 @@ class AgentContractTest(unittest.TestCase):
         self.assertIn("分类未出现在", description)
         self.assertIn("空数组", description)
         route_description = properties["suggested_route"]["description"]
-        self.assertIn("missing_fields 非空", route_description)
-        self.assertIn("不得使用 ask_user", route_description)
+        self.assertIn("ambiguous", route_description)
+        self.assertIn("partial", route_description)
 
     def test_triage_prompt_forbids_inventing_unconfigured_missing_fields(self):
         agent = TriageAgent(
@@ -433,7 +452,7 @@ class AgentContractTest(unittest.TestCase):
         self.assertIn("required_fields 是必要字段的唯一权威白名单", agent.prompt)
         self.assertIn("category 未出现在 required_fields", agent.prompt)
         self.assertIn("不得凭常识新增必要字段", agent.prompt)
-        self.assertIn("missing_fields 为空时不得使用 ask_user", agent.prompt)
+        self.assertIn("clarity=partial、suggested_route=diagnose", agent.prompt)
 
     def test_prompt_load_is_independent_of_current_working_directory(self):
         runner = FakeStructuredRunner(triage_result())
@@ -656,13 +675,12 @@ class DiagnosisContractTest(unittest.TestCase):
                     tool_registry=registry,
                 )
 
-    def test_high_risk_human_security_and_missing_fields_short_circuit(self):
+    def test_high_risk_human_and_security_short_circuit(self):
         cases = (
             (self._state(risk_level="high"), "escalate"),
             (self._state(risk_flags=["remote_control"]), "escalate"),
             (self._state(requires_human=True), "escalate"),
             (self._state(category="security_report"), "escalate"),
-            (self._state(missing_fields=["device_model"]), "need_user"),
         )
         for state, expected in cases:
             plan = FakeStructuredRunner(AssertionError("model must not run"))
@@ -682,6 +700,25 @@ class DiagnosisContractTest(unittest.TestCase):
                 self.assertEqual(plan.calls, [])
                 self.assertEqual(answer.calls, [])
                 self.assertEqual(tool_calls, [])
+
+    def test_missing_fields_produce_evidence_backed_guidance_before_waiting(self):
+        answer = self._answer(
+            outcome="need_user",
+            draft_answer="请先保持设备供电并重新打开官方应用。",
+            remaining_unknowns=["device_model"],
+        )
+        agent = self._agent(answer=answer)
+        result = agent.run(
+            self._state(
+                category="firmware_repair",
+                missing_fields=["device_model"],
+            )
+        )
+        self.assertEqual(result["outcome"], "need_user")
+        self.assertTrue(result["draft_answer"])
+        self.assertEqual(result["remaining_unknowns"], ["device_model"])
+        plan_payload = json.loads(agent.plan_runner.calls[0][1].content)
+        self.assertEqual(plan_payload["missing_fields"], ["device_model"])
 
     def test_plan_and_answer_messages_are_json_without_reasoning(self):
         agent = self._agent()
@@ -735,7 +772,8 @@ class DiagnosisContractTest(unittest.TestCase):
         self.assertIn("generic_troubleshooting", action_description)
 
         prompt = self._agent().prompt
-        self.assertIn("进入回答生成阶段表示必要字段已经齐全", prompt)
+        self.assertIn("missing_fields 非空表示意图已经明确", prompt)
+        self.assertIn("先依据知识库生成", prompt)
         self.assertIn("outcome=draft 时 remaining_unknowns 必须为空数组", prompt)
         self.assertIn("warranty_decision 只能用于 warranty_service", prompt)
         self.assertIn("其他普通分类只能使用 generic_troubleshooting", prompt)

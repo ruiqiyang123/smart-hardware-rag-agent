@@ -46,7 +46,7 @@ class OrchestrationRoutesTest(unittest.TestCase):
         "triaged": {"pending_user", "diagnosing", "escalated"},
         "pending_user": {"triaged", "escalated"},
         "diagnosing": {"pending_user", "reviewing", "escalated"},
-        "reviewing": {"resolved", "diagnosing", "escalated"},
+        "reviewing": {"pending_user", "resolved", "diagnosing", "escalated"},
         "escalated": {"resolved", "pending_user", "escalated"},
         "resolved": set(),
     }
@@ -123,6 +123,9 @@ class OrchestrationRoutesTest(unittest.TestCase):
             "status": "triaged",
             "category": "usb_connection",
             "risk_level": "low",
+            "clarity": "clear",
+            "clarification_question": "",
+            "clarification_options": [],
             "suggested_route": "diagnose",
             "missing_fields": [],
             "requires_human": False,
@@ -135,10 +138,23 @@ class OrchestrationRoutesTest(unittest.TestCase):
         self.assertEqual(
             route_after_triage(
                 self._triage_state(
-                    suggested_route="ask_user", missing_fields=["device_model"]
+                    clarity="ambiguous",
+                    suggested_route="clarify",
+                    clarification_question="你遇到的是哪一类问题？",
+                    clarification_options=["无法开机", "无法连接"],
                 )
             ),
             "pending_user",
+        )
+        self.assertEqual(
+            route_after_triage(
+                self._triage_state(
+                    category="firmware_repair",
+                    clarity="partial",
+                    missing_fields=["device_model"],
+                )
+            ),
+            "start_diagnosis",
         )
         self.assertEqual(
             route_after_triage(self._triage_state(category="security_report")),
@@ -167,12 +183,20 @@ class OrchestrationRoutesTest(unittest.TestCase):
             self._triage_state(risk_level="severe"),
             self._triage_state(category="unknown"),
             self._triage_state(suggested_route="unknown"),
+            self._triage_state(clarity="unknown"),
             self._triage_state(missing_fields="device_model"),
             self._triage_state(missing_fields=["unknown"]),
             self._triage_state(requires_human=1),
-            self._triage_state(suggested_route="ask_user", missing_fields=[]),
             self._triage_state(
-                suggested_route="diagnose", missing_fields=["device_model"]
+                clarity="ambiguous",
+                suggested_route="clarify",
+                clarification_question="",
+                clarification_options=[],
+            ),
+            self._triage_state(
+                clarity="clear",
+                suggested_route="diagnose",
+                missing_fields=["device_model"],
             ),
             {"status": "escalated", "category": "unknown"},
             {"status": "escalated", "suggested_route": "unknown"},

@@ -64,6 +64,9 @@ _TRIAGE_FIELDS = frozenset(
         "priority",
         "risk_level",
         "risk_flags",
+        "clarity",
+        "clarification_question",
+        "clarification_options",
         "missing_fields",
         "suggested_route",
         "summary",
@@ -602,6 +605,8 @@ def _diagnosis_node(
             if outcome not in outcomes:
                 raise ValueError("诊断 outcome 非法")
             target = outcomes[outcome]
+            if outcome == "need_user" and raw.get("draft_answer"):
+                target = Status.REVIEWING
             actions = raw.get("recommended_actions", [])
             if not isinstance(actions, list):
                 raise ValueError("recommended_actions 非法")
@@ -723,21 +728,34 @@ def _finalize_node(policy_guard: object) -> Callable[[TicketState], dict]:
             policy_guard, state.get("draft_answer"), state.get("citations", [])
         ):
             return _fail_closed(state, "finalize", "FINAL_POLICY_FAILURE")
-        assert_transition(Status.REVIEWING.value, Status.RESOLVED.value)
+        waiting_for_user = (
+            state.get("outcome") == "need_user"
+            and bool(state.get("remaining_unknowns"))
+        )
+        target = Status.PENDING_USER if waiting_for_user else Status.RESOLVED
+        assert_transition(Status.REVIEWING.value, target.value)
         version = state.get("response_version", 0)
         if isinstance(version, bool) or not isinstance(version, int) or version < 0:
             return _fail_closed(state, "finalize", "FINALIZE_FAILURE")
         return with_event(
             state,
             {
-                "status": Status.RESOLVED.value,
+                "status": target.value,
                 "requires_human": False,
                 "final_answer": state["draft_answer"],
                 "response_version": version + 1,
             },
             node_name="finalize",
-            event_type="response_finalized",
-            summary="答复通过策略复检并结案",
+            event_type=(
+                "guidance_finalized"
+                if waiting_for_user
+                else "response_finalized"
+            ),
+            summary=(
+                "基础答复通过策略复检，等待客户补充"
+                if waiting_for_user
+                else "答复通过策略复检并结案"
+            ),
         )
 
     return run
@@ -905,6 +923,8 @@ def _await_user(state: TicketState) -> dict:
         "type": "await_user",
         "ticket_id": _identifier(state.get("ticket_id"), "ticket_id"),
         "missing_fields": list(state.get("missing_fields", [])),
+        "clarification_question": state.get("clarification_question", ""),
+        "clarification_options": list(state.get("clarification_options", [])),
     }
     if state.get("last_error") == "INVALID_USER_RESUME":
         payload["validation_error"] = True
@@ -972,7 +992,12 @@ def _await_user(state: TicketState) -> dict:
                 "sensitive_flags": sensitive_flags,
                 "risk_flags": risk_flags,
                 "risk_level": effective_risk_level,
+                "clarity": "clear",
+                "clarification_question": "",
+                "clarification_options": [],
                 "missing_fields": [],
+                "draft_answer": "",
+                "final_answer": "",
                 "last_error": "",
             },
             node_name="await_user",
@@ -1079,8 +1104,14 @@ def build_support_graph(
     builder.add_edge("escalate", "human_review")
     builder.add_conditional_edges(
         "finalize",
-        lambda state: "end" if state.get("status") == Status.RESOLVED.value else "human_review",
-        {"end": END, "human_review": "human_review"},
+        lambda state: (
+            "end"
+            if state.get("status") == Status.RESOLVED.value
+            else "await_user"
+            if state.get("status") == Status.PENDING_USER.value
+            else "human_review"
+        ),
+        {"end": END, "await_user": "await_user", "human_review": "human_review"},
     )
     builder.add_conditional_edges(
         "human_review",

@@ -36,6 +36,9 @@ def _triage(_state):
         "priority": "P2",
         "risk_level": "low",
         "risk_flags": [],
+        "clarity": "clear",
+        "clarification_question": "",
+        "clarification_options": [],
         "missing_fields": [],
         "suggested_route": "diagnose",
         "summary": "低风险电源问题",
@@ -135,6 +138,126 @@ class HumanInLoopTest(unittest.TestCase):
             result["final_answer"], "请先更换可信电源线，然后重新连接设备。"
         )
         self.assertEqual(result["response_version"], 1)
+
+    def test_ambiguous_ticket_asks_one_question_without_running_diagnosis(self):
+        diagnosis_calls = []
+
+        def triage(state):
+            return {
+                **_triage(state),
+                "category": "other",
+                "clarity": "ambiguous",
+                "clarification_question": "你遇到的是哪一类问题？",
+                "clarification_options": ["设备无法开机", "设备无法连接"],
+                "suggested_route": "clarify",
+            }
+
+        def diagnosis(state):
+            diagnosis_calls.append(state)
+            return _diagnosis(state)
+
+        from agent.orchestration.graph import build_support_graph
+
+        result = build_support_graph(
+            triage=triage,
+            diagnosis=diagnosis,
+            review=_review,
+            policy_guard=lambda _text, _citations: True,
+            checkpointer=MemorySaver(),
+        ).invoke(
+            _initial_state(sanitized_input="我的钱包有问题"),
+            {"configurable": {"thread_id": "ambiguous"}},
+        )
+
+        self.assertEqual(result["status"], "pending_user")
+        self.assertEqual(result["clarity"], "ambiguous")
+        self.assertEqual(
+            result["clarification_options"], ["设备无法开机", "设备无法连接"]
+        )
+        self.assertEqual(diagnosis_calls, [])
+        self.assertIn("__interrupt__", result)
+
+    def test_partial_ticket_sends_reviewed_guidance_before_asking_for_details(self):
+        def triage(state):
+            if "KeyGuard Mini" in state["sanitized_input"]:
+                return {
+                    **_triage(state),
+                    "category": "firmware_repair",
+                    "summary": "固件升级中断，信息已补充完整",
+                }
+            return {
+                **_triage(state),
+                "category": "firmware_repair",
+                "clarity": "partial",
+                "missing_fields": ["device_model", "error_state"],
+                "summary": "固件升级中断，需要补充设备信息",
+            }
+
+        def diagnosis(state):
+            if not state.get("missing_fields"):
+                return {
+                    **_diagnosis(state),
+                    "diagnosis_summary": "设备信息完整，可以继续官方恢复流程",
+                    "draft_answer": "请在 KeyGuard Mini 上保持供电，并按照官方应用提示重新执行恢复。",
+                }
+            return {
+                **_diagnosis(state),
+                "outcome": "need_user",
+                "diagnosis_summary": "先保持设备供电并使用官方应用恢复",
+                "draft_answer": "请先保持设备供电，不要反复插拔，并在官方应用中重新进入恢复流程。",
+                "remaining_unknowns": ["device_model", "error_state"],
+            }
+
+        from agent.orchestration.graph import build_support_graph
+
+        graph = build_support_graph(
+            triage=triage,
+            diagnosis=diagnosis,
+            review=_review,
+            policy_guard=lambda _text, _citations: True,
+            checkpointer=MemorySaver(),
+        )
+        config = {"configurable": {"thread_id": "partial"}}
+        result = graph.invoke(
+            _initial_state(sanitized_input="固件升级中断了怎么办？"),
+            config,
+        )
+
+        self.assertEqual(result["status"], "pending_user")
+        self.assertEqual(result["clarity"], "partial")
+        self.assertEqual(
+            result["final_answer"],
+            "请先保持设备供电，不要反复插拔，并在官方应用中重新进入恢复流程。",
+        )
+        self.assertEqual(
+            result["remaining_unknowns"], ["device_model", "error_state"]
+        )
+        self.assertEqual(
+            result["status_events"][-1]["event_type"], "guidance_finalized"
+        )
+        self.assertIn("__interrupt__", result)
+
+        resumed = graph.invoke(
+            Command(
+                resume={
+                    "command_id": "partial-user-reply",
+                    "request_id": "partial-request-2",
+                    "sanitized_input": "设备是 KeyGuard Mini，屏幕显示 Update failed",
+                    "sensitive_flags": [],
+                    "risk_flags": [],
+                    "risk_level": "low",
+                }
+            ),
+            config,
+        )
+        self.assertEqual(resumed["ticket_id"], result["ticket_id"])
+        self.assertEqual(resumed["status"], "resolved")
+        self.assertEqual(resumed["clarity"], "clear")
+        self.assertEqual(resumed["missing_fields"], [])
+        self.assertEqual(
+            resumed["final_answer"],
+            "请在 KeyGuard Mini 上保持供电，并按照官方应用提示重新执行恢复。",
+        )
 
     def test_critical_ticket_skips_triage_and_interrupts_for_human(self):
         calls = []

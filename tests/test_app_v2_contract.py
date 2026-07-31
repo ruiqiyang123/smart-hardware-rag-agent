@@ -30,8 +30,13 @@ class AppV2ContractTest(unittest.TestCase):
         runtime_secret = self.function_source("_runtime_secret")
 
         self.assertIn("if name in os.environ", runtime_secret)
+        self.assertIn("st.secrets.load_if_toml_exists()", runtime_secret)
         self.assertLess(
             runtime_secret.index("if name in os.environ"),
+            runtime_secret.index("st.secrets.load_if_toml_exists()"),
+        )
+        self.assertLess(
+            runtime_secret.index("st.secrets.load_if_toml_exists()"),
             runtime_secret.index("st.secrets.get"),
         )
 

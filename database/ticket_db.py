@@ -73,7 +73,19 @@ CATEGORY_VALUES = {
     "security_report",
     "other",
 }
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+CLARITY_VALUES = {"ambiguous", "partial", "clear"}
+MISSING_FIELD_VALUES = {
+    "device_model",
+    "app_os",
+    "connection_type",
+    "firmware_version",
+    "error_state",
+    "serial_last4",
+    "purchase_date",
+    "transaction_hash",
+    "chain_name",
+}
 _EMPTY_PAYLOAD_FINGERPRINT = "0" * 64
 _PAYLOAD_FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _WORKBENCH_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}", re.ASCII)
@@ -105,6 +117,15 @@ CREATE TABLE IF NOT EXISTS tickets (
     risk_level TEXT CHECK(
         risk_level IS NULL OR risk_level IN ('low', 'medium', 'high', 'critical')
     ),
+    clarity TEXT CHECK(
+        clarity IS NULL OR clarity IN ('ambiguous', 'partial', 'clear')
+    ),
+    clarification_question TEXT,
+    clarification_options_json TEXT NOT NULL DEFAULT '[]'
+        CHECK(
+            json_valid(clarification_options_json)
+            AND json_type(clarification_options_json) = 'array'
+        ),
     sanitized_input TEXT NOT NULL CHECK(length(trim(sanitized_input)) > 0),
     summary TEXT CHECK(summary IS NULL OR length(trim(summary)) > 0),
     risk_flags_json TEXT NOT NULL DEFAULT '[]'
@@ -189,7 +210,7 @@ CREATE TABLE IF NOT EXISTS ticket_events (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_ticket_commands_one_in_progress
     ON ticket_commands(ticket_id)
     WHERE status = 'in_progress';
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 """
 _SENSITIVE_METADATA_KEYS = {
     "pin",
@@ -210,6 +231,7 @@ class TicketRepository:
     _BUSY_TIMEOUT_MS = 5000
     _JSON_LIST_FIELDS = {
         "risk_flags_json",
+        "clarification_options_json",
         "missing_fields_json",
         "evidence_refs_json",
     }
@@ -218,6 +240,8 @@ class TicketRepository:
         "category",
         "priority",
         "risk_level",
+        "clarity",
+        "clarification_question",
         "summary",
         *_JSON_LIST_FIELDS,
         "draft_answer",
@@ -250,6 +274,10 @@ class TicketRepository:
         "category",
         "priority",
         "risk_level",
+        "clarity",
+        "clarification_question",
+        "clarification_options_json",
+        "missing_fields_json",
         "draft_answer",
         "manual_gate_reason",
     )
@@ -284,6 +312,22 @@ class TicketRepository:
                 if "parent_ticket_id" not in columns:
                     connection.execute(
                         "ALTER TABLE tickets ADD COLUMN parent_ticket_id TEXT"
+                    )
+                if "clarity" not in columns:
+                    connection.execute(
+                        "ALTER TABLE tickets ADD COLUMN clarity TEXT"
+                    )
+                if "clarification_question" not in columns:
+                    connection.execute(
+                        "ALTER TABLE tickets ADD COLUMN clarification_question TEXT"
+                    )
+                if "clarification_options_json" not in columns:
+                    connection.execute(
+                        """
+                        ALTER TABLE tickets
+                        ADD COLUMN clarification_options_json TEXT
+                        NOT NULL DEFAULT '[]'
+                        """
                     )
                 connection.execute(
                     """
@@ -407,6 +451,40 @@ class TicketRepository:
         risk_level = cls._enum_value(
             row.get("risk_level"), "risk_level", RISK_LEVEL_VALUES
         )
+        clarity = cls._enum_value(
+            row.get("clarity"), "clarity", CLARITY_VALUES
+        )
+        raw_options = row.get("clarification_options_json", "[]")
+        if not isinstance(raw_options, str):
+            raise ValueError("clarification_options_json 不可安全展示")
+        try:
+            options = json.loads(raw_options)
+        except (TypeError, ValueError):
+            raise ValueError("clarification_options_json 不可安全展示") from None
+        if not isinstance(options, list) or len(options) > 5:
+            raise ValueError("clarification_options_json 不可安全展示")
+        safe_options = [
+            cls._project_workbench_text(
+                option, "clarification_option", 300
+            )
+            for option in options
+        ]
+        raw_missing = row.get("missing_fields_json", "[]")
+        if not isinstance(raw_missing, str):
+            raise ValueError("missing_fields_json 不可安全展示")
+        try:
+            missing_fields = json.loads(raw_missing)
+        except (TypeError, ValueError):
+            raise ValueError("missing_fields_json 不可安全展示") from None
+        if (
+            not isinstance(missing_fields, list)
+            or any(
+                not isinstance(field, str) or field not in MISSING_FIELD_VALUES
+                for field in missing_fields
+            )
+            or len(missing_fields) != len(set(missing_fields))
+        ):
+            raise ValueError("missing_fields_json 不可安全展示")
         return {
             "ticket_id": cls._project_workbench_identifier(
                 row.get("ticket_id"), "ticket_id"
@@ -434,6 +512,15 @@ class TicketRepository:
             "category": category,
             "priority": priority,
             "risk_level": risk_level,
+            "clarity": clarity,
+            "clarification_question": cls._project_workbench_text(
+                row.get("clarification_question"),
+                "clarification_question",
+                300,
+                optional=True,
+            ),
+            "clarification_options": safe_options,
+            "missing_fields": missing_fields,
             "draft_answer": cls._project_workbench_text(
                 row.get("draft_answer"), "draft_answer", 2_000, optional=True
             ),

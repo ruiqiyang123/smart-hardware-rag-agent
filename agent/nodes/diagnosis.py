@@ -507,11 +507,7 @@ class DiagnosisAgent:
         if unsafe:
             return _terminal_result("escalate", "该工单需要人工安全处理")
         if missing_fields:
-            return _terminal_result(
-                "need_user",
-                "需要补充必要信息",
-                remaining_unknowns=missing_fields,
-            )
+            allowed = allowed & {"knowledge_search", "profile"}
         safe_tool_context = _safe_tool_context(state, sanitized_input)
         review_feedback = _review_feedback(state)
 
@@ -536,7 +532,7 @@ class DiagnosisAgent:
             "allowed_tools": sorted(allowed),
             "category": category,
             "sanitized_input": sanitized_input,
-            "missing_fields": [],
+            "missing_fields": [field.value for field in missing_fields],
         }
         if review_feedback is not None:
             plan_payload["review_feedback"] = review_feedback
@@ -617,6 +613,7 @@ class DiagnosisAgent:
                 "category": category,
                 "risk_level": risk_level.value,
                 "risk_flags": [flag.value for flag in risk_flags],
+                "missing_fields": [field.value for field in missing_fields],
             },
             "evidence": evidence_json,
         }
@@ -640,6 +637,20 @@ class DiagnosisAgent:
             self.timeout_seconds,
             self.retries,
         )
+        if missing_fields:
+            expected_unknowns = {field.value for field in missing_fields}
+            actual_unknowns = {
+                field.value
+                if isinstance(field, MissingField)
+                else field
+                for field in result.remaining_unknowns
+            }
+            if (
+                result.outcome != "need_user"
+                or not result.draft_answer
+                or actual_unknowns != expected_unknowns
+            ):
+                raise ValueError("部分清楚问题必须先回答并保留既定缺失字段")
         output = result.model_dump(mode="json")
         output["evidence"] = evidence_json
         output["tool_errors"] = []

@@ -145,6 +145,10 @@ class OrchestrationResult:
     sanitized_input: str
     user_notice: str
     final_answer: str
+    clarity: str
+    clarification_question: str
+    clarification_options: List[str]
+    missing_fields: List[str]
     citations: List[dict]
     events: List[dict]
     duplicate: bool = False
@@ -1103,11 +1107,25 @@ class SupportOrchestrator:
             citations,
         )
 
+        clarity = state.get("clarity")
+        if clarity is not None and clarity not in {"ambiguous", "partial", "clear"}:
+            raise ValueError("clarity 非法")
         updates = {
             "status": final_status,
             "category": state.get("category"),
             "priority": state.get("priority"),
             "risk_level": state.get("risk_level"),
+            "clarity": clarity,
+            "clarification_question": _optional_output_text(
+                state.get("clarification_question"),
+                "clarification_question",
+                300,
+            ),
+            "clarification_options_json": _string_list(
+                state.get("clarification_options", []),
+                "clarification_options",
+                5,
+            ),
             "summary": _optional_output_text(state.get("summary"), "summary", 300),
             "risk_flags_json": _string_list(
                 state.get("risk_flags", []), "risk_flags", 16
@@ -1326,6 +1344,44 @@ class SupportOrchestrator:
             allow_empty=True,
         )
         if final_status != Status.RESOLVED.value:
+            if final_status == Status.PENDING_USER.value and final_answer:
+                if (
+                    command_type != CommandType.USER_INPUT.value
+                    or state.get("outcome") != "need_user"
+                    or state.get("review_decision") != "approve"
+                    or state.get("final_answer") != state.get("draft_answer")
+                    or not state.get("remaining_unknowns")
+                    or state.get("clarity") != "partial"
+                    or requires_human
+                ):
+                    raise ValueError("pending_user 基础答复语义非法")
+                try:
+                    diagnosis = DiagnosisResult.model_validate(
+                        {
+                            "outcome": state.get("outcome"),
+                            "diagnosis_summary": state.get("diagnosis_summary"),
+                            "recommended_actions": state.get(
+                                "recommended_actions"
+                            ),
+                            "evidence_refs": state.get("evidence_refs"),
+                            "citations": state.get("citations"),
+                            "draft_answer": state.get("draft_answer"),
+                            "remaining_unknowns": state.get(
+                                "remaining_unknowns"
+                            ),
+                        }
+                    )
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        "pending_user 基础答复 diagnosis 语义非法"
+                    ) from None
+                expected_unknowns = {
+                    field.value for field in diagnosis.remaining_unknowns
+                }
+                if expected_unknowns != set(state.get("missing_fields") or []):
+                    raise ValueError("pending_user 缺失字段与诊断结果不一致")
+                self._final_policy_passes(final_answer, citations)
+                return
             if final_answer:
                 raise ValueError("非 resolved 状态不得包含 final_answer")
             if final_status == Status.ESCALATED.value and not requires_human:
@@ -1524,8 +1580,42 @@ class SupportOrchestrator:
             if not final_answer or requires_human != 0:
                 raise ValueError("resolved ticket 终态非法")
             self._final_policy_passes(final_answer, citations)
+        elif result_status == Status.PENDING_USER.value and final_answer:
+            if (
+                ticket.get("review_decision") != "approve"
+                or requires_human != 0
+                or checkpoint.get("outcome") != "need_user"
+                or checkpoint.get("review_decision") != "approve"
+                or checkpoint.get("clarity") != "partial"
+                or checkpoint.get("final_answer") != final_answer
+                or checkpoint.get("draft_answer") != final_answer
+                or not checkpoint.get("remaining_unknowns")
+            ):
+                raise ValueError("pending_user ticket 基础答复非法")
+            self._final_policy_passes(final_answer, citations)
         elif final_answer:
             raise ValueError("非 resolved ticket 不得返回 final_answer")
+        clarity = ticket.get("clarity") or ""
+        if clarity and clarity not in {"ambiguous", "partial", "clear"}:
+            raise ValueError("ticket clarity 非法")
+        clarification_question = ticket.get("clarification_question") or ""
+        if clarification_question:
+            clarification_question = _safe_text(
+                clarification_question, "clarification_question", 300
+            )
+        try:
+            clarification_options = _string_list(
+                json.loads(ticket.get("clarification_options_json") or "[]"),
+                "clarification_options",
+                5,
+            )
+            missing_fields = _string_list(
+                json.loads(ticket.get("missing_fields_json") or "[]"),
+                "missing_fields",
+                16,
+            )
+        except (TypeError, ValueError):
+            raise ValueError("ticket 引导字段非法") from None
         sanitized_input = _safe_text(
             sanitized_input, "sanitized_input", 10_000, allow_empty=True
         )
@@ -1541,6 +1631,10 @@ class SupportOrchestrator:
             sanitized_input=sanitized_input,
             user_notice=user_notice,
             final_answer=final_answer,
+            clarity=clarity,
+            clarification_question=clarification_question,
+            clarification_options=clarification_options,
+            missing_fields=missing_fields,
             citations=citations,
             events=self._events(self.repository.list_events(ticket_id)),
             duplicate=duplicate,

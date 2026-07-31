@@ -46,7 +46,7 @@ KeyGuard 使用虚构硬件钱包品牌和模拟业务数据，演示蓝牙连�
 | 常见 Agent Demo 问题 | 常见做法 | KeyGuard 2.0 |
 |---|---|---|
 | 模型决定全部流程 | 一次 ReAct 循环自由选择工具 | Router 使用确定性规则控制下一跳 |
-| 信息不足时仍然回答 | 依赖 Prompt 提醒模型不要猜 | 进入 `pending_user`，补充信息后恢复 |
+| 问题含糊或信息不完整 | 要么猜测，要么只让用户补充 | 含糊时给选项澄清；意图明确时先给基础建议，再精准追问 |
 | 敏感信息进入历史 | 只在最终回答中隐藏 | Ingress Guard 在持久化之前脱敏 |
 | 高风险动作自动执行 | 继续让模型生成步骤 | 进入 `escalated` 和人工工作台 |
 | Agent 反复返工 | 没有独立循环边界 | Review 最多退回一次，再失败转人工 |
@@ -72,21 +72,22 @@ KeyGuard 使用虚构硬件钱包品牌和模拟业务数据，演示蓝牙连�
 flowchart LR
     U["用户 / 客户对话"] --> IG["Ingress Guard<br/>持久化前脱敏"]
     IG --> DB["Ticket Store<br/>工单与审计事件"]
-    DB --> T["Triage Agent<br/>分类、风险、缺失字段"]
+    DB --> T["Triage Agent<br/>分类、风险、清晰度"]
     T --> TR{"Triage Router"}
-    TR -->|信息不足| PU["pending_user<br/>等待用户补充"]
+    TR -->|意图含糊| PU["pending_user<br/>问题 + 可选答案"]
     TR -->|高风险| ES["escalated<br/>人工接管"]
-    TR -->|可以诊断| D["Diagnosis Agent<br/>检索证据、生成方案"]
+    TR -->|意图明确| D["Diagnosis Agent<br/>检索证据、生成方案"]
     D <--> TOOLS["只读 Tools<br/>RAG / 档案 / 保修 / 链状态"]
     D --> R2{"确定性 Diagnosis Router"}
-    R2 -->|信息仍不足| PU
+    R2 -->|只能先澄清| PU
     R2 -->|需要人工动作| ES
-    R2 -->|形成草稿| RV["Review Agent<br/>证据、安全、可执行性"]
+    R2 -->|完整答复或基础建议| RV["Review Agent<br/>证据、安全、可执行性"]
     RV --> R3{"确定性 Review Router"}
     R3 -->|一次返工| D
     R3 -->|升级人工| ES
     R3 -->|审查通过| PG["Policy Guard<br/>最终确定性校验"]
-    PG -->|通过| OK["resolved"]
+    PG -->|完整答复通过| OK["resolved"]
+    PG -->|基础建议通过| PU
     PG -->|阻断| ES
     PU -->|补充非敏感信息| T
     ES --> WB["工单工作台 / HITL"]
@@ -103,13 +104,14 @@ stateDiagram-v2
     [*] --> new
     new --> triaged: Triage 完成
     new --> escalated: 入口风险门禁
-    triaged --> pending_user: 信息不足
+    triaged --> pending_user: 意图含糊，先澄清
     triaged --> diagnosing: 信息齐全
     triaged --> escalated: 高风险
     diagnosing --> pending_user: 仍需补充
     diagnosing --> reviewing: 形成证据方案
     diagnosing --> escalated: 需要人工动作
     reviewing --> diagnosing: 返工（最多一次）
+    reviewing --> pending_user: 建议已复核，等待用户补充
     reviewing --> resolved: Review 和 Policy 通过
     reviewing --> escalated: 复核或策略阻断
     pending_user --> triaged: 用户补充
@@ -130,13 +132,15 @@ stateDiagram-v2
 
 **它做什么？**
 
-先判断用户遇到的是什么问题、风险有多高、继续处理还缺什么信息。
+先判断用户遇到的是什么问题、风险有多高，以及问题是含糊、部分清楚还是足够清楚。
 
 | 输入 | 结构化输出 | 不负责 |
 |---|---|---|
-| 已脱敏问题、工单上下文 | 意图、类别、优先级、风险、缺失字段、路由建议 | 不查询保修、不生成最终解决方案 |
+| 已脱敏问题、工单上下文 | 意图、类别、优先级、风险、清晰度、澄清选项、缺失字段、路由建议 | 不查询保修、不生成最终解决方案 |
 
 高风险输出必须满足 Pydantic 约束。例如助记词泄露、钓鱼或资产丢失必须是 `critical / P0 / escalate`，模型不能把它们静默降级。
+
+低风险问题采用渐进式澄清：像“我的钱包有问题”这种无法确定方向的输入，会先给出一个具体问题和 2–5 个选项；像“固件升级中断了怎么办”这种意图已明确但缺少设备型号、错误码的输入，会继续检索知识库，先返回经 Review 审核的安全恢复建议，再提示用户补充必要信息。用户回复后恢复同一张工单，不会重新丢失上下文。
 
 ### Agent 2：Diagnosis Agent（诊断）
 
@@ -256,7 +260,7 @@ class SanitizedText:
 | 场景 | 示例输入 | 应观察到的编排行为 |
 |---|---|---|
 | 蓝牙故障 | “蓝牙连不上手机，权限已开，App 和系统都是最新版。” | 自动分诊、检索证据、Review 后解决，回答附来源 |
-| 固件中断 | “升级固件时断开了，现在怎么办？” | 信息不足时进入 `pending_user`，补充设备和错误状态后恢复 |
+| 固件中断 | “升级固件时断开了，现在怎么办？” | 先给安全恢复建议，再提示补充设备型号和错误状态，并从同一工单恢复 |
 | 敏感信息 | 使用仓库测试词串模拟助记词泄露 | 入库前脱敏、固定安全提示、风险保持并进入 `escalated` |
 | 保修判断 | 提供演示序列号后四位 `A1B2` | 查询模拟证据；涉及保修结论时等待人工处理 |
 
@@ -345,9 +349,9 @@ streamlit run app.py
 pytest -q
 ```
 
-当前发布基线（2026-07-29）：
+当前发布基线（2026-07-31）：
 
-- **429 个测试通过**；
+- **448 个测试通过**；
 - **597 个参数化子测试通过**；
 - 覆盖状态转移、路由、安全脱敏、证据、持久化、恢复、Human-in-the-loop 和故障注入。
 
