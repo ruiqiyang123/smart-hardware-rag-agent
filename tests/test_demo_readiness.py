@@ -251,9 +251,10 @@ class DemoReadinessTest(unittest.TestCase):
             'R3 -->|一次返工| D',
             'R3 -->|升级人工| ES',
             'R3 -->|审查通过| PG',
-            'PG -->|完整答复通过| OK',
+            'PG -->|完整答复通过| PU',
             'PG -->|基础建议通过| PU',
             'PG -->|阻断| ES',
+            'PU -->|客户确认已解决| OK',
         ):
             self.assertIn(edge, readme)
         self.assertNotIn('PG -->|一次返工| D', readme)

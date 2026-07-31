@@ -26,6 +26,7 @@ from langgraph.types import Command, Interrupt
 
 from agent.orchestration.events import make_event, to_repository_event
 from agent.orchestration.invoke import invoke_with_policy
+from agent.orchestration.resolution_intent import is_resolution_confirmation
 from agent.orchestration.routes import assert_transition
 from agent.orchestration.state import (
     DiagnosisResult,
@@ -34,6 +35,7 @@ from agent.orchestration.state import (
     RiskLevel,
     Status,
     TicketState,
+    WaitingReason,
 )
 from agent.security.secrets import TransactionHash, contains_unredacted_secret
 from agent.security.trusted_sources import TrustedSourcePolicy
@@ -142,6 +144,7 @@ def _safe_exception_type(error: BaseException) -> str:
 class OrchestrationResult:
     ticket_id: str
     status: str
+    waiting_reason: str
     sanitized_input: str
     user_notice: str
     final_answer: str
@@ -1110,8 +1113,13 @@ class SupportOrchestrator:
         clarity = state.get("clarity")
         if clarity is not None and clarity not in {"ambiguous", "partial", "clear"}:
             raise ValueError("clarity 非法")
+        waiting_reason = state.get("waiting_reason")
+        allowed_waiting_reasons = {item.value for item in WaitingReason}
+        if waiting_reason is not None and waiting_reason not in allowed_waiting_reasons:
+            raise ValueError("waiting_reason 非法")
         updates = {
             "status": final_status,
+            "waiting_reason": waiting_reason,
             "category": state.get("category"),
             "priority": state.get("priority"),
             "risk_level": state.get("risk_level"),
@@ -1337,66 +1345,20 @@ class SupportOrchestrator:
         requires_human = state.get("requires_human", False)
         if not isinstance(requires_human, bool):
             raise ValueError("requires_human 非法")
+        waiting_reason = state.get("waiting_reason")
+        allowed_waiting_reasons = {item.value for item in WaitingReason}
+        if waiting_reason is not None and waiting_reason not in allowed_waiting_reasons:
+            raise ValueError("waiting_reason 非法")
         final_answer = _safe_text(
             state.get("final_answer", ""),
             "final_answer",
             2_000,
             allow_empty=True,
         )
-        if final_status != Status.RESOLVED.value:
-            if final_status == Status.PENDING_USER.value and final_answer:
-                if (
-                    command_type != CommandType.USER_INPUT.value
-                    or state.get("outcome") != "need_user"
-                    or state.get("review_decision") != "approve"
-                    or state.get("final_answer") != state.get("draft_answer")
-                    or not state.get("remaining_unknowns")
-                    or state.get("clarity") != "partial"
-                    or requires_human
-                ):
-                    raise ValueError("pending_user 基础答复语义非法")
-                try:
-                    diagnosis = DiagnosisResult.model_validate(
-                        {
-                            "outcome": state.get("outcome"),
-                            "diagnosis_summary": state.get("diagnosis_summary"),
-                            "recommended_actions": state.get(
-                                "recommended_actions"
-                            ),
-                            "evidence_refs": state.get("evidence_refs"),
-                            "citations": state.get("citations"),
-                            "draft_answer": state.get("draft_answer"),
-                            "remaining_unknowns": state.get(
-                                "remaining_unknowns"
-                            ),
-                        }
-                    )
-                except (TypeError, ValueError):
-                    raise ValueError(
-                        "pending_user 基础答复 diagnosis 语义非法"
-                    ) from None
-                expected_unknowns = {
-                    field.value for field in diagnosis.remaining_unknowns
-                }
-                if expected_unknowns != set(state.get("missing_fields") or []):
-                    raise ValueError("pending_user 缺失字段与诊断结果不一致")
-                self._final_policy_passes(final_answer, citations)
-                return
-            if final_answer:
-                raise ValueError("非 resolved 状态不得包含 final_answer")
-            if final_status == Status.ESCALATED.value and not requires_human:
-                raise ValueError("escalated 状态必须 requires_human")
-            return
 
-        if not final_answer or requires_human:
-            raise ValueError("resolved 状态必须包含答复且关闭人工门")
-        review_decision = state.get("review_decision")
-        human_decision = state.get("human_decision")
-        if command_type == CommandType.USER_INPUT.value:
-            if review_decision != "approve" or human_decision not in {None, ""}:
-                raise ValueError("USER_INPUT resolved 必须由 Review approve")
+        def validated_diagnosis() -> DiagnosisResult:
             try:
-                DiagnosisResult.model_validate(
+                return DiagnosisResult.model_validate(
                     {
                         "outcome": state.get("outcome"),
                         "diagnosis_summary": state.get("diagnosis_summary"),
@@ -1408,17 +1370,71 @@ class SupportOrchestrator:
                     }
                 )
             except (TypeError, ValueError):
-                raise ValueError("USER_INPUT resolved diagnosis 语义非法") from None
-            if state.get("tool_errors") != []:
-                raise ValueError("USER_INPUT resolved tool_errors 必须为空")
+                raise ValueError("终态 diagnosis 语义非法") from None
+
+        if final_status != Status.RESOLVED.value:
+            if final_status == Status.PENDING_USER.value:
+                if waiting_reason is None or requires_human:
+                    raise ValueError("pending_user 必须提供合法等待原因并关闭人工门")
+                if final_answer:
+                    if (
+                        command_type != CommandType.USER_INPUT.value
+                        or state.get("review_decision") != "approve"
+                        or state.get("final_answer") != state.get("draft_answer")
+                    ):
+                        raise ValueError("pending_user 已审核答复语义非法")
+                    diagnosis = validated_diagnosis()
+                    if waiting_reason == WaitingReason.MISSING_INFORMATION.value:
+                        expected_unknowns = {
+                            field.value for field in diagnosis.remaining_unknowns
+                        }
+                        if (
+                            state.get("outcome") != "need_user"
+                            or not expected_unknowns
+                            or state.get("clarity") != "partial"
+                            or expected_unknowns
+                            != set(state.get("missing_fields") or [])
+                        ):
+                            raise ValueError("等待补充信息语义非法")
+                    elif waiting_reason == WaitingReason.RESOLUTION_CONFIRMATION.value:
+                        if (
+                            state.get("outcome") != "draft"
+                            or state.get("remaining_unknowns") != []
+                            or state.get("clarity") != "clear"
+                            or state.get("tool_errors") != []
+                            or state.get("review_reasons") != ["passed"]
+                            or state.get("review_issues") != []
+                            or state.get("required_changes") != []
+                        ):
+                            raise ValueError("等待解决确认语义非法")
+                    else:
+                        raise ValueError("含答复的 pending_user 等待原因非法")
+                    self._final_policy_passes(final_answer, citations)
+                    return
+                if waiting_reason == WaitingReason.RESOLUTION_CONFIRMATION.value:
+                    raise ValueError("等待解决确认必须保留已审核答复")
+                return
+            if final_answer:
+                raise ValueError("非 resolved 状态不得包含 final_answer")
+            if final_status == Status.ESCALATED.value and not requires_human:
+                raise ValueError("escalated 状态必须 requires_human")
+            if final_status != Status.PENDING_USER.value and waiting_reason is not None:
+                raise ValueError("非 pending_user 状态不得包含 waiting_reason")
+            return
+
+        if not final_answer or requires_human or waiting_reason is not None:
+            raise ValueError("resolved 状态必须包含答复且关闭人工门")
+        review_decision = state.get("review_decision")
+        human_decision = state.get("human_decision")
+        if command_type == CommandType.USER_INPUT.value:
             if (
-                state.get("review_reasons") != ["passed"]
-                or state.get("review_issues") != []
-                or state.get("required_changes") != []
+                state.get("resolution_confirmed") is not True
+                or review_decision != "approve"
+                or human_decision not in {None, ""}
+                or state.get("final_answer") != state.get("draft_answer")
             ):
-                raise ValueError("USER_INPUT resolved review 语义非法")
-            if state.get("final_answer") != state.get("draft_answer"):
-                raise ValueError("USER_INPUT resolved 答复与审核草稿不一致")
+                raise ValueError("USER_INPUT resolved 必须来自客户明确确认")
+            validated_diagnosis()
         else:
             if human_action not in {"approve", "edit_send"}:
                 raise ValueError("ask_user/reject 不得 resolved")
@@ -1564,7 +1580,15 @@ class SupportOrchestrator:
         user_notice: str,
         duplicate: bool = False,
     ) -> OrchestrationResult:
-        ticket = self.repository.get_ticket(ticket_id)
+        try:
+            ticket = self.repository.get_ticket(ticket_id)
+        except Exception as error:
+            self._log_failure(
+                ticket_id, "runtime", "PERSISTENCE_FAILURE", error
+            )
+            raise PersistenceFailureError(
+                ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
+            ) from None
         if ticket is None:
             raise ValueError(f"工单不存在: {ticket_id}")
         checkpoint = self._checkpoint_values(ticket_id)
@@ -1573,28 +1597,55 @@ class SupportOrchestrator:
         if final_answer:
             final_answer = _safe_text(final_answer, "final_answer", 2_000)
         result_status = _status(ticket.get("status"))
+        waiting_reason = ticket.get("waiting_reason") or ""
+        allowed_waiting_reasons = {item.value for item in WaitingReason}
+        if waiting_reason and waiting_reason not in allowed_waiting_reasons:
+            raise ValueError("ticket waiting_reason 非法")
         requires_human = ticket.get("requires_human")
         if requires_human not in {0, 1}:
             raise ValueError("ticket requires_human 非法")
         if result_status == Status.RESOLVED.value:
-            if not final_answer or requires_human != 0:
+            if not final_answer or requires_human != 0 or waiting_reason:
                 raise ValueError("resolved ticket 终态非法")
             self._final_policy_passes(final_answer, citations)
         elif result_status == Status.PENDING_USER.value and final_answer:
             if (
                 ticket.get("review_decision") != "approve"
                 or requires_human != 0
-                or checkpoint.get("outcome") != "need_user"
                 or checkpoint.get("review_decision") != "approve"
-                or checkpoint.get("clarity") != "partial"
                 or checkpoint.get("final_answer") != final_answer
                 or checkpoint.get("draft_answer") != final_answer
-                or not checkpoint.get("remaining_unknowns")
+                or waiting_reason
+                not in {
+                    WaitingReason.MISSING_INFORMATION.value,
+                    WaitingReason.RESOLUTION_CONFIRMATION.value,
+                }
             ):
-                raise ValueError("pending_user ticket 基础答复非法")
+                raise ValueError("pending_user ticket 已审核答复非法")
+            if waiting_reason == WaitingReason.MISSING_INFORMATION.value:
+                if (
+                    checkpoint.get("outcome") != "need_user"
+                    or checkpoint.get("clarity") != "partial"
+                    or not checkpoint.get("remaining_unknowns")
+                ):
+                    raise ValueError("pending_user ticket 补充信息语义非法")
+            elif (
+                checkpoint.get("outcome") != "draft"
+                or checkpoint.get("clarity") != "clear"
+                or checkpoint.get("remaining_unknowns") != []
+            ):
+                raise ValueError("pending_user ticket 解决确认语义非法")
             self._final_policy_passes(final_answer, citations)
+        elif result_status == Status.PENDING_USER.value:
+            if waiting_reason not in {
+                WaitingReason.CLARIFICATION.value,
+                WaitingReason.MISSING_INFORMATION.value,
+            }:
+                raise ValueError("pending_user ticket 等待原因非法")
         elif final_answer:
             raise ValueError("非 resolved ticket 不得返回 final_answer")
+        elif waiting_reason:
+            raise ValueError("非 pending_user ticket 不得包含等待原因")
         clarity = ticket.get("clarity") or ""
         if clarity and clarity not in {"ambiguous", "partial", "clear"}:
             raise ValueError("ticket clarity 非法")
@@ -1628,6 +1679,7 @@ class SupportOrchestrator:
         return OrchestrationResult(
             ticket_id=_identifier(ticket_id, "ticket_id"),
             status=result_status,
+            waiting_reason=waiting_reason,
             sanitized_input=sanitized_input,
             user_notice=user_notice,
             final_answer=final_answer,
@@ -1882,6 +1934,24 @@ class SupportOrchestrator:
         request_id = _identifier(request_id, "request_id", 120)
         sanitized_input = sanitized.sanitized_input
         risk_flags = list(sanitized.risk_flags)
+        try:
+            ticket = self.repository.get_ticket(ticket_id)
+        except Exception as error:
+            self._log_failure(
+                ticket_id, "runtime", "PERSISTENCE_FAILURE", error
+            )
+            raise PersistenceFailureError(
+                ERROR_USER_MESSAGES["PERSISTENCE_FAILURE"]
+            ) from None
+        if ticket is None:
+            raise ValueError(f"工单不存在: {ticket_id}")
+        confirms_resolution = (
+            ticket.get("waiting_reason")
+            == WaitingReason.RESOLUTION_CONFIRMATION.value
+            and sanitized.risk_level == RiskLevel.LOW.value
+            and not risk_flags
+            and is_resolution_confirmation(sanitized_input)
+        )
         fingerprint = _payload_fingerprint(
             {
                 "kind": "resume_user",
@@ -1909,8 +1979,13 @@ class SupportOrchestrator:
         if duplicate is not None:
             return duplicate
 
-        resume_command = Command(
-            resume={
+        resume_payload = (
+            {
+                "command_id": command_id,
+                "action": "confirm_resolved",
+            }
+            if confirms_resolution
+            else {
                 "command_id": command_id,
                 "request_id": request_id,
                 "sanitized_input": sanitized_input,
@@ -1919,6 +1994,7 @@ class SupportOrchestrator:
                 "risk_level": sanitized.risk_level,
             }
         )
+        resume_command = Command(resume=resume_payload)
         self._execute(
             ticket_id=ticket_id,
             command_id=command_id,
@@ -1930,6 +2006,21 @@ class SupportOrchestrator:
             ticket_id,
             sanitized_input,
             sanitized.critical_notice,
+        )
+
+    def confirm_resolution(
+        self,
+        ticket_id: str,
+        action_id: Optional[str] = None,
+    ) -> OrchestrationResult:
+        """Close an answered ticket through the same audited customer path."""
+
+        action_id = uuid.uuid4().hex if action_id is None else action_id
+        action_id = _identifier(action_id, "action_id", 100)
+        return self.resume_user_prepared(
+            ticket_id,
+            self.prepare_user_input("问题已解决"),
+            request_id=f"confirm:{action_id}",
         )
 
     def human_action(

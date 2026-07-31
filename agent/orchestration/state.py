@@ -41,6 +41,12 @@ class Status(str, Enum):
     RESOLVED = "resolved"
 
 
+class WaitingReason(str, Enum):
+    CLARIFICATION = "clarification"
+    MISSING_INFORMATION = "missing_information"
+    RESOLUTION_CONFIRMATION = "resolution_confirmation"
+
+
 class RiskLevel(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
@@ -393,6 +399,8 @@ class TicketState(TypedDict, total=False):
     revision_count: int
     response_version: int
     status: str
+    waiting_reason: str
+    resolution_confirmed: bool
     requires_human: bool
     manual_gate_reason: str
     human_decision: str

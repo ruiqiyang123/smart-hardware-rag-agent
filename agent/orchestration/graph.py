@@ -38,6 +38,7 @@ from agent.orchestration.state import (
     Status,
     TicketState,
     TriageResult,
+    WaitingReason,
 )
 from agent.security.secrets import contains_unredacted_secret
 from agent.security.trusted_sources import TrustedSourcePolicy
@@ -439,6 +440,7 @@ def _fail_closed(state: Mapping[str, object], node_name: str, code: str) -> dict
         state,
         {
             "status": Status.ESCALATED.value,
+            "waiting_reason": None,
             "requires_human": True,
             "draft_answer": "",
             "final_answer": "",
@@ -500,7 +502,11 @@ def _entry(state: TicketState) -> dict:
         assert_transition(current.value, Status.ESCALATED.value)
         return with_event(
             state,
-            {"status": Status.ESCALATED.value, "requires_human": True},
+            {
+                "status": Status.ESCALATED.value,
+                "waiting_reason": None,
+                "requires_human": True,
+            },
             node_name="entry",
             event_type="risk_gate",
             summary="风险门禁要求人工处理",
@@ -538,6 +544,7 @@ def _triage_node(dependency: Callable[[dict], object]) -> Callable[[TicketState]
             target = Status.TRIAGED
             assert_transition(current.value, target.value)
             raw["status"] = target.value
+            raw["waiting_reason"] = None
             route_after_triage({**dict(state), **raw})
             return with_event(
                 state,
@@ -562,7 +569,7 @@ def _start_diagnosis(state: TicketState) -> dict:
     assert_transition(state.get("status"), Status.DIAGNOSING.value)
     return with_event(
         state,
-        {"status": Status.DIAGNOSING.value},
+        {"status": Status.DIAGNOSING.value, "waiting_reason": None},
         node_name="start_diagnosis",
         event_type="diagnosis_started",
         summary="诊断已开始",
@@ -621,6 +628,11 @@ def _diagnosis_node(
                 raw["requires_human"] = True
                 raw["manual_gate_reason"] = ",".join(gated)
             raw["status"] = target.value
+            raw["waiting_reason"] = (
+                WaitingReason.MISSING_INFORMATION.value
+                if target == Status.PENDING_USER
+                else None
+            )
             if target == Status.ESCALATED:
                 raw["requires_human"] = True
                 if outcome == "escalate":
@@ -649,7 +661,10 @@ def _pending_user(state: TicketState) -> dict:
         assert_transition(current.value, Status.PENDING_USER.value)
     return with_event(
         state,
-        {"status": Status.PENDING_USER.value},
+        {
+            "status": Status.PENDING_USER.value,
+            "waiting_reason": WaitingReason.CLARIFICATION.value,
+        },
         node_name="pending_user",
         event_type="user_information_required",
         summary="等待用户补充必要信息",
@@ -715,7 +730,12 @@ def _escalate(state: TicketState) -> dict:
         assert_transition(current.value, Status.ESCALATED.value)
     return with_event(
         state,
-        {"status": Status.ESCALATED.value, "requires_human": True, "final_answer": ""},
+        {
+            "status": Status.ESCALATED.value,
+            "waiting_reason": None,
+            "requires_human": True,
+            "final_answer": "",
+        },
         node_name="escalate",
         event_type="escalated",
         summary="工单已升级人工处理",
@@ -728,11 +748,11 @@ def _finalize_node(policy_guard: object) -> Callable[[TicketState], dict]:
             policy_guard, state.get("draft_answer"), state.get("citations", [])
         ):
             return _fail_closed(state, "finalize", "FINAL_POLICY_FAILURE")
-        waiting_for_user = (
+        waiting_for_information = (
             state.get("outcome") == "need_user"
             and bool(state.get("remaining_unknowns"))
         )
-        target = Status.PENDING_USER if waiting_for_user else Status.RESOLVED
+        target = Status.PENDING_USER
         assert_transition(Status.REVIEWING.value, target.value)
         version = state.get("response_version", 0)
         if isinstance(version, bool) or not isinstance(version, int) or version < 0:
@@ -741,6 +761,12 @@ def _finalize_node(policy_guard: object) -> Callable[[TicketState], dict]:
             state,
             {
                 "status": target.value,
+                "waiting_reason": (
+                    WaitingReason.MISSING_INFORMATION.value
+                    if waiting_for_information
+                    else WaitingReason.RESOLUTION_CONFIRMATION.value
+                ),
+                "resolution_confirmed": False,
                 "requires_human": False,
                 "final_answer": state["draft_answer"],
                 "response_version": version + 1,
@@ -748,13 +774,13 @@ def _finalize_node(policy_guard: object) -> Callable[[TicketState], dict]:
             node_name="finalize",
             event_type=(
                 "guidance_finalized"
-                if waiting_for_user
+                if waiting_for_information
                 else "response_finalized"
             ),
             summary=(
                 "基础答复通过策略复检，等待客户补充"
-                if waiting_for_user
-                else "答复通过策略复检并结案"
+                if waiting_for_information
+                else "完整答复已发送，等待客户确认是否解决"
             ),
         )
 
@@ -870,6 +896,7 @@ def _human_review_node(policy_guard: object) -> Callable[[TicketState], dict]:
                 state,
                 {
                     "status": Status.RESOLVED.value,
+                    "waiting_reason": None,
                     "requires_human": False,
                     "human_decision": action,
                     "final_answer": answer,
@@ -888,6 +915,8 @@ def _human_review_node(policy_guard: object) -> Callable[[TicketState], dict]:
                 state,
                 {
                     "status": Status.PENDING_USER.value,
+                    "waiting_reason": WaitingReason.MISSING_INFORMATION.value,
+                    "requires_human": False,
                     "human_decision": action,
                     "missing_fields": resume["missing_fields"],
                     "last_error": "",
@@ -902,6 +931,7 @@ def _human_review_node(policy_guard: object) -> Callable[[TicketState], dict]:
             state,
             {
                 "status": Status.ESCALATED.value,
+                "waiting_reason": None,
                 "requires_human": True,
                 "human_decision": "reject",
                 "last_error": "",
@@ -925,11 +955,41 @@ def _await_user(state: TicketState) -> dict:
         "missing_fields": list(state.get("missing_fields", [])),
         "clarification_question": state.get("clarification_question", ""),
         "clarification_options": list(state.get("clarification_options", [])),
+        "waiting_reason": state.get("waiting_reason"),
     }
     if state.get("last_error") == "INVALID_USER_RESUME":
         payload["validation_error"] = True
     resumed = interrupt(payload)
     try:
+        if (
+            isinstance(resumed, dict)
+            and set(resumed) == {"command_id", "action"}
+            and resumed.get("action") == "confirm_resolved"
+        ):
+            command_id = _identifier(resumed["command_id"], "command_id")
+            if (
+                state.get("waiting_reason")
+                != WaitingReason.RESOLUTION_CONFIRMATION.value
+                or not state.get("final_answer")
+                or state.get("review_decision") != "approve"
+                or state.get("requires_human", False)
+            ):
+                raise ValueError("当前工单不可确认结案")
+            assert_transition(Status.PENDING_USER.value, Status.RESOLVED.value)
+            return with_event(
+                state,
+                {
+                    "status": Status.RESOLVED.value,
+                    "waiting_reason": None,
+                    "resolution_confirmed": True,
+                    "last_error": "",
+                },
+                node_name="await_user",
+                event_type="user_confirmed_resolution",
+                summary="客户已确认问题解决，工单结案",
+                command_id=command_id,
+                step_index=1,
+            )
         required = {
             "command_id",
             "request_id",
@@ -996,6 +1056,9 @@ def _await_user(state: TicketState) -> dict:
                 "clarification_question": "",
                 "clarification_options": [],
                 "missing_fields": [],
+                "waiting_reason": None,
+                "resolution_confirmed": False,
+                "human_decision": "",
                 "draft_answer": "",
                 "final_answer": "",
                 "last_error": "",
@@ -1120,10 +1183,12 @@ def build_support_graph(
     )
     builder.add_conditional_edges(
         "await_user",
-        lambda state: "await_user"
+        lambda state: "end"
+        if state.get("status") == Status.RESOLVED.value
+        else "await_user"
         if state.get("last_error") == "INVALID_USER_RESUME"
         else "entry",
-        {"await_user": "await_user", "entry": "entry"},
+        {"end": END, "await_user": "await_user", "entry": "entry"},
     )
     return builder.compile(checkpointer=saver)
 

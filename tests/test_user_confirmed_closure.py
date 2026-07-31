@@ -1,0 +1,140 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from langgraph.checkpoint.memory import MemorySaver
+
+from agent.orchestration.graph import build_support_graph
+from agent.orchestration.runtime import SupportOrchestrator
+from agent.policies.security import IngressGuard, PolicyGuard
+from agent.security.trusted_sources import TrustedSourcePolicy
+from database.ticket_db import TicketRepository
+
+
+POLICY = {
+    "policy_version": "2026-07-31.user-confirmed-closure",
+    "official_domains": ["support.example.test"],
+    "critical_response_template_zh": "固定安全提示",
+}
+
+
+def triage(_state):
+    return {
+        "intent": "troubleshoot",
+        "category": "bluetooth_connection",
+        "priority": "P2",
+        "risk_level": "low",
+        "risk_flags": [],
+        "clarity": "clear",
+        "clarification_question": "",
+        "clarification_options": [],
+        "missing_fields": [],
+        "suggested_route": "diagnose",
+        "summary": "低风险蓝牙连接问题",
+    }
+
+
+def diagnosis(_state):
+    return {
+        "outcome": "draft",
+        "diagnosis_summary": "建议删除旧配对并重新连接。",
+        "recommended_actions": [
+            {
+                "action_code": "generic_troubleshooting",
+                "text": "删除旧配对记录后重新连接。",
+                "evidence_refs": ["kb-1"],
+            }
+        ],
+        "evidence_refs": ["kb-1"],
+        "evidence": [
+            {
+                "evidence_id": "kb-1",
+                "kind": "knowledge",
+                "content": "重新配对前需要删除旧配对记录。",
+                "source_title": "官方蓝牙排查",
+                "source_url": "https://support.example.test/bluetooth",
+            }
+        ],
+        "citations": [
+            {
+                "source_id": "kb-1",
+                "source_title": "官方蓝牙排查",
+                "source_url": "https://support.example.test/bluetooth",
+            }
+        ],
+        "draft_answer": "请删除手机和应用内的旧配对记录，然后重新连接。",
+        "remaining_unknowns": [],
+        "tool_errors": [],
+    }
+
+
+def review(_state):
+    return {
+        "review_decision": "approve",
+        "review_reasons": ["passed"],
+        "review_issues": [],
+        "required_changes": [],
+    }
+
+
+class UserConfirmedClosureTest(unittest.TestCase):
+    def test_follow_up_stays_open_and_explicit_confirmation_closes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trusted = TrustedSourcePolicy(["support.example.test"], [])
+            guard = PolicyGuard(POLICY, trusted_source_policy=trusted)
+            graph = build_support_graph(
+                triage_node=triage,
+                diagnosis_node=diagnosis,
+                review_node=review,
+                policy_guard=guard,
+                checkpointer=MemorySaver(),
+            )
+            runtime = SupportOrchestrator(
+                repository=TicketRepository(str(Path(directory) / "tickets.db")),
+                graph=graph,
+                ingress_guard=IngressGuard(POLICY),
+                recursion_limit=16,
+                lease_seconds=130,
+                graph_timeout_seconds=120,
+                trusted_source_policy=trusted,
+                final_policy_guard=guard,
+            )
+
+            first = runtime.submit(
+                "蓝牙无法连接手机，怎么排查？",
+                "1001",
+                request_id="first-question",
+            )
+            self.assertEqual(first.status, "pending_user")
+            self.assertEqual(first.waiting_reason, "resolution_confirmation")
+
+            follow_up = runtime.resume_user(
+                first.ticket_id,
+                "谢谢，但是还是不行",
+                request_id="follow-up",
+            )
+            self.assertEqual(follow_up.ticket_id, first.ticket_id)
+            self.assertEqual(follow_up.status, "pending_user")
+            self.assertEqual(
+                follow_up.waiting_reason,
+                "resolution_confirmation",
+            )
+
+            resolved = runtime.resume_user(
+                first.ticket_id,
+                "谢谢，已经解决了",
+                request_id="confirm-resolution",
+            )
+            self.assertEqual(resolved.ticket_id, first.ticket_id)
+            self.assertEqual(resolved.status, "resolved")
+            self.assertEqual(resolved.waiting_reason, "")
+            self.assertTrue(
+                any(
+                    event["event_type"] == "user_confirmed_resolution"
+                    for event in resolved.events
+                )
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -922,6 +922,7 @@ class TicketRepositoryTest(unittest.TestCase):
                 "conversation_id",
                 "parent_ticket_id",
                 "status",
+                "waiting_reason",
                 "sanitized_input",
                 "summary",
                 "category",

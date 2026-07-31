@@ -108,7 +108,7 @@ def _runtime_secret(name: str) -> Optional[str]:
 
 AGENT_VERSION = (_runtime_secret("KEYGUARD_AGENT_VERSION") or "v2").strip().lower()
 USE_V1_AGENT = AGENT_VERSION == "v1"
-ORCHESTRATOR_CONTRACT_VERSION = "2026-07-31-progressive-clarification-v3"
+ORCHESTRATOR_CONTRACT_VERSION = "2026-07-31-user-confirmed-closure-v4"
 SAFE_FAILURE_NOTICE = "⚠️ 当前请求未能安全完成，请稍后重试或联系人工客服。"
 PENDING_USER_NOTICE = "为了继续处理，请补充工单中标记的必要信息。"
 ESCALATED_NOTICE = "工单已进入人工审核，自动流程不会关闭该问题。"
@@ -748,6 +748,7 @@ def _answer_with_citations(result) -> str:
     clarification_options = getattr(result, "clarification_options", [])
     missing_fields = getattr(result, "missing_fields", [])
     citations = getattr(result, "citations", [])
+    events = getattr(result, "events", [])
     if not isinstance(status, str):
         status = ""
     if not isinstance(user_notice, str):
@@ -762,8 +763,16 @@ def _answer_with_citations(result) -> str:
         missing_fields = []
     if not isinstance(citations, list):
         citations = []
+    if not isinstance(events, list):
+        events = []
 
     answer = user_notice or final_answer
+    if status == "resolved" and any(
+        isinstance(event, dict)
+        and event.get("event_type") == "user_confirmed_resolution"
+        for event in events[-3:]
+    ):
+        return "✅ 好的，这张工单已标记为已解决。之后有新问题可以继续问我。"
     if status == "pending_user":
         clarification = _clarification_message(
             clarification_question,
@@ -953,6 +962,8 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
         return
 
     clear_frozen_request(st.session_state)
+    if route_ticket_id:
+        st.session_state.pop(f"followup_hint_{route_ticket_id}", None)
     if restoring:
         st.session_state[RECOVERY_NOTICE_SESSION_KEY] = RECOVERED_REQUEST_NOTICE
     st.session_state["active_ticket_id"] = result.ticket_id
@@ -1085,6 +1096,48 @@ def _run_human_action(
     st.rerun()
 
 
+def _run_resolution_confirmation(
+    orchestrator: SupportOrchestrator,
+    ticket_id: str,
+    user_id: str,
+) -> None:
+    action_key, action_id = _stable_action_id(ticket_id, "confirm_resolution")
+    try:
+        ticket = orchestrator.repository.get_ticket(ticket_id)
+        if (
+            ticket is None
+            or ticket.get("user_id") != user_id
+            or ticket.get("status") != "pending_user"
+            or ticket.get("waiting_reason") != "resolution_confirmation"
+        ):
+            raise ValueError("当前用户不可确认该工单")
+        result = orchestrator.confirm_resolution(ticket_id, action_id=action_id)
+    except (CommandInProgressError, TimeoutError) as error:
+        logger.error(
+            "[app]客户确认待恢复 stage=confirm_resolution error_type=%s",
+            type(error).__name__,
+        )
+        st.error(SAFE_FAILURE_NOTICE)
+        return
+    except Exception as error:
+        st.session_state.pop(action_key, None)
+        logger.error(
+            "[app]客户确认失败 stage=confirm_resolution error_type=%s",
+            type(error).__name__,
+        )
+        st.error(SAFE_FAILURE_NOTICE)
+        return
+    st.session_state.pop(action_key, None)
+    st.session_state["active_ticket_id"] = result.ticket_id
+    st.session_state["messages"].append(
+        {
+            "role": "assistant",
+            "content": "✅ 好的，这张工单已标记为已解决。之后有新问题可以继续问我。",
+        }
+    )
+    st.rerun()
+
+
 def _render_active_ticket(
     orchestrator: SupportOrchestrator,
     user_id: str,
@@ -1105,8 +1158,14 @@ def _render_active_ticket(
         )
         st.warning(SAFE_FAILURE_NOTICE)
         return
+    waiting_reason = ticket.get("waiting_reason") or ""
+    customer_status = {
+        "clarification": "等待你说明问题",
+        "missing_information": "等待你补充信息",
+        "resolution_confirmation": "等待你确认是否解决",
+    }.get(waiting_reason, ticket.get("status") or "-")
     st.caption(
-        f"当前工单 `{ticket_id}` · 状态 `{ticket.get('status') or '-'}` · "
+        f"当前工单 `{ticket_id}` · 状态 `{customer_status}` · "
         f"优先级 `{ticket.get('priority') or 'P2'}` · 风险 `{ticket.get('risk_level') or '-'}`"
     )
     completed_phases = project_customer_phases(events)
@@ -1135,6 +1194,29 @@ def _render_active_ticket(
                             st.rerun()
         elif missing_fields:
             st.info(_missing_fields_message(missing_fields))
+        elif waiting_reason == "resolution_confirmation":
+            st.info("这次回答解决你的问题了吗？工单会保持开启，直到你确认已解决。")
+            resolved_col, continue_col = st.columns(2)
+            with resolved_col:
+                if st.button(
+                    "✅ 已解决",
+                    key=f"customer_resolved_{ticket_id}",
+                    use_container_width=True,
+                ):
+                    _run_resolution_confirmation(
+                        orchestrator,
+                        ticket_id,
+                        user_id,
+                    )
+            with continue_col:
+                if st.button(
+                    "💬 继续追问",
+                    key=f"customer_continue_{ticket_id}",
+                    use_container_width=True,
+                ):
+                    st.session_state[f"followup_hint_{ticket_id}"] = True
+            if st.session_state.get(f"followup_hint_{ticket_id}"):
+                st.info("请直接在下方输入框补充现象，我会在同一张工单里继续处理。")
 
 
 def _render_operator_gate() -> bool:
@@ -1208,10 +1290,24 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
     resolved_tickets = [
         ticket for ticket in all_tickets if ticket.get("status") == "resolved"
     ]
+    waiting_for_clarification = sum(
+        ticket.get("waiting_reason") == "clarification"
+        for ticket in customer_tickets
+    )
+    waiting_for_information = sum(
+        ticket.get("waiting_reason") == "missing_information"
+        for ticket in customer_tickets
+    )
+    waiting_for_confirmation = sum(
+        ticket.get("waiting_reason") == "resolution_confirmation"
+        for ticket in customer_tickets
+    )
     st.caption(
-        f"待人工处理 {len(human_tickets)} · 待客户补充 {len(customer_tickets)} · "
-        f"已解决 {len(resolved_tickets)} · "
-        "低风险问题通常会自动结案"
+        f"待人工处理 {len(human_tickets)} · "
+        f"待客户说明 {waiting_for_clarification} · "
+        f"待客户补充 {waiting_for_information} · "
+        f"待客户确认 {waiting_for_confirmation} · "
+        f"已解决 {len(resolved_tickets)}"
     )
     view = st.selectbox(
         "工单范围",
@@ -1231,7 +1327,14 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
     for ticket in tickets:
         ticket_id = ticket["ticket_id"]
         status = ticket.get("status") or "-"
-        status_label = WORKBENCH_STATUS_LABELS.get(status, status)
+        status_label = {
+            "clarification": "等待客户说明问题",
+            "missing_information": "等待客户补充",
+            "resolution_confirmation": "等待客户确认",
+        }.get(
+            ticket.get("waiting_reason"),
+            WORKBENCH_STATUS_LABELS.get(status, status),
+        )
         label = (
             f"{ticket.get('priority') or 'P2'} · {ticket_id} · "
             f"{status_label}"
@@ -1296,7 +1399,14 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
 
             if status != "escalated":
                 if status == "pending_user":
-                    st.info("等待客户补充信息后，系统会继续处理这张工单。")
+                    waiting_message = {
+                        "clarification": "等待客户说明具体问题后，系统会继续处理这张工单。",
+                        "missing_information": "等待客户补充必要信息后，系统会继续处理这张工单。",
+                        "resolution_confirmation": (
+                            "答复已发送，等待客户确认是否解决；客户仍可在同一工单继续追问。"
+                        ),
+                    }.get(ticket.get("waiting_reason"), "等待客户回复。")
+                    st.info(waiting_message)
                 continue
 
             st.caption("人工审核区不会展示模型内部提示、工具参数或未审核的原始输出。")

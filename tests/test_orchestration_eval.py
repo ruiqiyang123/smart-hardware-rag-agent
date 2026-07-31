@@ -124,13 +124,6 @@ class OrchestrationDatasetTest(unittest.TestCase):
         false_secret_label[0]["contains_secret"] = True
         mutations.append(false_secret_label)
 
-        empty_pending_fields = copy.deepcopy(self.cases)
-        empty_pending_fields[0]["expected_route"] = "pending_user"
-        empty_pending_fields[0]["expected_final_status"] = "pending_user"
-        empty_pending_fields[0]["turns"][0]["expected_status"] = "pending_user"
-        empty_pending_fields[0]["expected_missing_fields"] = []
-        mutations.append(empty_pending_fields)
-
         for cases in mutations:
             with self.subTest(case=cases[0]["case_id"]), self.assertRaises(
                 CaseValidationError
@@ -417,6 +410,10 @@ class FakeEvaluationRunner:
                 "diagnosing",
                 "escalated",
             ]
+        if expected["expected_final_status"] == "pending_user" and not expected[
+            "expected_missing_fields"
+        ]:
+            return ["new", "triaged", "diagnosing", "reviewing", "pending_user"]
         return {
             "resolved": ["new", "triaged", "diagnosing", "reviewing", "resolved"],
             "pending_user": ["new", "triaged", "pending_user"],
@@ -633,10 +630,10 @@ class OrchestrationEvalRunnerTest(unittest.TestCase):
                     "reviewing",
                     "diagnosing",
                     "reviewing",
-                    "resolved",
+                    "pending_user",
                 ]
                 actual["turn_results"] = [
-                    {"turn_index": 1, "status": "resolved", "trace_index": 6}
+                    {"turn_index": 1, "status": "pending_user", "trace_index": 6}
                 ]
                 return actual
 

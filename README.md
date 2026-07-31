@@ -86,10 +86,11 @@ flowchart LR
     R3 -->|一次返工| D
     R3 -->|升级人工| ES
     R3 -->|审查通过| PG["Policy Guard<br/>最终确定性校验"]
-    PG -->|完整答复通过| OK["resolved"]
+    PG -->|完整答复通过| PU
     PG -->|基础建议通过| PU
     PG -->|阻断| ES
     PU -->|补充非敏感信息| T
+    PU -->|客户确认已解决| OK["resolved"]
     ES --> WB["工单工作台 / HITL"]
     WB -->|追问| PU
     WB -->|批准或编辑后发送| OK
@@ -112,9 +113,10 @@ stateDiagram-v2
     diagnosing --> escalated: 需要人工动作
     reviewing --> diagnosing: 返工（最多一次）
     reviewing --> pending_user: 建议已复核，等待用户补充
-    reviewing --> resolved: Review 和 Policy 通过
+    reviewing --> resolved: 受控终态兼容路径
     reviewing --> escalated: 复核或策略阻断
     pending_user --> triaged: 用户补充
+    pending_user --> resolved: 客户明确确认已解决
     pending_user --> escalated: 补充输入触发风险门禁
     escalated --> pending_user: 操作员追问
     escalated --> resolved: 操作员批准或编辑后发送
@@ -122,7 +124,7 @@ stateDiagram-v2
     resolved --> [*]
 ```
 
-状态集合固定为 `new`、`triaged`、`diagnosing`、`reviewing`、`pending_user`、`escalated`、`resolved`。模型输出结构化建议，但不能创造第八种状态或绕过允许的状态转移。
+状态集合固定为 `new`、`triaged`、`diagnosing`、`reviewing`、`pending_user`、`escalated`、`resolved`。模型输出结构化建议，但不能创造第八种状态或绕过允许的状态转移。完整自动答复会停在 `pending_user + resolution_confirmation`；只有客户明确确认，工单才进入 `resolved`。
 
 ---
 
@@ -351,8 +353,8 @@ pytest -q
 
 当前发布基线（2026-07-31）：
 
-- **449 个测试通过**；
-- **597 个参数化子测试通过**；
+- **453 个测试通过**；
+- **614 个参数化子测试通过**；
 - 覆盖状态转移、路由、安全脱敏、证据、持久化、恢复、Human-in-the-loop 和故障注入。
 
 ### 48 条离线评测
@@ -453,7 +455,7 @@ ai-hardware-cs-agent/
 KeyGuard 2.0｜多 Agent 硬件钱包售后工单系统｜个人项目
 
 • 基于 LangGraph StateGraph 设计 Triage、Diagnosis、Review 三 Agent 工单流程，
-  使用七状态状态机和确定性 Router 管理信息补充、一次返工、自动解决与人工升级。
+  使用七状态状态机和确定性 Router 管理信息补充、一次返工、客户确认结案与人工升级。
 
 • 实现持久化前敏感信息脱敏、风险粘性和出站 Policy Guard，覆盖助记词、私钥、
   PIN、Passphrase 与不可信链接等安全边界。
@@ -475,7 +477,7 @@ KeyGuard 2.0｜多 Agent 硬件钱包售后工单系统｜个人项目
 - 本地 Hash Embedding 方便 Demo 离线启动，但不能代表生产级语义召回能力；
 - Streamlit Cloud 文件系统是易失环境，SQLite、checkpoint 和向量缓存可能在重启或重新部署后丢失；
 - `KEYGUARD_OPERATOR_TOKEN` 是可选的 Demo 级共享令牌，不具备企业级身份、权限分层和轮换；
-- 低风险问题通常自动回复并结案；人工审核后的回复会同步回客户对话，结案后的追问会创建关联的后续工单；
+- 低风险问题会自动回复但保持开启；客户可在同一工单继续追问，只有点击“已解决”或明确表达问题已解决时才结案；
 - 外部保修和链状态工具均为模拟实现，没有连接厂商售后、真实 RPC 或资产操作接口；
 - V2 评测框架已经就绪，但仓库不预填未经真实 runner 执行的准确率、成本下降或 SLA。
 

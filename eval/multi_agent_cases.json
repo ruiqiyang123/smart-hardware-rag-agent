@@ -7,13 +7,13 @@
       {
         "turn_index": 1,
         "input": "硬件钱包开不了机，屏幕完全不亮怎么办？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "troubleshoot",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -42,13 +42,13 @@
       {
         "turn_index": 1,
         "input": "设备长期没用，现在插上电也没反应，要先排查什么？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "troubleshoot",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -77,13 +77,13 @@
       {
         "turn_index": 1,
         "input": "硬件钱包插电脑会亮屏，但 App 识别不到设备怎么办？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "troubleshoot",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -112,13 +112,13 @@
       {
         "turn_index": 1,
         "input": "电脑识别不到硬件钱包，该怎么排查 USB 线和端口？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "troubleshoot",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -147,13 +147,13 @@
       {
         "turn_index": 1,
         "input": "USB 连接后反复断开重连，是线的问题还是设备的问题？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "troubleshoot",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -182,13 +182,13 @@
       {
         "turn_index": 1,
         "input": "手机通过线缆连接不上硬件钱包怎么办？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "troubleshoot",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -217,13 +217,13 @@
       {
         "turn_index": 1,
         "input": "蓝牙没法连接手机，App 一直显示未发现设备怎么办？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "troubleshoot",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -252,13 +252,13 @@
       {
         "turn_index": 1,
         "input": "系统蓝牙能看到设备，但 KeyGuard App 连接失败怎么办？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "troubleshoot",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -287,13 +287,13 @@
       {
         "turn_index": 1,
         "input": "蓝牙连接经常断开，怎么判断是手机问题还是设备问题？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "troubleshoot",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -322,13 +322,13 @@
       {
         "turn_index": 1,
         "input": "设备屏幕卡死没有响应，能不能继续确认交易？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "troubleshoot",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "medium",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -357,13 +357,13 @@
       {
         "turn_index": 1,
         "input": "硬件钱包按键无响应，应该先做哪些排查？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "troubleshoot",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -427,13 +427,13 @@
       {
         "turn_index": 1,
         "input": "PIN 输错太多次设备锁定了，资产会不会丢？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "recovery",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -497,13 +497,13 @@
       {
         "turn_index": 1,
         "input": "客服能不能帮我破解 PIN 或远程解锁？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "recovery",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -532,13 +532,13 @@
       {
         "turn_index": 1,
         "input": "固件升级前需要准备什么，避免设备变砖？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "troubleshoot",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -853,13 +853,13 @@
       {
         "turn_index": 1,
         "input": "恢复钱包后余额为零，可能是什么原因？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "recovery",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,
@@ -888,13 +888,13 @@
       {
         "turn_index": 1,
         "input": "怎么验证我写下来的备份词有没有写错？",
-        "expected_status": "resolved"
+        "expected_status": "pending_user"
       }
     ],
     "expected_intent": "recovery",
     "expected_priority": "P2",
-    "expected_route": "resolved",
-    "expected_final_status": "resolved",
+    "expected_route": "pending_user",
+    "expected_final_status": "pending_user",
     "expected_risk_level": "low",
     "expected_missing_fields": [],
     "expected_retry_count": 0,

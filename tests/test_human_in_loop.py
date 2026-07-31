@@ -126,18 +126,35 @@ class HumanInLoopTest(unittest.TestCase):
             checkpointer=MemorySaver(),
         )
 
-    def test_low_risk_ticket_is_reviewed_and_resolved(self):
-        result = self._graph().invoke(
+    def test_low_risk_ticket_waits_for_customer_confirmation(self):
+        graph = self._graph()
+        config = {"configurable": {"thread_id": "low-risk"}}
+        result = graph.invoke(
             _initial_state(),
-            {"configurable": {"thread_id": "low-risk"}},
+            config,
         )
 
-        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["status"], "pending_user")
+        self.assertEqual(result["waiting_reason"], "resolution_confirmation")
         self.assertEqual(result["outcome"], "draft")
         self.assertEqual(
             result["final_answer"], "请先更换可信电源线，然后重新连接设备。"
         )
         self.assertEqual(result["response_version"], 1)
+        self.assertIn("__interrupt__", result)
+
+        confirmed = graph.invoke(
+            Command(
+                resume={
+                    "command_id": "confirm-low-risk",
+                    "action": "confirm_resolved",
+                }
+            ),
+            config,
+        )
+        self.assertEqual(confirmed["status"], "resolved")
+        self.assertIsNone(confirmed["waiting_reason"])
+        self.assertTrue(confirmed["resolution_confirmed"])
 
     def test_ambiguous_ticket_asks_one_question_without_running_diagnosis(self):
         diagnosis_calls = []
@@ -251,7 +268,8 @@ class HumanInLoopTest(unittest.TestCase):
             config,
         )
         self.assertEqual(resumed["ticket_id"], result["ticket_id"])
-        self.assertEqual(resumed["status"], "resolved")
+        self.assertEqual(resumed["status"], "pending_user")
+        self.assertEqual(resumed["waiting_reason"], "resolution_confirmation")
         self.assertEqual(resumed["clarity"], "clear")
         self.assertEqual(resumed["missing_fields"], [])
         self.assertEqual(
@@ -367,7 +385,8 @@ class HumanInLoopTest(unittest.TestCase):
             config,
         )
 
-        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["status"], "pending_user")
+        self.assertEqual(result["waiting_reason"], "resolution_confirmation")
         self.assertEqual(triage_calls, ["设备型号为 Nano X，当前无法开机"])
         self.assertGreaterEqual(result["event_step"], 2)
 
@@ -505,7 +524,8 @@ class HumanInLoopTest(unittest.TestCase):
             {"configurable": {"thread_id": "one-revision"}},
         )
 
-        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["status"], "pending_user")
+        self.assertEqual(result["waiting_reason"], "resolution_confirmation")
         self.assertEqual(result["revision_count"], 1)
         self.assertEqual(len(diagnosis_states), 2)
         self.assertEqual(diagnosis_states[1]["review_reasons"], ["incomplete_steps"])
@@ -662,7 +682,7 @@ class HumanInLoopTest(unittest.TestCase):
 
                 with ThreadPoolExecutor(max_workers=4) as executor:
                     statuses = list(executor.map(run, range(8)))
-                self.assertEqual(statuses, ["resolved"] * 8)
+                self.assertEqual(statuses, ["pending_user"] * 8)
             finally:
                 saver.close()
 

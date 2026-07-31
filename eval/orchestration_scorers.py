@@ -227,8 +227,8 @@ def validate_cases(cases: object) -> list[dict[str, object]]:
             f"{case_id}.expected_missing_fields",
             allowed=MISSING_FIELDS,
         )
-        if final_status == "pending_user" and not missing_fields:
-            _fail(f"{case_id}.pending_user 必须标注 expected_missing_fields")
+        # pending_user can either wait for missing information (non-empty
+        # fields) or wait for the customer's resolution confirmation (empty).
         retry_count = raw_case["expected_retry_count"]
         if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
             _fail(f"{case_id}.expected_retry_count 非法")

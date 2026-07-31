@@ -20,7 +20,9 @@ ALLOWED_TRANSITIONS: Mapping[Status, FrozenSet[Status]] = MappingProxyType(
         Status.TRIAGED: frozenset(
             {Status.PENDING_USER, Status.DIAGNOSING, Status.ESCALATED}
         ),
-        Status.PENDING_USER: frozenset({Status.TRIAGED, Status.ESCALATED}),
+        Status.PENDING_USER: frozenset(
+            {Status.TRIAGED, Status.ESCALATED, Status.RESOLVED}
+        ),
         Status.DIAGNOSING: frozenset(
             {Status.PENDING_USER, Status.REVIEWING, Status.ESCALATED}
         ),

@@ -157,7 +157,7 @@ class AppV2ContractTest(unittest.TestCase):
         source = self.function_source("get_or_build_orchestrator")
 
         self.assertIn(
-            'ORCHESTRATOR_CONTRACT_VERSION = "2026-07-31-progressive-clarification-v3"',
+            'ORCHESTRATOR_CONTRACT_VERSION = "2026-07-31-user-confirmed-closure-v4"',
             self.source,
         )
         self.assertIn("contract_version: str", source)

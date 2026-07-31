@@ -73,8 +73,13 @@ CATEGORY_VALUES = {
     "security_report",
     "other",
 }
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 CLARITY_VALUES = {"ambiguous", "partial", "clear"}
+WAITING_REASON_VALUES = {
+    "clarification",
+    "missing_information",
+    "resolution_confirmation",
+}
 MISSING_FIELD_VALUES = {
     "device_model",
     "app_os",
@@ -106,6 +111,9 @@ CREATE TABLE IF NOT EXISTS tickets (
     status TEXT NOT NULL CHECK(status IN (
         'new', 'triaged', 'diagnosing', 'reviewing', 'pending_user',
         'escalated', 'resolved'
+    )),
+    waiting_reason TEXT CHECK(waiting_reason IS NULL OR waiting_reason IN (
+        'clarification', 'missing_information', 'resolution_confirmation'
     )),
     category TEXT CHECK(category IS NULL OR category IN (
         'power', 'usb_connection', 'mobile_connection', 'bluetooth_connection',
@@ -210,7 +218,7 @@ CREATE TABLE IF NOT EXISTS ticket_events (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_ticket_commands_one_in_progress
     ON ticket_commands(ticket_id)
     WHERE status = 'in_progress';
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 """
 _SENSITIVE_METADATA_KEYS = {
     "pin",
@@ -237,6 +245,7 @@ class TicketRepository:
     }
     _WORKFLOW_UPDATABLE_FIELDS = {
         "status",
+        "waiting_reason",
         "category",
         "priority",
         "risk_level",
@@ -269,6 +278,7 @@ class TicketRepository:
         "conversation_id",
         "parent_ticket_id",
         "status",
+        "waiting_reason",
         "sanitized_input",
         "summary",
         "category",
@@ -328,6 +338,10 @@ class TicketRepository:
                         ADD COLUMN clarification_options_json TEXT
                         NOT NULL DEFAULT '[]'
                         """
+                    )
+                if "waiting_reason" not in columns:
+                    connection.execute(
+                        "ALTER TABLE tickets ADD COLUMN waiting_reason TEXT"
                     )
                 connection.execute(
                     """
@@ -446,6 +460,11 @@ class TicketRepository:
         if not isinstance(row, dict):
             raise TypeError("workbench ticket 必须是对象")
         status = cls._enum_value(row.get("status"), "status", STATUS_VALUES, False)
+        waiting_reason = cls._enum_value(
+            row.get("waiting_reason"),
+            "waiting_reason",
+            WAITING_REASON_VALUES,
+        )
         category = cls._enum_value(row.get("category"), "category", CATEGORY_VALUES)
         priority = cls._enum_value(row.get("priority"), "priority", PRIORITY_VALUES)
         risk_level = cls._enum_value(
@@ -503,6 +522,7 @@ class TicketRepository:
                 else None
             ),
             "status": status,
+            "waiting_reason": waiting_reason,
             "sanitized_input": cls._project_workbench_text(
                 row.get("sanitized_input"), "sanitized_input", 10_000
             ),
@@ -599,6 +619,10 @@ class TicketRepository:
             if field == "status":
                 prepared[field] = cls._enum_value(
                     value, field, STATUS_VALUES, allow_none=False
+                )
+            elif field == "waiting_reason":
+                prepared[field] = cls._enum_value(
+                    value, field, WAITING_REASON_VALUES
                 )
             elif field == "category":
                 prepared[field] = cls._enum_value(value, field, CATEGORY_VALUES)

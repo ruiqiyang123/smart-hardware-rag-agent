@@ -74,9 +74,9 @@ _MISSING_FIELDS = frozenset(
 _ALLOWED_TRANSITIONS = {
     "new": {"triaged", "escalated"},
     "triaged": {"pending_user", "diagnosing", "escalated"},
-    "pending_user": {"triaged", "escalated"},
+    "pending_user": {"triaged", "escalated", "resolved"},
     "diagnosing": {"pending_user", "reviewing", "escalated"},
-    "reviewing": {"resolved", "diagnosing", "escalated"},
+    "reviewing": {"pending_user", "resolved", "diagnosing", "escalated"},
     "escalated": {"resolved", "pending_user", "escalated"},
     "resolved": set(),
 }

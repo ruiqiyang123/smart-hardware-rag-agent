@@ -109,6 +109,7 @@ class FakeGraph:
                 state["human_decision"] = action
             if action == "ask_user":
                 state["missing_fields"] = list(resume["missing_fields"])
+                state["waiting_reason"] = "missing_information"
             if action is None:
                 for field in (
                     "request_id",
@@ -190,6 +191,7 @@ class FailureFallbackTest(unittest.TestCase):
                 **graph_input,
                 "event_step": 4,
                 "status": "pending_user",
+                "waiting_reason": "missing_information",
                 "category": "firmware_repair",
                 "priority": "P2",
                 "risk_level": "low",
@@ -319,6 +321,9 @@ class FailureFallbackTest(unittest.TestCase):
             decision.lease_version,
             {
                 "status": status,
+                "waiting_reason": (
+                    "clarification" if status == "pending_user" else None
+                ),
                 "risk_level": "low",
                 "requires_human": status == "escalated",
             },
