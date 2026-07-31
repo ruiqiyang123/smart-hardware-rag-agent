@@ -118,6 +118,7 @@ RECOVERED_REQUEST_NOTICE = (
 )
 RECOVERY_NOTICE_SESSION_KEY = "keyguard_v2_recovery_notice"
 PENDING_UI_REQUEST_SESSION_KEY = "keyguard_v2_pending_ui_request"
+CONVERSATION_ID_SESSION_KEY = "keyguard_conversation_id"
 PROCESSING_UI_NOTICE = "⏳ 正在安全检查、取证并生成回复…"
 OPERATOR_AUTH_SESSION_KEY = "keyguard_operator_auth"
 _UI_ID_PATTERN = re.compile(r"[0-9a-f]{32}", re.ASCII)
@@ -143,6 +144,7 @@ def _stable_action_id(ticket_id: str, action: str) -> tuple[str, str]:
 
 def _clear_customer_workflow_state() -> None:
     st.session_state.pop("active_ticket_id", None)
+    st.session_state.pop(CONVERSATION_ID_SESSION_KEY, None)
     clear_frozen_request(st.session_state)
     clear_frozen_actions(st.session_state)
     clear_editor_state(st.session_state)
@@ -161,8 +163,10 @@ def _operator_token_fingerprint(token: str) -> str:
 
 def _operator_is_authorized() -> bool:
     configured_token = _runtime_secret("KEYGUARD_OPERATOR_TOKEN")
+    if not configured_token:
+        return True
     proof = st.session_state.get(OPERATOR_AUTH_SESSION_KEY)
-    if not configured_token or not isinstance(proof, str):
+    if not isinstance(proof, str):
         return False
     expected = _operator_token_fingerprint(configured_token)
     return hmac.compare_digest(proof, expected)
@@ -671,6 +675,33 @@ ASK_USER_FIELDS = [
     "transaction_hash",
     "chain_name",
 ]
+WORKBENCH_STATUS_LABELS = {
+    "new": "新建",
+    "triaged": "已分诊",
+    "diagnosing": "诊断中",
+    "reviewing": "复核中",
+    "pending_user": "等待客户补充",
+    "escalated": "待人工审核",
+    "resolved": "已解决",
+}
+WORKBENCH_CATEGORY_LABELS = {
+    "bluetooth_connection": "蓝牙连接",
+    "usb_connection": "USB 连接",
+    "mobile_connection": "手机连接",
+    "power": "供电/开机",
+    "firmware_repair": "固件修复",
+    "security_incident": "安全事件",
+    "security_report": "安全报告",
+}
+WORKBENCH_GATE_REASON_LABELS = {
+    "unsafe_action": "安全策略未通过",
+    "official_source_violation": "来源需要人工核验",
+    "policy_guard_failure": "安全策略执行失败",
+    "review_failure": "安全复核失败",
+    "DIAGNOSIS_FAILURE": "自动诊断失败",
+    "TOOL_FAILURE": "诊断工具失败",
+    "DIAGNOSIS_NO_EVIDENCE": "没有足够诊断证据",
+}
 
 
 def _answer_with_citations(result) -> str:
@@ -690,6 +721,28 @@ def _answer_with_citations(result) -> str:
         ]
         answer += "\n\n📚 已验证参考来源：\n" + "\n".join(source_lines)
     return answer
+
+
+def _sync_human_result_to_customer_chat(result) -> None:
+    """Project a completed human action into the active customer conversation."""
+    if result.status == "resolved" and result.final_answer:
+        content = _answer_with_citations(result)
+    elif result.status == "pending_user":
+        content = PENDING_USER_NOTICE
+    else:
+        return
+    if st.session_state.get("active_ticket_id") != result.ticket_id:
+        return
+    messages = st.session_state.get("messages")
+    if not isinstance(messages, list):
+        return
+    if (
+        messages
+        and messages[-1].get("role") == "assistant"
+        and messages[-1].get("content") == content
+    ):
+        return
+    messages.append({"role": "assistant", "content": content})
 
 
 def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str) -> None:
@@ -718,10 +771,20 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
             _clear_customer_workflow_state()
             active_ticket_id = None
             active_ticket = None
+        conversation_id = st.session_state.get(CONVERSATION_ID_SESSION_KEY)
+        if active_ticket is not None and active_ticket.get("conversation_id"):
+            conversation_id = active_ticket["conversation_id"]
+            st.session_state[CONVERSATION_ID_SESSION_KEY] = conversation_id
         request_route = (
             ("resume_user", active_ticket_id)
             if active_ticket and active_ticket.get("status") == "pending_user"
             else ("submit", None)
+        )
+        parent_ticket_id = (
+            active_ticket_id
+            if active_ticket
+            and active_ticket.get("status") in {"resolved", "escalated"}
+            else None
         )
         frozen_command, safe_history, restoring = get_or_freeze_request_command(
             st.session_state,
@@ -766,6 +829,8 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
                         user_id=user_id,
                         request_id=request_id,
                         safe_history=safe_history,
+                        conversation_id=conversation_id,
+                        parent_ticket_id=parent_ticket_id,
                     )
                 else:
                     raise ValueError("冻结请求路由非法")
@@ -824,6 +889,11 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
     if restoring:
         st.session_state[RECOVERY_NOTICE_SESSION_KEY] = RECOVERED_REQUEST_NOTICE
     st.session_state["active_ticket_id"] = result.ticket_id
+    result_ticket = orchestrator.repository.get_ticket(result.ticket_id)
+    if result_ticket and result_ticket.get("conversation_id"):
+        st.session_state[CONVERSATION_ID_SESSION_KEY] = result_ticket[
+            "conversation_id"
+        ]
     safe_result_message = {"role": "user", "content": result.sanitized_input}
     if (
         st.session_state["messages"][-2].get("content")
@@ -908,7 +978,7 @@ def _run_human_action(
         )
         if restoring:
             st.info(RECOVERING_REQUEST_NOTICE)
-        orchestrator.human_action_prepared(
+        result = orchestrator.human_action_prepared(
             ticket_id,
             prepared,
             action_id=action_id,
@@ -943,6 +1013,7 @@ def _run_human_action(
         st.error(SAFE_FAILURE_NOTICE)
         return
     clear_frozen_action(st.session_state, action_key)
+    _sync_human_result_to_customer_chat(result)
     st.success("操作已安全提交。")
     st.rerun()
 
@@ -982,8 +1053,7 @@ def _render_operator_gate() -> bool:
         st.session_state.pop(OPERATOR_AUTH_SESSION_KEY, None)
         clear_frozen_actions(st.session_state)
         clear_editor_state(st.session_state)
-        st.warning("工单工作台未启用：服务端未配置独立操作员令牌。")
-        return False
+        return True
 
     if _operator_is_authorized():
         st.success("操作员已授权。")
@@ -1021,7 +1091,7 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
         st.error("工单工作台未授权。")
         return
     try:
-        tickets = orchestrator.repository.list_workbench_tickets()
+        all_tickets = orchestrator.repository.list_workbench_tickets()
     except Exception as error:
         logger.error(
             "[app]工单队列读取失败 stage=workbench error_type=%s",
@@ -1030,23 +1100,61 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
         st.error(SAFE_FAILURE_NOTICE)
         return
 
-    if not tickets:
+    if not all_tickets:
         st.info("暂无工单。先在“客户对话”中提交一个问题。")
+        return
+
+    pending_tickets = [
+        ticket
+        for ticket in all_tickets
+        if ticket.get("status") in {"escalated", "pending_user"}
+    ]
+    resolved_tickets = [
+        ticket for ticket in all_tickets if ticket.get("status") == "resolved"
+    ]
+    st.caption(
+        f"待处理 {len(pending_tickets)} · 已解决 {len(resolved_tickets)} · "
+        "低风险问题通常会自动结案"
+    )
+    view = st.selectbox(
+        "工单范围",
+        ["待处理", "全部", "已解决历史"],
+        key="workbench_view",
+    )
+    if view == "待处理":
+        tickets = pending_tickets
+    elif view == "已解决历史":
+        tickets = resolved_tickets
+    else:
+        tickets = all_tickets
+    if not tickets:
+        st.info("当前范围没有工单。")
         return
 
     for ticket in tickets:
         ticket_id = ticket["ticket_id"]
+        status = ticket.get("status") or "-"
+        status_label = WORKBENCH_STATUS_LABELS.get(status, status)
         label = (
             f"{ticket.get('priority') or 'P2'} · {ticket_id} · "
-            f"{ticket.get('status') or '-'}"
+            f"{status_label}"
         )
-        with st.expander(label):
+        with st.expander(label, expanded=status in {"escalated", "pending_user"}):
             st.text(ticket.get("summary") or ticket.get("sanitized_input") or "-")
             st.caption(
-                f"类别 `{ticket.get('category') or '-'}` · "
+                f"类别 `{WORKBENCH_CATEGORY_LABELS.get(ticket.get('category'), ticket.get('category') or '-')}` · "
                 f"优先级 `{ticket.get('priority') or 'P2'}` · "
-                f"风险 `{ticket.get('risk_level') or '-'}`"
+                f"风险 `{ticket.get('risk_level') or '-'}` · "
+                f"会话 `{ticket.get('conversation_id') or '-'}`"
             )
+            if ticket.get("parent_ticket_id"):
+                st.caption(f"🔗 这是后续工单，上一张工单：`{ticket['parent_ticket_id']}`")
+            if ticket.get("manual_gate_reason"):
+                reason = ticket["manual_gate_reason"]
+                st.warning(
+                    "进入人工原因："
+                    + WORKBENCH_GATE_REASON_LABELS.get(reason, reason)
+                )
             try:
                 events = orchestrator.repository.list_events(ticket_id)
                 for event in project_workbench_events(events):
@@ -1073,7 +1181,9 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
                     _escape_markdown_url(citation["source_url"]),
                 )
 
-            if ticket.get("status") != "escalated":
+            if status != "escalated":
+                if status == "pending_user":
+                    st.info("等待客户补充信息后，系统会继续处理这张工单。")
                 continue
 
             st.caption("人工审核区不会展示模型内部提示、工具参数或未审核的原始输出。")

@@ -919,6 +919,8 @@ class TicketRepositoryTest(unittest.TestCase):
             {
                 "ticket_id",
                 "user_id",
+                "conversation_id",
+                "parent_ticket_id",
                 "status",
                 "sanitized_input",
                 "summary",
@@ -926,6 +928,7 @@ class TicketRepositoryTest(unittest.TestCase):
                 "priority",
                 "risk_level",
                 "draft_answer",
+                "manual_gate_reason",
             },
         )
         self.assertEqual(projected[0]["draft_answer"], "请使用官方应用重新配对。")
@@ -944,6 +947,29 @@ class TicketRepositoryTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "未脱敏"):
             self.repo.list_workbench_tickets()
+
+    def test_follow_up_ticket_inherits_conversation_and_parent(self):
+        first = self.repo.create_ticket(
+            "conversation-root", "1001", "蓝牙连接失败", []
+        )
+        follow_up = self.repo.create_ticket(
+            "conversation-follow-up",
+            "1001",
+            "换手机后仍然无法配对",
+            [],
+            parent_ticket_id=first["ticket_id"],
+        )
+        self.assertEqual(follow_up["parent_ticket_id"], first["ticket_id"])
+        self.assertEqual(follow_up["conversation_id"], first["conversation_id"])
+        projected = self.repo.list_workbench_tickets()
+        self.assertEqual(
+            {
+                item["parent_ticket_id"]
+                for item in projected
+                if item["ticket_id"] == follow_up["ticket_id"]
+            },
+            {first["ticket_id"]},
+        )
 
 
 if __name__ == "__main__":

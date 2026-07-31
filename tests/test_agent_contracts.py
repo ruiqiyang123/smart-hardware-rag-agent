@@ -1367,6 +1367,26 @@ class ReviewAgentContractTest(unittest.TestCase):
                 )
                 self.assertNotIn("111111", json.dumps(output))
 
+    def test_review_policy_allows_negated_secret_safety_reminders(self):
+        state = self._state(
+            draft_answer=(
+                "蓝牙排查过程中不需要输入助记词、私钥、PIN 或 Passphrase，"
+                "也不要安装任何第三方修复工具。"
+            ),
+            recommended_actions=[
+                {
+                    "action_code": "generic_troubleshooting",
+                    "text": "无需提供助记词即可继续排查连接问题",
+                    "evidence_refs": ["kb:usb:1"],
+                }
+            ],
+        )
+        agent = self._agent()
+        output = agent.run(state)
+        self.assertEqual(output["review_decision"], "approve")
+        self.assertEqual(output["review_reasons"], ["passed"])
+        self.assertEqual(agent.runner.calls.__len__(), 1)
+
     def test_constructor_requires_exactly_one_model_or_runner_and_policy(self):
         from agent.nodes.review import ReviewAgent
         from agent.orchestration.state import ReviewResult

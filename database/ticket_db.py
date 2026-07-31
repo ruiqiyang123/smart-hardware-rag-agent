@@ -73,7 +73,7 @@ CATEGORY_VALUES = {
     "security_report",
     "other",
 }
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _EMPTY_PAYLOAD_FINGERPRINT = "0" * 64
 _PAYLOAD_FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _WORKBENCH_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}", re.ASCII)
@@ -85,6 +85,12 @@ CREATE TABLE IF NOT EXISTS tickets (
     ticket_id TEXT PRIMARY KEY CHECK(length(trim(ticket_id)) > 0),
     request_id TEXT NOT NULL UNIQUE CHECK(length(trim(request_id)) > 0),
     user_id TEXT NOT NULL CHECK(length(trim(user_id)) > 0),
+    conversation_id TEXT CHECK(
+        conversation_id IS NULL OR length(trim(conversation_id)) > 0
+    ),
+    parent_ticket_id TEXT CHECK(
+        parent_ticket_id IS NULL OR length(trim(parent_ticket_id)) > 0
+    ),
     status TEXT NOT NULL CHECK(status IN (
         'new', 'triaged', 'diagnosing', 'reviewing', 'pending_user',
         'escalated', 'resolved'
@@ -122,6 +128,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     created_at TEXT NOT NULL CHECK(length(trim(created_at)) > 0),
     updated_at TEXT NOT NULL CHECK(length(trim(updated_at)) > 0)
 );
+CREATE INDEX IF NOT EXISTS ix_tickets_conversation
+    ON tickets(conversation_id, updated_at DESC);
 CREATE TABLE IF NOT EXISTS ticket_commands (
     command_id TEXT PRIMARY KEY CHECK(length(trim(command_id)) > 0),
     ticket_id TEXT NOT NULL CHECK(length(trim(ticket_id)) > 0),
@@ -181,7 +189,7 @@ CREATE TABLE IF NOT EXISTS ticket_events (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_ticket_commands_one_in_progress
     ON ticket_commands(ticket_id)
     WHERE status = 'in_progress';
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;
 """
 _SENSITIVE_METADATA_KEYS = {
     "pin",
@@ -234,6 +242,8 @@ class TicketRepository:
     _WORKBENCH_TICKET_FIELDS = (
         "ticket_id",
         "user_id",
+        "conversation_id",
+        "parent_ticket_id",
         "status",
         "sanitized_input",
         "summary",
@@ -241,6 +251,7 @@ class TicketRepository:
         "priority",
         "risk_level",
         "draft_answer",
+        "manual_gate_reason",
     )
 
     def __init__(self, db_path: str = "data/keyguard_v2.db"):
@@ -254,9 +265,34 @@ class TicketRepository:
                 """
             ).fetchall()
             schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if existing_tables and schema_version != SCHEMA_VERSION:
+            if existing_tables and schema_version not in {
+                SCHEMA_VERSION - 1,
+                SCHEMA_VERSION,
+            }:
                 raise RuntimeError(
                     "schema 版本不兼容；请备份后重建 KeyGuard V2 数据库"
+                )
+            if existing_tables and schema_version == SCHEMA_VERSION - 1:
+                columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(tickets)")
+                }
+                if "conversation_id" not in columns:
+                    connection.execute(
+                        "ALTER TABLE tickets ADD COLUMN conversation_id TEXT"
+                    )
+                if "parent_ticket_id" not in columns:
+                    connection.execute(
+                        "ALTER TABLE tickets ADD COLUMN parent_ticket_id TEXT"
+                    )
+                connection.execute(
+                    """
+                    UPDATE tickets
+                    SET conversation_id = 'CV-' || upper(substr(
+                        replace(ticket_id, 'KG-', ''), 1, 12
+                    ))
+                    WHERE conversation_id IS NULL
+                    """
                 )
             connection.executescript(SCHEMA)
 
@@ -378,6 +414,16 @@ class TicketRepository:
             "user_id": cls._project_workbench_identifier(
                 row.get("user_id"), "user_id"
             ),
+            "conversation_id": cls._project_workbench_identifier(
+                row.get("conversation_id"), "conversation_id"
+            ),
+            "parent_ticket_id": (
+                cls._project_workbench_identifier(
+                    row.get("parent_ticket_id"), "parent_ticket_id"
+                )
+                if row.get("parent_ticket_id") is not None
+                else None
+            ),
             "status": status,
             "sanitized_input": cls._project_workbench_text(
                 row.get("sanitized_input"), "sanitized_input", 10_000
@@ -390,6 +436,12 @@ class TicketRepository:
             "risk_level": risk_level,
             "draft_answer": cls._project_workbench_text(
                 row.get("draft_answer"), "draft_answer", 2_000, optional=True
+            ),
+            "manual_gate_reason": cls._project_workbench_text(
+                row.get("manual_gate_reason"),
+                "manual_gate_reason",
+                500,
+                optional=True,
             ),
         }
 
@@ -578,12 +630,24 @@ class TicketRepository:
         user_id: str,
         sanitized_input: str,
         risk_flags: List[str],
+        conversation_id: Optional[str] = None,
+        parent_ticket_id: Optional[str] = None,
     ) -> Dict[str, object]:
         request_id = self._nonempty_text(request_id, "request_id")
         user_id = self._nonempty_text(user_id, "user_id")
         sanitized_input = self._nonempty_text(sanitized_input, "sanitized_input")
         self._assert_no_secret(sanitized_input)
         normalized_flags = self._normalize_string_list(risk_flags, "risk_flags")
+        if conversation_id is None:
+            conversation_id = f"CV-{uuid.uuid4().hex[:12].upper()}"
+        else:
+            conversation_id = self._project_workbench_identifier(
+                conversation_id, "conversation_id"
+            )
+        if parent_ticket_id is not None:
+            parent_ticket_id = self._project_workbench_identifier(
+                parent_ticket_id, "parent_ticket_id"
+            )
         risk_flags_json = self._json(normalized_flags)
         now = self._now()
         ticket_id = f"KG-{uuid.uuid4().hex[:12].upper()}"
@@ -603,17 +667,35 @@ class TicketRepository:
                     )
                 return dict(existing)
 
+            if parent_ticket_id is not None:
+                parent = connection.execute(
+                    """
+                    SELECT user_id, conversation_id
+                    FROM tickets WHERE ticket_id = ?
+                    """,
+                    (parent_ticket_id,),
+                ).fetchone()
+                if parent is None:
+                    raise ValueError("parent_ticket_id 对应工单不存在")
+                if parent["user_id"] != user_id:
+                    raise ValueError("后续工单必须属于同一用户")
+                if parent["conversation_id"]:
+                    conversation_id = parent["conversation_id"]
+
             connection.execute(
                 """
                 INSERT INTO tickets (
-                    ticket_id, request_id, user_id, status, sanitized_input,
-                    risk_flags_json, created_at, updated_at
-                ) VALUES (?, ?, ?, 'new', ?, ?, ?, ?)
+                    ticket_id, request_id, user_id, conversation_id,
+                    parent_ticket_id, status, sanitized_input, risk_flags_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'new', ?, ?, ?, ?)
                 """,
                 (
                     ticket_id,
                     request_id,
                     user_id,
+                    conversation_id,
+                    parent_ticket_id,
                     sanitized_input,
                     risk_flags_json,
                     now,

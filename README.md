@@ -234,7 +234,7 @@ class SanitizedText:
 - **有限重试与超时**：模型失败后执行受限重试，并返回清理过的错误；
 - **命令租约与幂等键**：减少重复恢复命令造成的双重执行；
 - **双数据库隔离**：工单和 checkpoint 必须使用不同 SQLite 文件；
-- **Fail closed**：缺少所选模型 Key 或操作员令牌时，不会借用其他 Provider Key，也不会匿名开放工作台。
+- **Fail closed**：缺少所选模型 Key 时不会借用其他 Provider Key；求职 Demo 未配置操作员令牌时工作台默认开放，配置令牌后自动启用保护模式。
 
 ### Human-in-the-loop 不是一句提示
 
@@ -318,7 +318,7 @@ streamlit run app.py
 
 浏览器打开 `http://localhost:8501`。
 
-如需使用工单工作台，在 `.env` 中设置一个不可猜测的 `KEYGUARD_OPERATOR_TOKEN`。未配置时工作台默认关闭。
+求职 Demo 无需配置操作员令牌，打开“工单工作台”即可体验。若要演示受保护模式，可在 `.env` 中设置 `KEYGUARD_OPERATOR_TOKEN`；配置后工作台会要求输入令牌。
 
 ### 关键配置
 
@@ -329,7 +329,7 @@ streamlit run app.py
 | `DEEPSEEK_THINKING` | `disabled` | 关闭额外思考输出 |
 | `EMBEDDING_PROVIDER` | `local` | 本地 1024 维 Hash Embedding |
 | `KEYGUARD_AGENT_VERSION` | `v2` | 使用多 Agent 工单链路 |
-| `KEYGUARD_OPERATOR_TOKEN` | 无 | 工作台令牌；缺失时 fail closed |
+| `KEYGUARD_OPERATOR_TOKEN` | 无 | 可选工作台令牌；Demo 缺失时默认开放，配置后启用保护 |
 | `KEYGUARD_TICKET_DB` | `data/keyguard_v2.db` | 工单和审计事件 |
 | `KEYGUARD_CHECKPOINT_DB` | `data/keyguard_v2_checkpoints.sqlite3` | LangGraph 恢复点 |
 
@@ -470,7 +470,8 @@ KeyGuard 2.0｜多 Agent 硬件钱包售后工单系统｜个人项目
 - 所有品牌、用户、设备、序列号、保修、链状态和业务案例均为虚构或模拟数据；
 - 本地 Hash Embedding 方便 Demo 离线启动，但不能代表生产级语义召回能力；
 - Streamlit Cloud 文件系统是易失环境，SQLite、checkpoint 和向量缓存可能在重启或重新部署后丢失；
-- `KEYGUARD_OPERATOR_TOKEN` 是 Demo 级共享令牌，不具备企业级身份、权限分层和轮换；
+- `KEYGUARD_OPERATOR_TOKEN` 是可选的 Demo 级共享令牌，不具备企业级身份、权限分层和轮换；
+- 低风险问题通常自动回复并结案；人工审核后的回复会同步回客户对话，结案后的追问会创建关联的后续工单；
 - 外部保修和链状态工具均为模拟实现，没有连接厂商售后、真实 RPC 或资产操作接口；
 - V2 评测框架已经就绪，但仓库不预填未经真实 runner 执行的准确率、成本下降或 SLA。
 

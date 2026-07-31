@@ -1667,12 +1667,16 @@ class SupportOrchestrator:
         user_id: str,
         request_id: Optional[str] = None,
         safe_history: Optional[List[dict]] = None,
+        conversation_id: Optional[str] = None,
+        parent_ticket_id: Optional[str] = None,
     ) -> OrchestrationResult:
         return self.submit_prepared(
             self.prepare_user_input(raw_input),
             user_id=user_id,
             request_id=request_id,
             safe_history=safe_history,
+            conversation_id=conversation_id,
+            parent_ticket_id=parent_ticket_id,
         )
 
     def submit_prepared(
@@ -1681,6 +1685,8 @@ class SupportOrchestrator:
         user_id: str,
         request_id: Optional[str] = None,
         safe_history: Optional[List[dict]] = None,
+        conversation_id: Optional[str] = None,
+        parent_ticket_id: Optional[str] = None,
     ) -> OrchestrationResult:
         sanitized = self._validated_prepared_user_input(prepared)
         history = _safe_history(safe_history)
@@ -1704,6 +1710,8 @@ class SupportOrchestrator:
             user_id,
             sanitized_input,
             risk_flags,
+            conversation_id=conversation_id,
+            parent_ticket_id=parent_ticket_id,
         )
         ticket_id = _identifier(ticket["ticket_id"], "ticket_id")
         command_id = _identifier(f"request:{request_id}", "command_id")

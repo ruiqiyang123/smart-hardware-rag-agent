@@ -180,13 +180,28 @@ class AppV2ContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
-    def test_workbench_is_closed_without_independent_operator_auth(self):
+    def test_human_results_are_projected_back_to_customer_chat(self):
+        action = self.function_source("_run_human_action")
+        sync = self.function_source("_sync_human_result_to_customer_chat")
+        self.assertIn("result = orchestrator.human_action_prepared(", action)
+        self.assertIn("_sync_human_result_to_customer_chat(result)", action)
+        self.assertIn('result.status == "resolved"', sync)
+        self.assertIn('result.status == "pending_user"', sync)
+        self.assertIn('messages.append({"role": "assistant"', sync)
+
+    def test_workbench_explains_queue_scope_and_follow_up_links(self):
+        source = self.function_source("_render_workbench")
+        for label in ("待处理", "全部", "已解决历史", "conversation_id", "parent_ticket_id"):
+            self.assertIn(label, source)
+
+    def test_workbench_defaults_to_demo_access_without_operator_token(self):
         gate = self.function_source("_render_operator_gate")
         workbench = self.function_source("_render_workbench")
         action = self.function_source("_run_human_action")
         self.assertIn("KEYGUARD_OPERATOR_TOKEN", self.source)
         self.assertIn("hmac.compare_digest", gate)
-        self.assertIn("工作台未启用", gate)
+        self.assertIn("if not configured_token", gate)
+        self.assertIn("return True", gate)
         self.assertIn("退出工作台", gate)
         self.assertLess(
             workbench.index("_operator_is_authorized"),

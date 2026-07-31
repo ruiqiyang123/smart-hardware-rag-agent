@@ -440,6 +440,7 @@ def _fail_closed(state: Mapping[str, object], node_name: str, code: str) -> dict
             "draft_answer": "",
             "final_answer": "",
             "last_error": code,
+            "manual_gate_reason": code,
         },
         node_name=node_name,
         event_type="node_failure",
@@ -661,6 +662,10 @@ def _review_node(dependency: Callable[[dict], object]) -> Callable[[TicketState]
             decision = raw.get("review_decision")
             if decision not in {"approve", "revise", "escalate"}:
                 raise ValueError("审核决定非法")
+            if decision == "escalate":
+                raw["manual_gate_reason"] = ",".join(
+                    raw.get("review_reasons") or ["review_escalated"]
+                )[:500]
             route_after_review({**dict(state), **raw})
             return with_event(
                 state,

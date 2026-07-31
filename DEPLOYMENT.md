@@ -41,7 +41,7 @@ KEYGUARD_TICKET_DB=data/keyguard_v2.db
 KEYGUARD_CHECKPOINT_DB=data/keyguard_v2_checkpoints.sqlite3
 ```
 
-- `KEYGUARD_OPERATOR_TOKEN` 未配置时，工单工作台默认关闭；这是一条 fail-closed 边界。
+- `KEYGUARD_OPERATOR_TOKEN` 是可选配置；求职 Demo 未配置时工作台默认开放，配置后启用令牌保护。
 - `KEYGUARD_TICKET_DB` 保存业务工单和审计事件，`KEYGUARD_CHECKPOINT_DB` 保存 LangGraph 恢复点。两者**必须使用不同文件**，应用会拒绝相同的解析路径。
 - 两个数据库路径是可选覆盖项；默认值分别为 `data/keyguard_v2.db` 和 `data/keyguard_v2_checkpoints.sqlite3`。
 - 本地 Hash Embedding 可通过 `EMBEDDING_PROVIDER=local` 和 `LOCAL_EMBEDDING_DIMENSION=1024` 配置，不需要额外 Embedding Key。
@@ -97,7 +97,7 @@ streamlit run app.py
 随后人工检查：
 
 - “客户对话”和“工单工作台”两个标签页可见。
-- 未配置或输入错误的操作员令牌时，工作台不可访问。
+- 未配置令牌时工作台直接开放；配置令牌后，输入错误的令牌不能进入工作台。
 - 蓝牙案例能够自动完成并给出证据引用。
 - 固件信息不足时停在 `pending_user`，补充信息后可以继续。
 - 测试助记词在持久化前被脱敏，并进入 `escalated`。
@@ -111,7 +111,7 @@ streamlit run app.py
 
 ### 工单工作台打不开
 
-这是未配置 `KEYGUARD_OPERATOR_TOKEN` 时的预期行为。配置令牌并重启应用后，用相同令牌进入工作台。
+Demo 默认无需令牌。如果配置了 `KEYGUARD_OPERATOR_TOKEN`，请确认输入的令牌与当前环境变量或 Streamlit Secrets 完全一致，并重启应用。
 
 ### 应用拒绝数据库配置
 

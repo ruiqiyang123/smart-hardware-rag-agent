@@ -85,8 +85,9 @@ _HIGH_FLAGS = frozenset(
 
 _UNSAFE_ACTION_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(
-        r"(?:请|把|将|需要|向我|给我|可以)(?:你)?(?:发送|提供|告诉|提交|输入|上传)"
+        r"(?:请|把|将|(?<!不)(?<!无)(?<!免)需要|向我|给我|可以)(?:你)?(?:发送|提供|告诉|提交|输入|上传)"
         r".{0,12}(?:助记词|私钥|PIN|Passphrase|密码|seed\s+phrase|private\s+key)|"
+        r"(?<!don't )(?<!do not )(?<!never )(?<!no need to )"
         r"(?:send|provide|share|tell|enter|upload).{0,20}"
         r"(?:seed\s+phrase|private\s+key|PIN|passphrase|password)",
         re.IGNORECASE,
