@@ -156,6 +156,10 @@ class AppV2ContractTest(unittest.TestCase):
     def test_orchestrator_cache_key_includes_contract_version(self):
         source = self.function_source("get_or_build_orchestrator")
 
+        self.assertIn(
+            'ORCHESTRATOR_CONTRACT_VERSION = "2026-07-31-progressive-clarification-v3"',
+            self.source,
+        )
         self.assertIn("contract_version: str", source)
         self.assertIn(
             "contract_version != ORCHESTRATOR_CONTRACT_VERSION",
@@ -276,6 +280,20 @@ class AppV2ContractTest(unittest.TestCase):
         self.assertIn("_escape_markdown_text", source)
         self.assertIn("_escape_markdown_url", source)
         self.assertIn("[", source)
+
+    def test_answer_projection_tolerates_stale_cached_result_contract(self):
+        source = self.function_source("_answer_with_citations")
+
+        for field in (
+            "status",
+            "user_notice",
+            "final_answer",
+            "clarification_question",
+            "clarification_options",
+            "missing_fields",
+            "citations",
+        ):
+            self.assertIn(f'getattr(result, "{field}"', source)
 
     def test_workbench_displays_only_repository_projected_draft(self):
         source = self.function_source("_render_workbench")

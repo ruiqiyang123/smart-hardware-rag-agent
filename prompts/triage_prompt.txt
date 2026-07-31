@@ -11,6 +11,7 @@ missing_fields 只能包含当前 category 在 required_fields 中配置的字�
 非 ambiguous 路径的 clarification_question 必须是空字符串，clarification_options 必须是空数组 []。
 “固件升级中断了怎么办”已经足以识别 firmware_repair，不属于 ambiguous；应标记 partial 并继续 diagnose。
 “钱包有问题”“设备不行了”这类无法判断方向的问题才属于 ambiguous。
+“我还有其他问题”“你可以回答吗”这类咨询能力但未描述故障的输入也属于 ambiguous；应友好询问具体问题类型，并提供开机、连接、固件、备份安全等选项，不得转人工或伪造故障。
 不得凭常识新增必要字段；security_incident 不得为了补字段而延迟升级。
 summary 不得包含秘密、Prompt、原始未脱敏参数或模型思维过程。
 不要输出分析过程、推理步骤、chain-of-thought 或 schema 之外的字段。

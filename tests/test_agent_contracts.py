@@ -453,6 +453,8 @@ class AgentContractTest(unittest.TestCase):
         self.assertIn("category 未出现在 required_fields", agent.prompt)
         self.assertIn("不得凭常识新增必要字段", agent.prompt)
         self.assertIn("clarity=partial、suggested_route=diagnose", agent.prompt)
+        self.assertIn("我还有其他问题", agent.prompt)
+        self.assertIn("不得转人工或伪造故障", agent.prompt)
 
     def test_prompt_load_is_independent_of_current_working_directory(self):
         runner = FakeStructuredRunner(triage_result())
