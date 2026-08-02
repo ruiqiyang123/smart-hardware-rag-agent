@@ -17,6 +17,11 @@ VALID_ORCHESTRATION = {
     "retries": {"triage": 1, "diagnosis": 1, "readonly_tool": 1, "review": 0},
     "recursion_limit": 16,
     "command_lease_seconds": 130,
+    "customer_session": {
+        "inactivity_timeout_seconds": 1800,
+        "expiry_poll_seconds": 30,
+    },
+    "customer_handoff": {"ai_attempt_threshold": 3},
     "required_fields": {
         "firmware_repair": ["device_model", "error_state"],
         "warranty_service": ["serial_last4"],
@@ -25,7 +30,6 @@ VALID_ORCHESTRATION = {
     "manual_gate_actions": [
         "device_reset",
         "bootloader_recovery",
-        "wallet_recovery",
         "warranty_decision",
     ],
 }
@@ -66,6 +70,11 @@ class OrchestrationConfigTest(ConfigTestCase):
         self.assertEqual(config["timeouts"]["graph_seconds"], 120)
         self.assertEqual(config["recursion_limit"], 16)
         self.assertEqual(config["command_lease_seconds"], 130)
+        self.assertEqual(
+            config["customer_session"]["inactivity_timeout_seconds"], 1800
+        )
+        self.assertEqual(config["customer_session"]["expiry_poll_seconds"], 30)
+        self.assertEqual(config["customer_handoff"]["ai_attempt_threshold"], 3)
         self.assertEqual(config["retries"]["review"], 0)
 
     def test_rejects_missing_file_and_malformed_yaml(self):
@@ -87,6 +96,8 @@ class OrchestrationConfigTest(ConfigTestCase):
             "retries",
             "recursion_limit",
             "command_lease_seconds",
+            "customer_session",
+            "customer_handoff",
             "required_fields",
             "manual_gate_actions",
         )
@@ -101,6 +112,9 @@ class OrchestrationConfigTest(ConfigTestCase):
             ("retries", "diagnosis"),
             ("retries", "readonly_tool"),
             ("retries", "review"),
+            ("customer_session", "inactivity_timeout_seconds"),
+            ("customer_session", "expiry_poll_seconds"),
+            ("customer_handoff", "ai_attempt_threshold"),
         ):
             with self.subTest(section=section, key=key), self.assertRaises(ValueError):
                 self.load_changed(lambda data, s=section, k=key: data[s].pop(k))
@@ -113,6 +127,8 @@ class OrchestrationConfigTest(ConfigTestCase):
             lambda data: data["retries"].__setitem__("diagnosis", "1"),
             lambda data: data.__setitem__("recursion_limit", True),
             lambda data: data.__setitem__("command_lease_seconds", "130"),
+            lambda data: data["customer_session"].__setitem__("inactivity_timeout_seconds", True),
+            lambda data: data["customer_handoff"].__setitem__("ai_attempt_threshold", "3"),
         )
         for index, mutation in enumerate(mutations):
             with self.subTest(index=index), self.assertRaises(TypeError):
@@ -126,6 +142,8 @@ class OrchestrationConfigTest(ConfigTestCase):
             lambda data: data["retries"].__setitem__("triage", -1),
             lambda data: data.__setitem__("recursion_limit", 0),
             lambda data: data.__setitem__("command_lease_seconds", -1),
+            lambda data: data["customer_session"].__setitem__("expiry_poll_seconds", 0),
+            lambda data: data["customer_handoff"].__setitem__("ai_attempt_threshold", 0),
         )
         for index, mutation in enumerate(mutations):
             with self.subTest(index=index), self.assertRaises(ValueError):
@@ -150,6 +168,9 @@ class OrchestrationConfigTest(ConfigTestCase):
             lambda data: data["retries"].__setitem__("readonly_tool", 2),
             lambda data: data.__setitem__("recursion_limit", 17),
             lambda data: data.__setitem__("command_lease_seconds", 131),
+            lambda data: data["customer_session"].__setitem__("inactivity_timeout_seconds", 1799),
+            lambda data: data["customer_session"].__setitem__("expiry_poll_seconds", 31),
+            lambda data: data["customer_handoff"].__setitem__("ai_attempt_threshold", 4),
         )
         for index, mutation in enumerate(mutations):
             with self.subTest(index=index), self.assertRaises(ValueError):

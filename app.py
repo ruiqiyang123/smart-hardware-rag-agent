@@ -15,6 +15,7 @@ bootstrap_environment()
 import streamlit as st
 
 from agent.orchestration.graph import build_configured_graph, sqlite_checkpointer
+from agent.orchestration.handoff_intent import is_human_handoff_request
 from agent.orchestration.runtime import (
     CheckpointRestoreError,
     CommandFailedError,
@@ -109,10 +110,15 @@ def _runtime_secret(name: str) -> Optional[str]:
 
 AGENT_VERSION = (_runtime_secret("KEYGUARD_AGENT_VERSION") or "v2").strip().lower()
 USE_V1_AGENT = AGENT_VERSION == "v1"
-ORCHESTRATOR_CONTRACT_VERSION = "2026-08-02-deepseek-structured-output-v7"
+ORCHESTRATOR_CONTRACT_VERSION = "2026-08-02-session-ticket-lifecycle-v8"
 SAFE_FAILURE_NOTICE = "⚠️ 当前请求未能安全完成，请稍后重试或联系人工客服。"
 PENDING_USER_NOTICE = "为了继续处理，请补充工单中标记的必要信息。"
 ESCALATED_NOTICE = "工单已进入人工审核，自动流程不会关闭该问题。"
+HANDOFF_THRESHOLD_NOTICE = (
+    "为了优先帮你快速解决问题，请先完成 {threshold} 次 AI 自助问答。"
+    "目前已完成 {attempts}/{threshold}；你可以继续描述问题。"
+    "涉及敏感信息、资产风险或异常签名时，系统仍会立即转人工。"
+)
 RECOVERING_REQUEST_NOTICE = (
     "正在恢复上次请求；本次输入不会作为一个新问题处理。"
 )
@@ -471,6 +477,12 @@ def get_or_build_orchestrator(
             recursion_limit=orchestration["recursion_limit"],
             lease_seconds=orchestration["command_lease_seconds"],
             graph_timeout_seconds=orchestration["timeouts"]["graph_seconds"],
+            inactivity_timeout_seconds=orchestration["customer_session"][
+                "inactivity_timeout_seconds"
+            ],
+            customer_handoff_threshold=orchestration["customer_handoff"][
+                "ai_attempt_threshold"
+            ],
             trusted_source_policy=trusted_sources,
             final_policy_guard=policy_guard,
         )
@@ -686,6 +698,7 @@ WORKBENCH_STATUS_LABELS = {
     "reviewing": "复核中",
     "pending_user": "等待客户补充",
     "escalated": "待人工审核",
+    "closed": "已结束",
     "resolved": "已解决",
 }
 WORKBENCH_CATEGORY_LABELS = {
@@ -705,6 +718,7 @@ WORKBENCH_GATE_REASON_LABELS = {
     "DIAGNOSIS_FAILURE": "自动诊断失败",
     "TOOL_FAILURE": "诊断工具失败",
     "DIAGNOSIS_NO_EVIDENCE": "没有足够诊断证据",
+    "customer_requested_human": "客户主动申请人工客服",
 }
 MISSING_FIELD_GUIDANCE = {
     "device_model": ("设备型号", "例如 KeyGuard Mini"),
@@ -822,7 +836,12 @@ def _sync_human_result_to_customer_chat(result) -> None:
     messages.append({"role": "assistant", "content": content})
 
 
-def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str) -> None:
+def _run_v2_prompt(
+    orchestrator: SupportOrchestrator,
+    prompt: str,
+    user_id: str,
+    ui_container,
+) -> None:
     active_ticket_id = st.session_state.get("active_ticket_id")
     restoring = False
     request_id = _stable_request_id()
@@ -837,6 +856,7 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
             )
 
     try:
+        orchestrator.close_expired_sessions()
         active_ticket = (
             orchestrator.repository.get_ticket(active_ticket_id)
             if active_ticket_id
@@ -848,8 +868,16 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
             _clear_customer_workflow_state()
             active_ticket_id = None
             active_ticket = None
-        conversation_id = st.session_state.get(CONVERSATION_ID_SESSION_KEY)
-        if active_ticket is not None and active_ticket.get("conversation_id"):
+        active_status = active_ticket.get("status") if active_ticket else None
+        starts_new_conversation = active_status in {"closed", "resolved"}
+        conversation_id = (
+            None
+            if starts_new_conversation
+            else st.session_state.get(CONVERSATION_ID_SESSION_KEY)
+        )
+        if starts_new_conversation:
+            st.session_state.pop(CONVERSATION_ID_SESSION_KEY, None)
+        elif active_ticket is not None and active_ticket.get("conversation_id"):
             conversation_id = active_ticket["conversation_id"]
             st.session_state[CONVERSATION_ID_SESSION_KEY] = conversation_id
         request_route = (
@@ -860,14 +888,28 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
         parent_ticket_id = (
             active_ticket_id
             if active_ticket
-            and active_ticket.get("status") in {"resolved", "escalated"}
+            and active_ticket.get("status") in {"closed", "resolved", "escalated"}
             else None
         )
+
+        def _prepare_request():
+            prepared = orchestrator.prepare_user_input(prompt)
+            route = request_route
+            if (
+                active_ticket
+                and active_ticket.get("status") == "pending_user"
+                and prepared.risk_level == "low"
+                and not prepared.risk_flags
+                and is_human_handoff_request(prepared.sanitized_input)
+            ):
+                route = ("request_human", active_ticket_id)
+            return route, prepared
+
         frozen_command, safe_history, restoring = get_or_freeze_request_command(
             st.session_state,
             request_id,
             st.session_state.get("messages", []),
-            lambda: (request_route, orchestrator.prepare_user_input(prompt)),
+            _prepare_request,
         )
         if (
             not isinstance(frozen_command, tuple)
@@ -885,17 +927,42 @@ def _run_v2_prompt(orchestrator: SupportOrchestrator, prompt: str, user_id: str)
                 PROCESSING_UI_NOTICE,
             )
             st.session_state[PENDING_UI_REQUEST_SESSION_KEY] = request_id
-            with st.chat_message("user", avatar="🧑"):
+            with ui_container.chat_message("user", avatar="🧑"):
                 st.markdown(prepared.sanitized_input)
-            with st.chat_message("assistant", avatar="🔐"):
+            with ui_container.chat_message("assistant", avatar="🔐"):
                 st.markdown(PROCESSING_UI_NOTICE)
 
-        with st.status("正在安全处理工单…", expanded=True) as processing_status:
+        with ui_container.status(
+            "正在安全处理工单…", expanded=True
+        ) as processing_status:
             try:
                 if route_kind == "resume_user":
                     if route_ticket_id != active_ticket_id:
                         raise ValueError("冻结请求工单不一致")
                     result = orchestrator.resume_user_prepared(
+                        route_ticket_id,
+                        prepared,
+                        request_id=request_id,
+                    )
+                elif route_kind == "request_human":
+                    if route_ticket_id != active_ticket_id:
+                        raise ValueError("冻结人工请求工单不一致")
+                    allowed, attempts = orchestrator.can_request_human(
+                        route_ticket_id
+                    )
+                    if not allowed:
+                        message = HANDOFF_THRESHOLD_NOTICE.format(
+                            threshold=orchestrator.customer_handoff_threshold,
+                            attempts=attempts,
+                        )
+                        processing_status.update(
+                            label="AI 自助流程仍可继续", state="complete"
+                        )
+                        _finish_ui_message(message)
+                        clear_frozen_request(st.session_state)
+                        st.session_state.pop(PENDING_UI_REQUEST_SESSION_KEY, None)
+                        st.rerun()
+                    result = orchestrator.request_human_prepared(
                         route_ticket_id,
                         prepared,
                         request_id=request_id,
@@ -1147,6 +1214,7 @@ def _render_active_ticket(
     if not ticket_id:
         return
     try:
+        orchestrator.close_expired_sessions()
         ticket = orchestrator.repository.get_ticket(ticket_id)
         if ticket is None or ticket.get("user_id") != user_id:
             _clear_customer_workflow_state()
@@ -1164,7 +1232,14 @@ def _render_active_ticket(
         "clarification": "等待你说明问题",
         "missing_information": "等待你补充信息",
         "resolution_confirmation": "等待你确认是否解决",
-    }.get(waiting_reason, ticket.get("status") or "-")
+    }.get(
+        waiting_reason,
+        {
+            "closed": "已结束（30 分钟未继续提问）",
+            "resolved": "已解决",
+            "escalated": "人工处理中",
+        }.get(ticket.get("status"), ticket.get("status") or "-"),
+    )
     st.caption(
         f"当前工单 `{ticket_id}` · 状态 `{customer_status}` · "
         f"优先级 `{ticket.get('priority') or 'P2'}` · 风险 `{ticket.get('risk_level') or '-'}`"
@@ -1218,6 +1293,39 @@ def _render_active_ticket(
                     st.session_state[f"followup_hint_{ticket_id}"] = True
             if st.session_state.get(f"followup_hint_{ticket_id}"):
                 st.info("请直接在下方输入框补充现象，我会在同一张工单里继续处理。")
+        try:
+            handoff_allowed, ai_answers = orchestrator.can_request_human(ticket_id)
+        except Exception:
+            handoff_allowed, ai_answers = False, 0
+        st.caption(
+            f"人工客服入口 · AI 自助进度 {ai_answers}/"
+            f"{orchestrator.customer_handoff_threshold}"
+        )
+        if st.button(
+            "🧑 联系人工客服" if handoff_allowed else "🧑 申请人工客服",
+            key=f"customer_handoff_{ticket_id}",
+            use_container_width=True,
+        ):
+            st.session_state["pending_prompt"] = "请帮我转人工客服"
+            st.rerun()
+    elif ticket.get("status") == "closed":
+        st.info("这张会话工单因 30 分钟没有新问题而结束。你可以继续输入，新问题会创建一张关联工单。")
+
+
+@st.fragment(run_every="30s")
+def _poll_session_expiry(orchestrator: SupportOrchestrator) -> None:
+    """Keep the demo lifecycle moving even when the visitor is only reading."""
+
+    try:
+        closed = orchestrator.close_expired_sessions()
+    except Exception as error:
+        logger.error(
+            "[app]会话超时扫描失败 stage=session_expiry error_type=%s",
+            type(error).__name__,
+        )
+        return
+    if st.session_state.get("active_ticket_id") in closed:
+        st.rerun(scope="app")
 
 
 def _render_operator_gate() -> bool:
@@ -1264,6 +1372,7 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
         st.error("工单工作台未授权。")
         return
     try:
+        orchestrator.close_expired_sessions()
         all_tickets = orchestrator.repository.list_workbench_tickets()
     except Exception as error:
         logger.error(
@@ -1291,6 +1400,9 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
     resolved_tickets = [
         ticket for ticket in all_tickets if ticket.get("status") == "resolved"
     ]
+    closed_tickets = [
+        ticket for ticket in all_tickets if ticket.get("status") == "closed"
+    ]
     waiting_for_clarification = sum(
         ticket.get("waiting_reason") == "clarification"
         for ticket in customer_tickets
@@ -1308,15 +1420,18 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
         f"待客户说明 {waiting_for_clarification} · "
         f"待客户补充 {waiting_for_information} · "
         f"待客户确认 {waiting_for_confirmation} · "
+        f"已结束 {len(closed_tickets)} · "
         f"已解决 {len(resolved_tickets)}"
     )
     view = st.selectbox(
         "工单范围",
-        ["待处理", "全部", "已解决历史"],
+        ["待处理", "全部", "已结束历史", "已解决历史"],
         key="workbench_view",
     )
     if view == "待处理":
         tickets = pending_tickets
+    elif view == "已结束历史":
+        tickets = closed_tickets
     elif view == "已解决历史":
         tickets = resolved_tickets
     else:
@@ -1350,6 +1465,11 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
             )
             if ticket.get("parent_ticket_id"):
                 st.caption(f"🔗 这是后续工单，上一张工单：`{ticket['parent_ticket_id']}`")
+            if status == "closed":
+                st.caption(
+                    f"⏱️ 结束时间 `{ticket.get('closed_at') or '-'}` · "
+                    "原因 `30 分钟未继续提问`"
+                )
             if ticket.get("clarity"):
                 clarity_label = {
                     "ambiguous": "问题含糊，等待澄清",
@@ -1408,6 +1528,8 @@ def _render_workbench(orchestrator: SupportOrchestrator) -> None:
                         ),
                     }.get(ticket.get("waiting_reason"), "等待客户回复。")
                     st.info(waiting_message)
+                elif status == "closed":
+                    st.info("会话已结束，但没有被标记为“问题已解决”。")
                 continue
 
             st.caption("人工审核区不会展示模型内部提示、工具参数或未审核的原始输出。")
@@ -1508,6 +1630,9 @@ else:
 
 customer_tab, workbench_tab = st.tabs(["客户对话", "工单工作台"])
 
+if not USE_V1_AGENT and orchestrator is not None:
+    _poll_session_expiry(orchestrator)
+
 with customer_tab:
     recovery_notice = st.session_state.pop(RECOVERY_NOTICE_SESSION_KEY, None)
     if recovery_notice in {RECOVERING_REQUEST_NOTICE, RECOVERED_REQUEST_NOTICE}:
@@ -1527,10 +1652,12 @@ with customer_tab:
 > 当前登录身份：**{selected}**，切换用户会自动开新对话。"""
             )
 
-    for message in st.session_state["messages"]:
-        avatar = "🔐" if message["role"] == "assistant" else "🧑"
-        with st.chat_message(message["role"], avatar=avatar):
-            st.markdown(message["content"])
+    chat_history_container = st.container()
+    with chat_history_container:
+        for message in st.session_state["messages"]:
+            avatar = "🔐" if message["role"] == "assistant" else "🧑"
+            with st.chat_message(message["role"], avatar=avatar):
+                st.markdown(message["content"])
 
     if orchestrator is not None:
         _render_active_ticket(orchestrator, uid)
@@ -1551,7 +1678,12 @@ with customer_tab:
         elif orchestrator is None:
             st.error(SAFE_FAILURE_NOTICE)
         else:
-            _run_v2_prompt(orchestrator, prompt, uid)
+            _run_v2_prompt(
+                orchestrator,
+                prompt,
+                uid,
+                chat_history_container,
+            )
 
 with workbench_tab:
     if USE_V1_AGENT:

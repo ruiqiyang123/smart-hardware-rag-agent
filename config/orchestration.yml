@@ -9,6 +9,11 @@ retries:
   review: 0
 recursion_limit: 16
 command_lease_seconds: 130
+customer_session:
+  inactivity_timeout_seconds: 1800
+  expiry_poll_seconds: 30
+customer_handoff:
+  ai_attempt_threshold: 3
 required_fields:
   firmware_repair: [device_model, error_state]
   warranty_service: [serial_last4]
@@ -16,5 +21,4 @@ required_fields:
 manual_gate_actions:
   - device_reset
   - bootloader_recovery
-  - wallet_recovery
   - warranty_decision

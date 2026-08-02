@@ -27,6 +27,8 @@ class CommandDisposition(str, Enum):
 
 class CommandType(str, Enum):
     USER_INPUT = "user_input"
+    CUSTOMER_REQUEST_HUMAN = "customer_request_human"
+    SYSTEM_IDLE_CLOSE = "system_idle_close"
     HUMAN_APPROVE = "human_approve"
     HUMAN_EDIT_SEND = "human_edit_send"
     HUMAN_ASK = "human_ask"
@@ -52,6 +54,7 @@ STATUS_VALUES = {
     "reviewing",
     "pending_user",
     "escalated",
+    "closed",
     "resolved",
 }
 PRIORITY_VALUES = {"P0", "P1", "P2"}
@@ -73,13 +76,14 @@ CATEGORY_VALUES = {
     "security_report",
     "other",
 }
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 CLARITY_VALUES = {"ambiguous", "partial", "clear"}
 WAITING_REASON_VALUES = {
     "clarification",
     "missing_information",
     "resolution_confirmation",
 }
+CLOSE_REASON_VALUES = {"inactivity"}
 MISSING_FIELD_VALUES = {
     "device_model",
     "app_os",
@@ -110,7 +114,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     ),
     status TEXT NOT NULL CHECK(status IN (
         'new', 'triaged', 'diagnosing', 'reviewing', 'pending_user',
-        'escalated', 'resolved'
+        'escalated', 'closed', 'resolved'
     )),
     waiting_reason TEXT CHECK(waiting_reason IS NULL OR waiting_reason IN (
         'clarification', 'missing_information', 'resolution_confirmation'
@@ -154,16 +158,37 @@ CREATE TABLE IF NOT EXISTS tickets (
     requires_human INTEGER NOT NULL DEFAULT 0
         CHECK(typeof(requires_human) = 'integer' AND requires_human IN (0, 1)),
     manual_gate_reason TEXT,
+    idle_expires_at TEXT CHECK(
+        idle_expires_at IS NULL OR (
+            status = 'pending_user' AND length(trim(idle_expires_at)) > 0
+        )
+    ),
+    closed_at TEXT CHECK(
+        closed_at IS NULL OR length(trim(closed_at)) > 0
+    ),
+    close_reason TEXT CHECK(
+        close_reason IS NULL OR close_reason = 'inactivity'
+    ),
     created_at TEXT NOT NULL CHECK(length(trim(created_at)) > 0),
-    updated_at TEXT NOT NULL CHECK(length(trim(updated_at)) > 0)
+    updated_at TEXT NOT NULL CHECK(length(trim(updated_at)) > 0),
+    CHECK(
+        (status = 'closed' AND idle_expires_at IS NULL
+            AND closed_at IS NOT NULL AND close_reason = 'inactivity')
+        OR
+        (status <> 'closed' AND closed_at IS NULL AND close_reason IS NULL)
+    )
 );
 CREATE INDEX IF NOT EXISTS ix_tickets_conversation
     ON tickets(conversation_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS ix_tickets_idle_expiry
+    ON tickets(status, idle_expires_at)
+    WHERE status = 'pending_user' AND idle_expires_at IS NOT NULL;
 CREATE TABLE IF NOT EXISTS ticket_commands (
     command_id TEXT PRIMARY KEY CHECK(length(trim(command_id)) > 0),
     ticket_id TEXT NOT NULL CHECK(length(trim(ticket_id)) > 0),
     command_type TEXT NOT NULL CHECK(command_type IN (
-        'user_input', 'human_approve', 'human_edit_send', 'human_ask', 'human_reject'
+        'user_input', 'customer_request_human', 'system_idle_close',
+        'human_approve', 'human_edit_send', 'human_ask', 'human_reject'
     )),
     payload_fingerprint TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'
         CHECK(
@@ -177,7 +202,7 @@ CREATE TABLE IF NOT EXISTS ticket_commands (
     result_status TEXT CHECK(
         result_status IS NULL OR result_status IN (
             'new', 'triaged', 'diagnosing', 'reviewing', 'pending_user',
-            'escalated', 'resolved'
+            'escalated', 'closed', 'resolved'
         )
     ),
     result_event_id INTEGER,
@@ -200,11 +225,11 @@ CREATE TABLE IF NOT EXISTS ticket_events (
     event_type TEXT NOT NULL CHECK(length(trim(event_type)) > 0),
     from_status TEXT CHECK(from_status IS NULL OR from_status IN (
         'new', 'triaged', 'diagnosing', 'reviewing', 'pending_user',
-        'escalated', 'resolved'
+        'escalated', 'closed', 'resolved'
     )),
     to_status TEXT CHECK(to_status IS NULL OR to_status IN (
         'new', 'triaged', 'diagnosing', 'reviewing', 'pending_user',
-        'escalated', 'resolved'
+        'escalated', 'closed', 'resolved'
     )),
     summary TEXT NOT NULL CHECK(length(trim(summary)) > 0),
     metadata_json TEXT NOT NULL DEFAULT '{}'
@@ -218,7 +243,7 @@ CREATE TABLE IF NOT EXISTS ticket_events (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_ticket_commands_one_in_progress
     ON ticket_commands(ticket_id)
     WHERE status = 'in_progress';
-PRAGMA user_version = 7;
+PRAGMA user_version = 8;
 """
 _SENSITIVE_METADATA_KEYS = {
     "pin",
@@ -260,6 +285,9 @@ class TicketRepository:
         "response_version",
         "requires_human",
         "manual_gate_reason",
+        "idle_expires_at",
+        "closed_at",
+        "close_reason",
     }
     _ADMIN_UPDATABLE_FIELDS = {"requires_human", "manual_gate_reason"}
     _TRANSACTION_HASH_METADATA_PATHS = {("transaction_hash",)}
@@ -290,6 +318,9 @@ class TicketRepository:
         "missing_fields_json",
         "draft_answer",
         "manual_gate_reason",
+        "idle_expires_at",
+        "closed_at",
+        "close_reason",
     )
 
     def __init__(self, db_path: str = "data/keyguard_v2.db"):
@@ -303,56 +334,106 @@ class TicketRepository:
                 """
             ).fetchall()
             schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if existing_tables and schema_version not in {
-                SCHEMA_VERSION - 1,
-                SCHEMA_VERSION,
-            }:
+            if existing_tables and schema_version not in {6, 7, SCHEMA_VERSION}:
                 raise RuntimeError(
                     "schema 版本不兼容；请备份后重建 KeyGuard V2 数据库"
                 )
-            if existing_tables and schema_version == SCHEMA_VERSION - 1:
-                columns = {
-                    row[1]
-                    for row in connection.execute("PRAGMA table_info(tickets)")
-                }
-                if "conversation_id" not in columns:
-                    connection.execute(
-                        "ALTER TABLE tickets ADD COLUMN conversation_id TEXT"
-                    )
-                if "parent_ticket_id" not in columns:
-                    connection.execute(
-                        "ALTER TABLE tickets ADD COLUMN parent_ticket_id TEXT"
-                    )
-                if "clarity" not in columns:
-                    connection.execute(
-                        "ALTER TABLE tickets ADD COLUMN clarity TEXT"
-                    )
-                if "clarification_question" not in columns:
-                    connection.execute(
-                        "ALTER TABLE tickets ADD COLUMN clarification_question TEXT"
-                    )
-                if "clarification_options_json" not in columns:
-                    connection.execute(
-                        """
-                        ALTER TABLE tickets
-                        ADD COLUMN clarification_options_json TEXT
-                        NOT NULL DEFAULT '[]'
-                        """
-                    )
-                if "waiting_reason" not in columns:
-                    connection.execute(
-                        "ALTER TABLE tickets ADD COLUMN waiting_reason TEXT"
-                    )
-                connection.execute(
-                    """
-                    UPDATE tickets
-                    SET conversation_id = 'CV-' || upper(substr(
-                        replace(ticket_id, 'KG-', ''), 1, 12
-                    ))
-                    WHERE conversation_id IS NULL
-                    """
-                )
+            if existing_tables and schema_version == 6:
+                self._migrate_v6_to_v7(connection)
+                schema_version = 7
+            if existing_tables and schema_version == 7:
+                self._migrate_v7_to_v8(connection)
             connection.executescript(SCHEMA)
+
+    @staticmethod
+    def _migrate_v6_to_v7(connection: sqlite3.Connection) -> None:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(tickets)")
+        }
+        additions = {
+            "conversation_id": "ALTER TABLE tickets ADD COLUMN conversation_id TEXT",
+            "parent_ticket_id": "ALTER TABLE tickets ADD COLUMN parent_ticket_id TEXT",
+            "clarity": "ALTER TABLE tickets ADD COLUMN clarity TEXT",
+            "clarification_question": (
+                "ALTER TABLE tickets ADD COLUMN clarification_question TEXT"
+            ),
+            "clarification_options_json": (
+                "ALTER TABLE tickets ADD COLUMN clarification_options_json "
+                "TEXT NOT NULL DEFAULT '[]'"
+            ),
+            "waiting_reason": "ALTER TABLE tickets ADD COLUMN waiting_reason TEXT",
+        }
+        for column, statement in additions.items():
+            if column not in columns:
+                connection.execute(statement)
+        connection.execute(
+            """
+            UPDATE tickets
+            SET conversation_id = 'CV-' || upper(substr(
+                replace(ticket_id, 'KG-', ''), 1, 12
+            ))
+            WHERE conversation_id IS NULL
+            """
+        )
+        connection.execute("PRAGMA user_version = 7")
+        connection.commit()
+
+    @staticmethod
+    def _migrate_v7_to_v8(connection: sqlite3.Connection) -> None:
+        ticket_columns = (
+            "ticket_id, request_id, user_id, conversation_id, parent_ticket_id, "
+            "status, waiting_reason, category, priority, risk_level, clarity, "
+            "clarification_question, clarification_options_json, sanitized_input, "
+            "summary, risk_flags_json, missing_fields_json, evidence_refs_json, "
+            "draft_answer, final_answer, review_decision, revision_count, "
+            "response_version, requires_human, manual_gate_reason, created_at, updated_at"
+        )
+        command_columns = (
+            "command_id, ticket_id, command_type, payload_fingerprint, status, "
+            "lease_expires_at, lease_version, result_status, result_event_id, "
+            "error_code, created_at, updated_at"
+        )
+        event_columns = (
+            "event_id, ticket_id, idempotency_key, command_id, step_index, node_name, "
+            "event_type, from_status, to_status, summary, metadata_json, created_at"
+        )
+        schema_without_pragmas = "\n".join(
+            line
+            for line in SCHEMA.splitlines()
+            if not line.startswith("PRAGMA foreign_keys")
+            and not line.startswith("PRAGMA user_version")
+        )
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            connection.executescript(
+                f"""
+                BEGIN IMMEDIATE;
+                ALTER TABLE ticket_events RENAME TO ticket_events_v7;
+                ALTER TABLE ticket_commands RENAME TO ticket_commands_v7;
+                ALTER TABLE tickets RENAME TO tickets_v7;
+                DROP INDEX IF EXISTS ix_tickets_conversation;
+                DROP INDEX IF EXISTS ux_ticket_commands_one_in_progress;
+                {schema_without_pragmas}
+                INSERT INTO tickets ({ticket_columns})
+                    SELECT {ticket_columns} FROM tickets_v7;
+                INSERT INTO ticket_commands ({command_columns})
+                    SELECT {command_columns} FROM ticket_commands_v7;
+                INSERT INTO ticket_events ({event_columns})
+                    SELECT {event_columns} FROM ticket_events_v7;
+                DROP TABLE ticket_events_v7;
+                DROP TABLE ticket_commands_v7;
+                DROP TABLE tickets_v7;
+                PRAGMA user_version = 8;
+                COMMIT;
+                """
+            )
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -550,6 +631,18 @@ class TicketRepository:
                 500,
                 optional=True,
             ),
+            "idle_expires_at": cls._project_workbench_text(
+                row.get("idle_expires_at"),
+                "idle_expires_at",
+                64,
+                optional=True,
+            ),
+            "closed_at": cls._project_workbench_text(
+                row.get("closed_at"), "closed_at", 64, optional=True
+            ),
+            "close_reason": cls._enum_value(
+                row.get("close_reason"), "close_reason", CLOSE_REASON_VALUES
+            ),
         }
 
     @classmethod
@@ -623,6 +716,10 @@ class TicketRepository:
             elif field == "waiting_reason":
                 prepared[field] = cls._enum_value(
                     value, field, WAITING_REASON_VALUES
+                )
+            elif field == "close_reason":
+                prepared[field] = cls._enum_value(
+                    value, field, CLOSE_REASON_VALUES
                 )
             elif field == "category":
                 prepared[field] = cls._enum_value(value, field, CATEGORY_VALUES)
@@ -749,6 +846,7 @@ class TicketRepository:
         sanitized_input = self._nonempty_text(sanitized_input, "sanitized_input")
         self._assert_no_secret(sanitized_input)
         normalized_flags = self._normalize_string_list(risk_flags, "risk_flags")
+        inherit_parent_conversation = conversation_id is None
         if conversation_id is None:
             conversation_id = f"CV-{uuid.uuid4().hex[:12].upper()}"
         else:
@@ -790,7 +888,7 @@ class TicketRepository:
                     raise ValueError("parent_ticket_id 对应工单不存在")
                 if parent["user_id"] != user_id:
                     raise ValueError("后续工单必须属于同一用户")
-                if parent["conversation_id"]:
+                if inherit_parent_conversation and parent["conversation_id"]:
                     conversation_id = parent["conversation_id"]
 
             connection.execute(
@@ -849,6 +947,87 @@ class TicketRepository:
                 """
             ).fetchall()
         return [self._project_workbench_ticket(dict(row)) for row in rows]
+
+    @classmethod
+    def _utc_timestamp(cls, value: object, field_name: str) -> str:
+        text = cls._nonempty_text(value, field_name)
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as error:
+            raise ValueError(f"{field_name} 必须是 ISO-8601 时间") from error
+        if parsed.tzinfo is None:
+            raise ValueError(f"{field_name} 必须包含时区")
+        return parsed.astimezone(timezone.utc).isoformat()
+
+    def set_idle_deadline(self, ticket_id: str, expires_at: str) -> bool:
+        """Arm inactivity expiry only while the ticket is awaiting the customer."""
+
+        ticket_id = self._nonempty_text(ticket_id, "ticket_id")
+        expires_at = self._utc_timestamp(expires_at, "expires_at")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE tickets
+                SET idle_expires_at = ?, updated_at = ?
+                WHERE ticket_id = ? AND status = 'pending_user'
+                  AND closed_at IS NULL AND close_reason IS NULL
+                """,
+                (expires_at, self._now(), ticket_id),
+            )
+        return cursor.rowcount == 1
+
+    def clear_idle_deadline(self, ticket_id: str) -> bool:
+        ticket_id = self._nonempty_text(ticket_id, "ticket_id")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE tickets
+                SET idle_expires_at = NULL, updated_at = ?
+                WHERE ticket_id = ? AND idle_expires_at IS NOT NULL
+                """,
+                (self._now(), ticket_id),
+            )
+        return cursor.rowcount == 1
+
+    def list_expired_pending(
+        self, now: str, *, limit: int = 100
+    ) -> List[Dict[str, object]]:
+        now = self._utc_timestamp(now, "now")
+        limit = self._positive_integer(limit, "limit")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT ticket_id, idle_expires_at
+                FROM tickets
+                WHERE status = 'pending_user'
+                  AND idle_expires_at IS NOT NULL
+                  AND idle_expires_at <= ?
+                ORDER BY idle_expires_at ASC
+                LIMIT ?
+                """,
+                (now, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_ai_answers(self, ticket_id: str) -> int:
+        ticket_id = self._nonempty_text(ticket_id, "ticket_id")
+        with self._connect() as connection:
+            ticket = connection.execute(
+                "SELECT 1 FROM tickets WHERE ticket_id = ?", (ticket_id,)
+            ).fetchone()
+            if ticket is None:
+                raise ValueError(f"工单不存在: {ticket_id}")
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS answer_count
+                FROM ticket_events
+                WHERE ticket_id = ? AND event_type = 'response_finalized'
+                """,
+                (ticket_id,),
+            ).fetchone()
+        return int(row["answer_count"])
 
     def begin_command(
         self,

@@ -80,9 +80,13 @@ _FIXED_REQUIRED_FIELDS = {
 _FIXED_MANUAL_GATE_ACTIONS = {
     "device_reset",
     "bootloader_recovery",
-    "wallet_recovery",
     "warranty_decision",
 }
+_FIXED_CUSTOMER_SESSION = {
+    "inactivity_timeout_seconds": 1800,
+    "expiry_poll_seconds": 30,
+}
+_FIXED_CUSTOMER_HANDOFF = {"ai_attempt_threshold": 3}
 
 
 def load_orchestration_config(
@@ -96,6 +100,8 @@ def load_orchestration_config(
             "retries",
             "recursion_limit",
             "command_lease_seconds",
+            "customer_session",
+            "customer_handoff",
             "required_fields",
             "manual_gate_actions",
         },
@@ -132,6 +138,28 @@ def load_orchestration_config(
         raise ValueError("command_lease_seconds 必须大于 timeouts.graph_seconds")
     if lease != 130:
         raise ValueError("command_lease_seconds 必须为 130")
+
+    customer_session = _require_dict(data["customer_session"], "customer_session")
+    _require_keys(
+        customer_session,
+        set(_FIXED_CUSTOMER_SESSION),
+        "customer_session",
+    )
+    for key, expected in _FIXED_CUSTOMER_SESSION.items():
+        _require_integer(customer_session[key], f"customer_session.{key}", minimum=1)
+        if customer_session[key] != expected:
+            raise ValueError(f"customer_session.{key} 必须为 {expected}")
+
+    customer_handoff = _require_dict(data["customer_handoff"], "customer_handoff")
+    _require_keys(
+        customer_handoff,
+        set(_FIXED_CUSTOMER_HANDOFF),
+        "customer_handoff",
+    )
+    for key, expected in _FIXED_CUSTOMER_HANDOFF.items():
+        _require_integer(customer_handoff[key], f"customer_handoff.{key}", minimum=1)
+        if customer_handoff[key] != expected:
+            raise ValueError(f"customer_handoff.{key} 必须为 {expected}")
 
     required_fields = _require_dict(data["required_fields"], "required_fields")
     if not required_fields:

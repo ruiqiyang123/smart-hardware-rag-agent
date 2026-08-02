@@ -91,6 +91,7 @@ flowchart LR
     PG -->|阻断| ES
     PU -->|补充非敏感信息| T
     PU -->|客户确认已解决| OK["resolved"]
+    PU -->|30 分钟无新问题| CL["closed / 已结束"]
     ES --> WB["工单工作台 / HITL"]
     WB -->|追问| PU
     WB -->|批准或编辑后发送| OK
@@ -98,7 +99,7 @@ flowchart LR
     CP -. "仅从暂停态恢复" .-> ES
 ```
 
-### 七状态工单图
+### 八状态会话工单图
 
 ```mermaid
 stateDiagram-v2
@@ -117,14 +118,18 @@ stateDiagram-v2
     reviewing --> escalated: 复核或策略阻断
     pending_user --> triaged: 用户补充
     pending_user --> resolved: 客户明确确认已解决
+    pending_user --> closed: 30 分钟没有继续提问
     pending_user --> escalated: 补充输入触发风险门禁
     escalated --> pending_user: 操作员追问
     escalated --> resolved: 操作员批准或编辑后发送
     escalated --> escalated: 保持人工升级
+    closed --> [*]
     resolved --> [*]
 ```
 
-状态集合固定为 `new`、`triaged`、`diagnosing`、`reviewing`、`pending_user`、`escalated`、`resolved`。模型输出结构化建议，但不能创造第八种状态或绕过允许的状态转移。完整自动答复会停在 `pending_user + resolution_confirmation`；只有客户明确确认，工单才进入 `resolved`。
+状态集合固定为 `new`、`triaged`、`diagnosing`、`reviewing`、`pending_user`、`escalated`、`closed`、`resolved`。模型输出结构化建议，但不能创造第九种状态或绕过允许的状态转移。完整自动答复会停在 `pending_user + resolution_confirmation`；客户在 30 分钟内可以跨主题继续追问，每一轮都会重新执行安全分诊、诊断和复核。30 分钟没有新问题只进入 `closed（已结束）`，不会冒充“问题已解决”；只有客户明确确认，或受控人工动作完成，工单才进入 `resolved`。
+
+这里的一张工单代表一次客服会话，而不是单个问题主题。会话超时后，下一条消息创建新的 `conversation_id`，同时用 `parent_ticket_id` 关联上一张已结束工单，便于演示连续服务和审计链路。
 
 ---
 
@@ -244,6 +249,8 @@ class SanitizedText:
 
 ### Human-in-the-loop 不是一句提示
 
+客户页始终展示“联系人工客服”入口。普通低风险会话完成 3 次有效 AI 回答后可以主动转人工，用来模拟先自助、再人工的客服分流；助记词泄露、资产丢失、钓鱼、异常签名等风险信号不受次数限制，会立即进入人工队列。
+
 “工单工作台”支持四种操作：
 
 1. 批准并发送；
@@ -251,7 +258,7 @@ class SanitizedText:
 3. 向用户追问，回到 `pending_user`；
 4. 拒绝并保持人工升级。
 
-设备重置、bootloader 恢复、钱包恢复和保修结论等有影响的动作不会被 Tool 自动执行。
+设备重置、bootloader 恢复和保修结论等有影响的动作不会被 Tool 自动执行。低风险的钱包恢复知识咨询可以由 AI 给出安全说明；一旦包含敏感信息或资产风险，仍由风险门禁直接转人工。
 
 ---
 
@@ -353,8 +360,8 @@ pytest -q
 
 当前发布基线（2026-08-02）：
 
-- **466 个测试通过**；
-- **618 个参数化子测试通过**；
+- **479 个测试通过**；
+- **653 个参数化子测试通过**；
 - 覆盖状态转移、路由、DeepSeek 结构化输出兼容、安全脱敏、证据、持久化、恢复、Human-in-the-loop 和故障注入。
 
 ### 48 条离线评测
@@ -455,7 +462,7 @@ ai-hardware-cs-agent/
 KeyGuard 2.0｜多 Agent 硬件钱包售后工单系统｜个人项目
 
 • 基于 LangGraph StateGraph 设计 Triage、Diagnosis、Review 三 Agent 工单流程，
-  使用七状态状态机和确定性 Router 管理信息补充、一次返工、客户确认结案与人工升级。
+  使用八状态状态机和确定性 Router 管理跨主题连续追问、30 分钟会话结束、客户确认结案与人工升级。
 
 • 实现持久化前敏感信息脱敏、风险粘性和出站 Policy Guard，覆盖助记词、私钥、
   PIN、Passphrase 与不可信链接等安全边界。

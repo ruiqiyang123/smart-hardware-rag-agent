@@ -28,6 +28,7 @@ from agent.orchestration.events import make_event, to_repository_event
 from agent.orchestration.invoke import invoke_with_policy
 from agent.orchestration.resolution_intent import is_resolution_confirmation
 from agent.orchestration.routes import assert_transition
+from agent.orchestration.session_lifecycle import SessionExpiryService
 from agent.orchestration.state import (
     DiagnosisResult,
     MissingField,
@@ -717,6 +718,8 @@ class SupportOrchestrator:
         recursion_limit: int,
         lease_seconds: int,
         graph_timeout_seconds: float = 120,
+        inactivity_timeout_seconds: int = 1800,
+        customer_handoff_threshold: int = 3,
         trusted_source_policy: object | None = None,
         final_policy_guard: object | None = None,
         checkpoint_safety: object | None = None,
@@ -742,6 +745,18 @@ class SupportOrchestrator:
             raise ValueError("graph_timeout_seconds 必须是有限正数")
         if graph_timeout_seconds >= lease_seconds:
             raise ValueError("graph_timeout_seconds 必须严格小于 command lease")
+        if (
+            isinstance(inactivity_timeout_seconds, bool)
+            or not isinstance(inactivity_timeout_seconds, int)
+            or inactivity_timeout_seconds <= 0
+        ):
+            raise ValueError("inactivity_timeout_seconds 必须是正整数")
+        if (
+            isinstance(customer_handoff_threshold, bool)
+            or not isinstance(customer_handoff_threshold, int)
+            or customer_handoff_threshold <= 0
+        ):
+            raise ValueError("customer_handoff_threshold 必须是正整数")
         if not callable(getattr(repository, "begin_command", None)):
             raise TypeError("repository 接口非法")
         if not callable(getattr(graph, "invoke", None)):
@@ -781,6 +796,12 @@ class SupportOrchestrator:
         self.recursion_limit = recursion_limit
         self.lease_seconds = lease_seconds
         self.graph_timeout_seconds = float(graph_timeout_seconds)
+        self.customer_handoff_threshold = customer_handoff_threshold
+        self.sessions = SessionExpiryService(
+            repository,
+            inactivity_timeout_seconds=inactivity_timeout_seconds,
+            command_lease_seconds=lease_seconds,
+        )
         self._prepared_issuer = object()
         self._prepared_signing_key = secrets.token_bytes(32)
         self.trusted_sources = trusted_source_policy or TrustedSourcePolicy()
@@ -792,6 +813,18 @@ class SupportOrchestrator:
                 "final_policy_guard 与 runtime 必须共享 trusted_source_policy"
             )
         self.final_policy_guard = final_policy_guard
+
+    def _refresh_idle_deadline(self, ticket_id: str) -> None:
+        ticket = self.repository.get_ticket(ticket_id)
+        if ticket is None:
+            raise ValueError(f"工单不存在: {ticket_id}")
+        if ticket.get("status") == Status.PENDING_USER.value:
+            self.sessions.arm(ticket_id)
+        else:
+            self.sessions.clear(ticket_id)
+
+    def close_expired_sessions(self) -> list[str]:
+        return self.sessions.close_expired()
 
     def _config(
         self,
@@ -1642,6 +1675,17 @@ class SupportOrchestrator:
                 WaitingReason.MISSING_INFORMATION.value,
             }:
                 raise ValueError("pending_user ticket 等待原因非法")
+        elif result_status == Status.CLOSED.value:
+            if (
+                waiting_reason
+                or requires_human != 0
+                or ticket.get("idle_expires_at") is not None
+                or not ticket.get("closed_at")
+                or ticket.get("close_reason") != "inactivity"
+            ):
+                raise ValueError("closed ticket 终态非法")
+            if final_answer:
+                self._final_policy_passes(final_answer, citations)
         elif final_answer:
             raise ValueError("非 resolved ticket 不得返回 final_answer")
         elif waiting_reason:
@@ -1904,6 +1948,7 @@ class SupportOrchestrator:
             graph_input=state,
             command_type=CommandType.USER_INPUT.value,
         )
+        self._refresh_idle_deadline(ticket_id)
         return self._result(
             ticket_id,
             sanitized_input,
@@ -1979,6 +2024,8 @@ class SupportOrchestrator:
         if duplicate is not None:
             return duplicate
 
+        self.sessions.clear(ticket_id)
+
         resume_payload = (
             {
                 "command_id": command_id,
@@ -2002,6 +2049,7 @@ class SupportOrchestrator:
             graph_input=resume_command,
             command_type=CommandType.USER_INPUT.value,
         )
+        self._refresh_idle_deadline(ticket_id)
         return self._result(
             ticket_id,
             sanitized_input,
@@ -2022,6 +2070,90 @@ class SupportOrchestrator:
             self.prepare_user_input("问题已解决"),
             request_id=f"confirm:{action_id}",
         )
+
+    def can_request_human(self, ticket_id: str) -> tuple[bool, int]:
+        ticket_id = _identifier(ticket_id, "ticket_id")
+        attempts = self.repository.count_ai_answers(ticket_id)
+        return attempts >= self.customer_handoff_threshold, attempts
+
+    def request_human(
+        self,
+        ticket_id: str,
+        raw_input: str = "转人工客服",
+        request_id: Optional[str] = None,
+    ) -> OrchestrationResult:
+        return self.request_human_prepared(
+            ticket_id,
+            self.prepare_user_input(raw_input),
+            request_id=request_id,
+        )
+
+    def request_human_prepared(
+        self,
+        ticket_id: str,
+        prepared: PreparedUserInput,
+        request_id: Optional[str] = None,
+    ) -> OrchestrationResult:
+        sanitized = self._validated_prepared_user_input(prepared)
+        ticket_id = _identifier(ticket_id, "ticket_id")
+        if sanitized.risk_level != RiskLevel.LOW.value or sanitized.risk_flags:
+            raise ValueError("风险输入必须先经过安全分诊")
+        allowed, attempts = self.can_request_human(ticket_id)
+        if not allowed:
+            raise ValueError("尚未达到人工接入条件")
+        request_id = uuid.uuid4().hex if request_id is None else request_id
+        request_id = _identifier(request_id, "request_id", 120)
+        command_id = _identifier(f"human-request:{request_id}", "command_id")
+        fingerprint = _payload_fingerprint(
+            {
+                "kind": "customer_request_human",
+                "ticket_id": ticket_id,
+                "sanitized_input": sanitized.sanitized_input,
+                "ai_answer_count": attempts,
+            }
+        )
+        decision = self.repository.begin_command(
+            ticket_id,
+            command_id,
+            CommandType.CUSTOMER_REQUEST_HUMAN.value,
+            self.lease_seconds,
+            payload_fingerprint=fingerprint,
+            required_status=Status.PENDING_USER.value,
+        )
+        duplicate = self._existing_decision_result(
+            decision,
+            ticket_id=ticket_id,
+            sanitized_input=sanitized.sanitized_input,
+            user_notice="",
+        )
+        if duplicate is not None:
+            return duplicate
+        self.sessions.clear(ticket_id)
+        self.repository.commit_command_result(
+            ticket_id,
+            command_id,
+            decision.lease_version,
+            {
+                "status": Status.ESCALATED.value,
+                "waiting_reason": None,
+                "idle_expires_at": None,
+                "final_answer": None,
+                "requires_human": True,
+                "manual_gate_reason": "customer_requested_human",
+            },
+            [
+                {
+                    "step_index": 1,
+                    "node_name": "customer_handoff",
+                    "event_type": "ticket.escalated",
+                    "from_status": Status.PENDING_USER.value,
+                    "to_status": Status.ESCALATED.value,
+                    "summary": "客户在完成 AI 自助后申请人工客服",
+                    "metadata": {"ai_answer_count": attempts},
+                }
+            ],
+        )
+        return self._result(ticket_id, sanitized.sanitized_input, "")
 
     def human_action(
         self,
@@ -2185,4 +2317,5 @@ class SupportOrchestrator:
             human_action=action,
             expected_final_answer=expected_final_answer,
         )
+        self._refresh_idle_deadline(ticket_id)
         return self._result(ticket_id, "", "")

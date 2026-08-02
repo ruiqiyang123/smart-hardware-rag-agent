@@ -18,6 +18,7 @@ CUSTOMER_PHASE_LABELS = {
     "guidance_finalized": "💬 基础建议已生成，等待补充",
     "escalated": "👩‍💼 已转人工审核",
     "response_finalized": "📨 安全回复已完成",
+    "ticket.closed": "⏱️ 会话已结束",
 }
 
 _WORKBENCH_EVENT_TYPES = frozenset(

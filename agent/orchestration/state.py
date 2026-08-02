@@ -38,6 +38,7 @@ class Status(str, Enum):
     REVIEWING = "reviewing"
     PENDING_USER = "pending_user"
     ESCALATED = "escalated"
+    CLOSED = "closed"
     RESOLVED = "resolved"
 
 
@@ -403,6 +404,9 @@ class TicketState(TypedDict, total=False):
     resolution_confirmed: bool
     requires_human: bool
     manual_gate_reason: str
+    idle_expires_at: str
+    closed_at: str
+    close_reason: str
     human_decision: str
     final_answer: str
     status_events: Annotated[List[StatusEventState], add]

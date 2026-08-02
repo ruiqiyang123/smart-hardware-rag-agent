@@ -83,6 +83,14 @@ _HIGH_FLAGS = frozenset(
     }
 )
 
+_UNSAFE_SECRET_DESTINATION_PATTERN = re.compile(
+    r"(?<!不要)(?<!请勿)(?<!别)(?<!不)(?:在|向)"
+    r"(?:任何)?(?:电脑|手机|网页|网站|客服)"
+    r".{0,16}(?:输入|提供|发送|上传)"
+    r".{0,12}(?:助记词|私钥|PIN|Passphrase|密码|seed\s+phrase|private\s+key)",
+    re.IGNORECASE,
+)
+
 _UNSAFE_ACTION_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(
         r"(?:请|把|将|(?<!不)(?<!无)(?<!免)需要|向我|给我|可以)(?:你)?(?:发送|提供|告诉|提交|输入|上传)"
@@ -110,6 +118,52 @@ _UNSAFE_ACTION_PATTERNS: Tuple[re.Pattern, ...] = (
         re.IGNORECASE,
     ),
 )
+
+
+def _safe_device_recovery_secret_input(text: str, match: re.Match) -> bool:
+    """Allow device-local recovery wording without allowing secret solicitation."""
+
+    matched = match.group(0)
+    if not re.search(r"输入|enter", matched, re.IGNORECASE):
+        return False
+    if re.search(
+        r"发送|提供|告诉|提交|上传|share|send|provide|tell|upload",
+        matched,
+        re.IGNORECASE,
+    ):
+        return False
+    context = text[max(0, match.start() - 180) : match.end() + 100]
+    if not re.search(r"恢复|recovery|recover", context, re.IGNORECASE):
+        return False
+    if not re.search(
+        r"(?:新|硬件钱包|KeyGuard).{0,24}设备|设备端|hardware\s+wallet",
+        context,
+        re.IGNORECASE,
+    ):
+        return False
+    if _UNSAFE_SECRET_DESTINATION_PATTERN.search(context) or re.search(
+        r"(?:computer|phone|website|support).{0,16}(?:enter|send|provide)",
+        context,
+        re.IGNORECASE,
+    ):
+        return False
+    return True
+
+
+def _contains_unsafe_action(text: str) -> bool:
+    if _UNSAFE_SECRET_DESTINATION_PATTERN.search(text):
+        return True
+    for index, pattern in enumerate(_UNSAFE_ACTION_PATTERNS):
+        matches = list(pattern.finditer(text))
+        if index == 0:
+            if any(
+                not _safe_device_recovery_secret_input(text, match)
+                for match in matches
+            ):
+                return True
+        elif matches:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -246,7 +300,7 @@ class PolicyGuard:
         reasons: List[str] = []
         if contains_unredacted_secret(text):
             reasons.append("secret_exposure")
-        if any(pattern.search(text) for pattern in _UNSAFE_ACTION_PATTERNS):
+        if _contains_unsafe_action(text):
             reasons.append("unsafe_action")
 
         safe_citations = {

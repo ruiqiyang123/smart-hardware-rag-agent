@@ -193,6 +193,8 @@ class TicketRepositoryTest(unittest.TestCase):
             {member.value for member in CommandType},
             {
                 "user_input",
+                "customer_request_human",
+                "system_idle_close",
                 "human_approve",
                 "human_edit_send",
                 "human_ask",
@@ -934,6 +936,9 @@ class TicketRepositoryTest(unittest.TestCase):
                 "missing_fields",
                 "draft_answer",
                 "manual_gate_reason",
+                "idle_expires_at",
+                "closed_at",
+                "close_reason",
             },
         )
         self.assertEqual(projected[0]["draft_answer"], "请使用官方应用重新配对。")
@@ -975,6 +980,55 @@ class TicketRepositoryTest(unittest.TestCase):
             },
             {first["ticket_id"]},
         )
+
+    def test_follow_up_can_start_a_new_conversation_after_closed_ticket(self):
+        first = self.repo.create_ticket(
+            "closed-root", "1001", "蓝牙连接失败", []
+        )
+        follow_up = self.repo.create_ticket(
+            "closed-follow-up",
+            "1001",
+            "开始一个新会话",
+            [],
+            conversation_id="CV-NEWSESSION1",
+            parent_ticket_id=first["ticket_id"],
+        )
+        self.assertEqual(follow_up["parent_ticket_id"], first["ticket_id"])
+        self.assertEqual(follow_up["conversation_id"], "CV-NEWSESSION1")
+        self.assertNotEqual(follow_up["conversation_id"], first["conversation_id"])
+
+    def test_idle_deadline_only_applies_to_pending_tickets(self):
+        ticket = self._ticket("idle-deadline")
+        deadline = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        self.assertFalse(self.repo.set_idle_deadline(ticket["ticket_id"], deadline))
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                "UPDATE tickets SET status = 'pending_user' WHERE ticket_id = ?",
+                (ticket["ticket_id"],),
+            )
+        self.assertTrue(self.repo.set_idle_deadline(ticket["ticket_id"], deadline))
+        saved = self.repo.get_ticket(ticket["ticket_id"])
+        self.assertEqual(saved["idle_expires_at"], deadline)
+        self.assertTrue(self.repo.clear_idle_deadline(ticket["ticket_id"]))
+        self.assertIsNone(self.repo.get_ticket(ticket["ticket_id"])["idle_expires_at"])
+
+    def test_lists_only_due_pending_tickets(self):
+        due = self._ticket("idle-due")
+        future = self._ticket("idle-future")
+        now = datetime.now(timezone.utc)
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                "UPDATE tickets SET status = 'pending_user' WHERE ticket_id IN (?, ?)",
+                (due["ticket_id"], future["ticket_id"]),
+            )
+        self.repo.set_idle_deadline(
+            due["ticket_id"], (now - timedelta(seconds=1)).isoformat()
+        )
+        self.repo.set_idle_deadline(
+            future["ticket_id"], (now + timedelta(minutes=30)).isoformat()
+        )
+        expired = self.repo.list_expired_pending(now.isoformat())
+        self.assertEqual([row["ticket_id"] for row in expired], [due["ticket_id"]])
 
 
 if __name__ == "__main__":

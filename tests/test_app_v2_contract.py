@@ -160,7 +160,7 @@ class AppV2ContractTest(unittest.TestCase):
         source = self.function_source("get_or_build_orchestrator")
 
         self.assertIn(
-            'ORCHESTRATOR_CONTRACT_VERSION = "2026-08-02-deepseek-structured-output-v7"',
+            'ORCHESTRATOR_CONTRACT_VERSION = "2026-08-02-session-ticket-lifecycle-v8"',
             self.source,
         )
         self.assertIn("contract_version: str", source)
@@ -236,7 +236,7 @@ class AppV2ContractTest(unittest.TestCase):
         submit = self.function_source("_run_v2_prompt")
         action = self.function_source("_run_human_action")
         self.assertIn("_stable_request_id()", submit)
-        self.assertEqual(submit.count("request_id=request_id"), 2)
+        self.assertEqual(submit.count("request_id=request_id"), 3)
         self.assertIn("get_or_freeze_request_command(", submit)
         self.assertIn("orchestrator.prepare_user_input(prompt)", submit)
         self.assertIn("orchestrator.submit_prepared(", submit)
@@ -358,9 +358,9 @@ class AppV2ContractTest(unittest.TestCase):
         self.assertIn("append_processing_turn", submit)
         self.assertIn("replace_processing_answer", submit)
         self.assertIn("PENDING_UI_REQUEST_SESSION_KEY", submit)
-        self.assertIn('st.chat_message("user"', submit)
-        self.assertIn('st.chat_message("assistant"', submit)
-        self.assertIn("st.status(", submit)
+        self.assertIn('ui_container.chat_message("user"', submit)
+        self.assertIn('ui_container.chat_message("assistant"', submit)
+        self.assertIn("ui_container.status(", submit)
         self.assertIn("project_customer_phases", render)
         self.assertIn("project_workbench_events", self.function_source("_render_workbench"))
 

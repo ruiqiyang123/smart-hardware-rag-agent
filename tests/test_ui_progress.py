@@ -16,6 +16,7 @@ class UiProgressProjectionTest(unittest.TestCase):
             {"event_type": "triage_completed", "summary": "重复"},
             {"event_type": "node_failure", "summary": "不应展示"},
             {"event_type": "unknown", "summary": "不应展示"},
+            {"event_type": "ticket.closed", "summary": "30 分钟无新消息"},
         ]
 
         self.assertEqual(
@@ -23,6 +24,7 @@ class UiProgressProjectionTest(unittest.TestCase):
             [
                 {"event_type": "entry_checked", "label": "🛡️ 安全检查完成"},
                 {"event_type": "triage_completed", "label": "🧭 问题分诊完成"},
+                {"event_type": "ticket.closed", "label": "⏱️ 会话已结束"},
             ],
         )
 

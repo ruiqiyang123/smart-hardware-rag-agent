@@ -44,10 +44,11 @@ class OrchestrationRoutesTest(unittest.TestCase):
     expected_transitions = {
         "new": {"triaged", "escalated"},
         "triaged": {"pending_user", "diagnosing", "escalated"},
-        "pending_user": {"triaged", "escalated", "resolved"},
+        "pending_user": {"triaged", "escalated", "closed", "resolved"},
         "diagnosing": {"pending_user", "reviewing", "escalated"},
         "reviewing": {"pending_user", "resolved", "diagnosing", "escalated"},
         "escalated": {"resolved", "pending_user", "escalated"},
+        "closed": set(),
         "resolved": set(),
     }
 

@@ -327,6 +327,26 @@ class WalletSafetyGuardTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(result.reason_codes, ["secret_exposure", "unsafe_action"])
 
+    def test_policy_allows_device_local_recovery_verification(self):
+        text = (
+            "请使用一台新的 KeyGuard 设备完成恢复。"
+            "恢复后需要输入同一个 Passphrase 才能看到对应账户。"
+            "不要在电脑、手机或网页输入，也不要向客服提供任何钱包秘密。"
+        )
+
+        result = self.output.evaluate(text, citation_urls=[])
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.reason_codes, [])
+
+    def test_policy_still_rejects_recovery_secret_input_on_webpage(self):
+        text = "使用新 KeyGuard 设备恢复前，请在网页输入 Passphrase。"
+
+        result = self.output.evaluate(text, citation_urls=[])
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.reason_codes, ["unsafe_action"])
+
     def test_policy_empty_and_non_string_inputs_fail_closed_without_echo(self):
         for text, citations in (("", []), (None, []), (123, []), ("安全内容", None)):
             with self.subTest(text_type=type(text).__name__):
