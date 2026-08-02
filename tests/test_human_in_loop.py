@@ -712,7 +712,7 @@ class HumanInLoopTest(unittest.TestCase):
                 step_index=2,
             )
 
-    def test_manual_gate_keeps_safe_draft_for_human_review(self):
+    def test_controlled_action_guidance_does_not_force_human_handoff(self):
         gated_output = _diagnosis(None)
         gated_output["recommended_actions"][0]["action_code"] = "device_reset"
         from agent.orchestration.graph import build_support_graph
@@ -725,13 +725,14 @@ class HumanInLoopTest(unittest.TestCase):
             checkpointer=MemorySaver(),
         ).invoke(
             _initial_state(),
-            {"configurable": {"thread_id": "manual-gate"}},
+            {"configurable": {"thread_id": "controlled-guidance"}},
         )
 
-        self.assertEqual(result["status"], "escalated")
-        self.assertEqual(result["manual_gate_reason"], "device_reset")
+        self.assertEqual(result["status"], "pending_user")
+        self.assertFalse(result["requires_human"])
+        self.assertFalse(result.get("manual_gate_reason"))
         self.assertEqual(
-            result["draft_answer"], "请先更换可信电源线，然后重新连接设备。"
+            result["final_answer"], "请先更换可信电源线，然后重新连接设备。"
         )
         self.assertIn("__interrupt__", result)
 
@@ -789,12 +790,6 @@ class HumanInLoopTest(unittest.TestCase):
                 "warranty_service": ["serial_last4"],
                 "transaction_boundary": ["transaction_hash", "chain_name"],
             },
-            "manual_gate_actions": [
-                "device_reset",
-                "bootloader_recovery",
-                "wallet_recovery",
-                "warranty_decision",
-            ],
         }
         policy = {
             "policy_version": "test.v1",
@@ -843,13 +838,64 @@ class HumanInLoopTest(unittest.TestCase):
             ],
         )
 
-    def test_triage_cannot_downgrade_ingress_risk_or_drop_flags(self):
+    def test_low_medium_triage_validation_failure_uses_safe_clarification(self):
         downgraded = self._graph().invoke(
             _initial_state(risk_level="medium"),
             {"configurable": {"thread_id": "risk-downgrade"}},
         )
-        self.assertEqual(downgraded["status"], "escalated")
-        self.assertEqual(downgraded["last_error"], "TRIAGE_FAILURE")
+        self.assertEqual(downgraded["status"], "pending_user")
+        self.assertEqual(
+            downgraded["last_error"], "TRIAGE_FALLBACK_CLARIFICATION"
+        )
+        self.assertEqual(downgraded["category"], "other")
+        self.assertEqual(downgraded["priority"], "P2")
+        self.assertEqual(downgraded["risk_level"], "medium")
+        self.assertEqual(len(downgraded["clarification_options"]), 5)
+
+    def test_triage_fallback_clears_stale_answer_and_evidence(self):
+        def invalid_triage(_state):
+            raise ValueError("provider raw output must not be persisted")
+
+        from agent.orchestration.graph import build_support_graph
+
+        result = build_support_graph(
+            triage_node=invalid_triage,
+            diagnosis_node=_diagnosis,
+            review_node=_review,
+            policy_guard=lambda _text, _citations: True,
+            checkpointer=MemorySaver(),
+        ).invoke(
+            _initial_state(
+                status="pending_user",
+                category="power",
+                priority="P2",
+                summary="上一轮摘要",
+                outcome="draft",
+                draft_answer="上一轮草稿",
+                final_answer="上一轮回答",
+                evidence_refs=["old-1"],
+                evidence=[{"evidence_id": "old-1"}],
+                citations=[{"source_id": "old-1"}],
+            ),
+            {"configurable": {"thread_id": "triage-fallback-clear"}},
+        )
+
+        self.assertEqual(result["status"], "pending_user")
+        self.assertEqual(result["category"], "other")
+        self.assertEqual(result["summary"], "等待用户选择问题类型")
+        self.assertEqual(result["draft_answer"], "")
+        self.assertEqual(result["final_answer"], "")
+        self.assertEqual(result["evidence"], [])
+        self.assertEqual(result["citations"], [])
+        fallback_events = [
+            event
+            for event in result["status_events"]
+            if event["event_type"] == "triage_fallback_clarification"
+        ]
+        self.assertEqual(len(fallback_events), 1)
+        self.assertNotIn("provider raw output", str(result))
+
+    def test_triage_failure_with_sticky_flag_still_fails_closed(self):
 
         dropped = self._graph().invoke(
             _initial_state(

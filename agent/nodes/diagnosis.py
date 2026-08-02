@@ -64,11 +64,8 @@ _CRITICAL_FLAGS = frozenset(
 )
 _HIGH_FLAGS = frozenset(
     {
-        RiskFlag.UNOFFICIAL_FIRMWARE,
         RiskFlag.ADDRESS_MISMATCH,
         RiskFlag.SUSPICIOUS_SIGNATURE,
-        RiskFlag.DEVICE_AUTH_FAILURE,
-        RiskFlag.REMOTE_CONTROL,
     }
 )
 _WARRANTY_QUERY = re.compile(r"[A-Za-z0-9]{4}", re.ASCII)

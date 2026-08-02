@@ -14,7 +14,7 @@ import re
 import sqlite3
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Mapping
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
@@ -50,9 +50,6 @@ _EXCEPTION_TYPE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}", re.ASCII)
 _MISSING_FIELDS = frozenset(item.value for item in MissingField)
 _RISK_FLAGS = frozenset(item.value for item in RiskFlag)
 _RISK_LEVELS = frozenset(item.value for item in RiskLevel)
-_MANUAL_ACTIONS = frozenset(
-    {"device_reset", "bootloader_recovery", "wallet_recovery", "warranty_decision"}
-)
 _RESUME_ACTIONS = frozenset({"approve", "edit_send", "ask_user", "reject"})
 _CONNECTION_CATEGORIES = frozenset(
     {"usb_connection", "mobile_connection", "bluetooth_connection"}
@@ -122,11 +119,8 @@ _CRITICAL_FLAGS = frozenset(
 )
 _HIGH_FLAGS = frozenset(
     {
-        RiskFlag.UNOFFICIAL_FIRMWARE.value,
         RiskFlag.ADDRESS_MISMATCH.value,
         RiskFlag.SUSPICIOUS_SIGNATURE.value,
-        RiskFlag.DEVICE_AUTH_FAILURE.value,
-        RiskFlag.REMOTE_CONTROL.value,
     }
 )
 _REVIEW_REASON_PATTERN = re.compile(r"[a-z_]{1,64}", re.ASCII)
@@ -145,6 +139,24 @@ _RISK_ORDER = {
     RiskLevel.HIGH.value: 2,
     RiskLevel.CRITICAL.value: 3,
 }
+_AUTOMATIC_ESCALATION_REASON_ORDER = (
+    RiskFlag.SECRET_EXPOSURE.value,
+    RiskFlag.PHISHING.value,
+    RiskFlag.ASSET_LOSS.value,
+    RiskFlag.ADDRESS_MISMATCH.value,
+    RiskFlag.SUSPICIOUS_SIGNATURE.value,
+)
+_TRIAGE_FALLBACK_CODE = "TRIAGE_FALLBACK_CLARIFICATION"
+_TRIAGE_FALLBACK_QUESTION = (
+    "系统暂时无法准确判断问题类型。请选择最接近的一项，我会继续为你处理："
+)
+_TRIAGE_FALLBACK_OPTIONS = [
+    "设备故障（开机、屏幕或按键）",
+    "连接问题（USB、蓝牙或手机）",
+    "钱包恢复或账户显示问题",
+    "交易未确认、失败或余额显示异常",
+    "发现未经本人授权的资产转移",
+]
 
 
 def _forbidden_control(value: str) -> bool:
@@ -453,6 +465,74 @@ def _fail_closed(state: Mapping[str, object], node_name: str, code: str) -> dict
     )
 
 
+def _can_use_triage_clarification_fallback(state: Mapping[str, object]) -> bool:
+    risk_level = state.get("risk_level")
+    risk_flags = state.get("risk_flags")
+    requires_human = state.get("requires_human", False)
+    return (
+        risk_level in {RiskLevel.LOW.value, RiskLevel.MEDIUM.value}
+        and isinstance(risk_flags, list)
+        and not risk_flags
+        and requires_human is False
+    )
+
+
+def _automatic_escalation_reason(state: Mapping[str, object]) -> str:
+    flags = state.get("risk_flags", [])
+    if not isinstance(flags, list):
+        return ""
+    present = {item for item in flags if isinstance(item, str)}
+    return next(
+        (reason for reason in _AUTOMATIC_ESCALATION_REASON_ORDER if reason in present),
+        "",
+    )
+
+
+def _triage_clarification_fallback(state: Mapping[str, object]) -> dict:
+    current = _status(state.get("status"))
+    assert_transition(current.value, Status.TRIAGED.value)
+    update = {
+        "status": Status.TRIAGED.value,
+        "waiting_reason": None,
+        "intent": "other",
+        "category": "other",
+        "priority": "P2",
+        "risk_level": state["risk_level"],
+        "risk_flags": [],
+        "clarity": "ambiguous",
+        "clarification_question": _TRIAGE_FALLBACK_QUESTION,
+        "clarification_options": list(_TRIAGE_FALLBACK_OPTIONS),
+        "missing_fields": [],
+        "suggested_route": "clarify",
+        "summary": "等待用户选择问题类型",
+        "outcome": "",
+        "diagnosis_summary": "",
+        "recommended_actions": [],
+        "evidence_refs": [],
+        "citations": [],
+        "remaining_unknowns": [],
+        "evidence": [],
+        "tool_errors": [],
+        "draft_answer": "",
+        "final_answer": "",
+        "review_decision": "",
+        "review_reasons": [],
+        "review_issues": [],
+        "required_changes": [],
+        "requires_human": False,
+        "manual_gate_reason": "",
+        "last_error": _TRIAGE_FALLBACK_CODE,
+    }
+    route_after_triage({**dict(state), **update})
+    return with_event(
+        state,
+        update,
+        node_name="triage",
+        event_type="triage_fallback_clarification",
+        summary="分诊结构校验失败，已进入安全澄清",
+    )
+
+
 def _log_node_failure(
     state: Mapping[str, object],
     node_name: str,
@@ -506,6 +586,8 @@ def _entry(state: TicketState) -> dict:
                 "status": Status.ESCALATED.value,
                 "waiting_reason": None,
                 "requires_human": True,
+                "manual_gate_reason": _automatic_escalation_reason(state)
+                or "risk_gate",
             },
             node_name="entry",
             event_type="risk_gate",
@@ -554,6 +636,12 @@ def _triage_node(dependency: Callable[[dict], object]) -> Callable[[TicketState]
                 summary="分诊已完成",
             )
         except Exception as error:
+            if (
+                isinstance(error, (TypeError, ValueError))
+                and _can_use_triage_clarification_fallback(state)
+            ):
+                _log_node_failure(state, "triage", _TRIAGE_FALLBACK_CODE, error)
+                return _triage_clarification_fallback(state)
             error_code = (
                 "TRIAGE_TIMEOUT"
                 if isinstance(error, TimeoutError)
@@ -578,7 +666,6 @@ def _start_diagnosis(state: TicketState) -> dict:
 
 def _diagnosis_node(
     dependency: Callable[[dict], object],
-    manual_actions: frozenset[str],
     trusted_sources: object | None,
 ) -> Callable[[TicketState], dict]:
     def run(state: TicketState) -> dict:
@@ -614,19 +701,6 @@ def _diagnosis_node(
             target = outcomes[outcome]
             if outcome == "need_user" and raw.get("draft_answer"):
                 target = Status.REVIEWING
-            actions = raw.get("recommended_actions", [])
-            if not isinstance(actions, list):
-                raise ValueError("recommended_actions 非法")
-            action_codes = {
-                item.get("action_code")
-                for item in actions
-                if isinstance(item, Mapping) and isinstance(item.get("action_code"), str)
-            }
-            gated = sorted(action_codes & manual_actions)
-            if gated:
-                target = Status.ESCALATED
-                raw["requires_human"] = True
-                raw["manual_gate_reason"] = ",".join(gated)
             raw["status"] = target.value
             raw["waiting_reason"] = (
                 WaitingReason.MISSING_INFORMATION.value
@@ -735,6 +809,9 @@ def _escalate(state: TicketState) -> dict:
             "waiting_reason": None,
             "requires_human": True,
             "final_answer": "",
+            "manual_gate_reason": state.get("manual_gate_reason")
+            or _automatic_escalation_reason(state)
+            or "model_escalated",
         },
         node_name="escalate",
         event_type="escalated",
@@ -1086,7 +1163,6 @@ def build_support_graph(
     review_node: object | None = None,
     policy_guard: object,
     checkpointer: object,
-    manual_gate_actions: Sequence[str] = tuple(_MANUAL_ACTIONS),
     triage: object | None = None,
     diagnosis: object | None = None,
     review: object | None = None,
@@ -1111,16 +1187,6 @@ def build_support_graph(
     ):
         raise TypeError("policy_guard.trusted_sources 接口非法")
     saver = _checkpointer(checkpointer)
-    if (
-        not isinstance(manual_gate_actions, Sequence)
-        or isinstance(manual_gate_actions, (str, bytes))
-        or not manual_gate_actions
-        or any(not isinstance(item, str) or item not in _MANUAL_ACTIONS for item in manual_gate_actions)
-        or len(manual_gate_actions) != len(set(manual_gate_actions))
-    ):
-        raise ValueError("manual_gate_actions 非法")
-    manual_actions = frozenset(manual_gate_actions)
-
     builder = StateGraph(TicketState)
     builder.add_node("entry", _entry)
     builder.add_node("triage", _triage_node(triage_call))
@@ -1128,7 +1194,7 @@ def build_support_graph(
     builder.add_node("start_diagnosis", _start_diagnosis)
     builder.add_node(
         "diagnosis",
-        _diagnosis_node(diagnosis_call, manual_actions, trusted_sources),
+        _diagnosis_node(diagnosis_call, trusted_sources),
     )
     builder.add_node("review", _review_node(review_call))
     builder.add_node("revision", _revision)
@@ -1281,7 +1347,6 @@ def build_configured_graph(
     timeouts = _configured_mapping(config.get("timeouts"), "timeouts")
     retries = _configured_mapping(config.get("retries"), "retries")
     required_fields = config.get("required_fields")
-    manual_actions = config.get("manual_gate_actions")
     agent_timeout = _configured_positive_number(
         timeouts.get("agent_seconds"), "timeouts.agent_seconds"
     )
@@ -1436,5 +1501,4 @@ def build_configured_graph(
         review_node=reviewer,
         policy_guard=guard,
         checkpointer=checkpointer,
-        manual_gate_actions=manual_actions,
     )

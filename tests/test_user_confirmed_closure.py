@@ -142,26 +142,17 @@ class UserConfirmedClosureTest(unittest.TestCase):
                 )
             )
 
-    def test_three_cross_topic_ai_answers_unlock_customer_handoff(self):
+    def test_first_ai_answer_allows_customer_handoff(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = self._runtime(directory)
             result = runtime.submit(
                 "蓝牙无法连接手机，怎么排查？",
                 "1001",
-                request_id="topic-one",
+                request_id="first-answer",
             )
-            for request_id, question in (
-                ("topic-two", "电脑识别不到设备，怎么排查？"),
-                ("topic-three", "固件升级前需要检查什么？"),
-            ):
-                result = runtime.resume_user(
-                    result.ticket_id, question, request_id=request_id
-                )
-                self.assertEqual(result.status, "pending_user")
-
             allowed, attempts = runtime.can_request_human(result.ticket_id)
             self.assertTrue(allowed)
-            self.assertEqual(attempts, 3)
+            self.assertEqual(attempts, 1)
             escalated = runtime.request_human(
                 result.ticket_id,
                 "我想转人工客服",
@@ -172,24 +163,6 @@ class UserConfirmedClosureTest(unittest.TestCase):
             ticket = runtime.repository.get_ticket(result.ticket_id)
             self.assertEqual(ticket["manual_gate_reason"], "customer_requested_human")
             self.assertIsNone(ticket["idle_expires_at"])
-
-    def test_handoff_stays_locked_before_three_ai_answers(self):
-        with tempfile.TemporaryDirectory() as directory:
-            runtime = self._runtime(directory)
-            result = runtime.submit(
-                "蓝牙无法连接手机，怎么排查？",
-                "1001",
-                request_id="only-answer",
-            )
-            allowed, attempts = runtime.can_request_human(result.ticket_id)
-            self.assertFalse(allowed)
-            self.assertEqual(attempts, 1)
-            with self.assertRaisesRegex(ValueError, "尚未达到"):
-                runtime.request_human(
-                    result.ticket_id,
-                    "转人工",
-                    request_id="too-early",
-                )
 
 
 if __name__ == "__main__":

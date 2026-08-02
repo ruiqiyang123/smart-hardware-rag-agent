@@ -59,11 +59,8 @@ _CRITICAL_FLAGS = frozenset(
 )
 _HIGH_FLAGS = frozenset(
     {
-        RiskFlag.UNOFFICIAL_FIRMWARE,
         RiskFlag.ADDRESS_MISMATCH,
         RiskFlag.SUSPICIOUS_SIGNATURE,
-        RiskFlag.DEVICE_AUTH_FAILURE,
-        RiskFlag.REMOTE_CONTROL,
     }
 )
 _SAFE_HISTORY_ROLES = frozenset({"user", "assistant"})
@@ -286,6 +283,7 @@ class TriageAgent:
         timeout_seconds: float = 20,
         retries: int = 1,
         required_fields: object | None = None,
+        triage_policy: object | None = None,
     ) -> None:
         if (model is None) == (runner is None):
             raise ValueError("TriageAgent 必须且只能提供 model 或 runner")
@@ -309,7 +307,14 @@ class TriageAgent:
             from utils.config_handler import load_orchestration_config
 
             required_fields = load_orchestration_config()["required_fields"]
+        from utils.config_handler import load_triage_policy, validate_triage_policy
+
+        if triage_policy is None:
+            triage_policy = load_triage_policy()
+        else:
+            triage_policy = validate_triage_policy(triage_policy)
         self.required_fields = _validate_required_fields(required_fields)
+        self.triage_policy = triage_policy
         self.prompt = _load_prompt(_PROMPT_PATH)
 
     def run(self, state: dict) -> dict:
@@ -344,6 +349,7 @@ class TriageAgent:
             "sensitive_flags": [flag.value for flag in sensitive_flags],
             "risk_flags": [flag.value for flag in entry_flags],
             "required_fields": required_fields_json,
+            "triage_policy": copy.deepcopy(self.triage_policy),
         }
         messages = [
             SystemMessage(content=self.prompt),

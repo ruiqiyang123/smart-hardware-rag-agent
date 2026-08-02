@@ -89,11 +89,8 @@ _CRITICAL_FLAGS = frozenset(
 )
 _HIGH_FLAGS = frozenset(
     {
-        RiskFlag.UNOFFICIAL_FIRMWARE.value,
         RiskFlag.ADDRESS_MISMATCH.value,
         RiskFlag.SUSPICIOUS_SIGNATURE.value,
-        RiskFlag.DEVICE_AUTH_FAILURE.value,
-        RiskFlag.REMOTE_CONTROL.value,
     }
 )
 _DB_EVENT_FIELDS = frozenset(
@@ -719,7 +716,6 @@ class SupportOrchestrator:
         lease_seconds: int,
         graph_timeout_seconds: float = 120,
         inactivity_timeout_seconds: int = 1800,
-        customer_handoff_threshold: int = 3,
         trusted_source_policy: object | None = None,
         final_policy_guard: object | None = None,
         checkpoint_safety: object | None = None,
@@ -751,12 +747,6 @@ class SupportOrchestrator:
             or inactivity_timeout_seconds <= 0
         ):
             raise ValueError("inactivity_timeout_seconds 必须是正整数")
-        if (
-            isinstance(customer_handoff_threshold, bool)
-            or not isinstance(customer_handoff_threshold, int)
-            or customer_handoff_threshold <= 0
-        ):
-            raise ValueError("customer_handoff_threshold 必须是正整数")
         if not callable(getattr(repository, "begin_command", None)):
             raise TypeError("repository 接口非法")
         if not callable(getattr(graph, "invoke", None)):
@@ -796,7 +786,6 @@ class SupportOrchestrator:
         self.recursion_limit = recursion_limit
         self.lease_seconds = lease_seconds
         self.graph_timeout_seconds = float(graph_timeout_seconds)
-        self.customer_handoff_threshold = customer_handoff_threshold
         self.sessions = SessionExpiryService(
             repository,
             inactivity_timeout_seconds=inactivity_timeout_seconds,
@@ -2072,9 +2061,11 @@ class SupportOrchestrator:
         )
 
     def can_request_human(self, ticket_id: str) -> tuple[bool, int]:
+        """Return immediate availability plus answer count for analytics only."""
+
         ticket_id = _identifier(ticket_id, "ticket_id")
         attempts = self.repository.count_ai_answers(ticket_id)
-        return attempts >= self.customer_handoff_threshold, attempts
+        return True, attempts
 
     def request_human(
         self,
@@ -2098,9 +2089,7 @@ class SupportOrchestrator:
         ticket_id = _identifier(ticket_id, "ticket_id")
         if sanitized.risk_level != RiskLevel.LOW.value or sanitized.risk_flags:
             raise ValueError("风险输入必须先经过安全分诊")
-        allowed, attempts = self.can_request_human(ticket_id)
-        if not allowed:
-            raise ValueError("尚未达到人工接入条件")
+        _, attempts = self.can_request_human(ticket_id)
         request_id = uuid.uuid4().hex if request_id is None else request_id
         request_id = _identifier(request_id, "request_id", 120)
         command_id = _identifier(f"human-request:{request_id}", "command_id")
@@ -2148,7 +2137,7 @@ class SupportOrchestrator:
                     "event_type": "ticket.escalated",
                     "from_status": Status.PENDING_USER.value,
                     "to_status": Status.ESCALATED.value,
-                    "summary": "客户在完成 AI 自助后申请人工客服",
+                    "summary": "客户主动申请人工客服",
                     "metadata": {"ai_answer_count": attempts},
                 }
             ],

@@ -511,6 +511,19 @@ class AgentContractTest(unittest.TestCase):
         self.assertEqual(
             payload["required_fields"], {"firmware_repair": ["device_model"]}
         )
+        self.assertEqual(
+            payload["triage_policy"]["definitions"]["device_loss_damage"],
+            TriageAgent(
+                runner=FakeStructuredRunner(triage_result())
+            ).triage_policy["definitions"]["device_loss_damage"],
+        )
+        self.assertIn(
+            "设备丢了或坏了，资产还能恢复吗？",
+            [
+                item["input"]
+                for item in payload["triage_policy"]["contrastive_examples"]
+            ],
+        )
         self.assertNotIn("chain_of_thought", payload)
         self.assertNotIn("reasoning", payload)
 
@@ -537,6 +550,9 @@ class AgentContractTest(unittest.TestCase):
         self.assertIn("clarity=partial、suggested_route=diagnose", agent.prompt)
         self.assertIn("我还有其他问题", agent.prompt)
         self.assertIn("不得转人工或伪造故障", agent.prompt)
+        self.assertIn("triage_policy 是风险定义", agent.prompt)
+        self.assertIn("device_loss_damage 表示物理设备丢失", agent.prompt)
+        self.assertIn("不得只根据", agent.prompt)
 
     def test_prompt_load_is_independent_of_current_working_directory(self):
         runner = FakeStructuredRunner(triage_result())
@@ -768,7 +784,6 @@ class DiagnosisContractTest(unittest.TestCase):
     def test_high_risk_human_and_security_short_circuit(self):
         cases = (
             (self._state(risk_level="high"), "escalate"),
-            (self._state(risk_flags=["remote_control"]), "escalate"),
             (self._state(requires_human=True), "escalate"),
             (self._state(category="security_report"), "escalate"),
         )
@@ -790,6 +805,21 @@ class DiagnosisContractTest(unittest.TestCase):
                 self.assertEqual(plan.calls, [])
                 self.assertEqual(answer.calls, [])
                 self.assertEqual(tool_calls, [])
+
+    def test_advisory_flags_do_not_short_circuit_diagnosis(self):
+        for flag in (
+            "unofficial_firmware",
+            "device_auth_failure",
+            "remote_control",
+        ):
+            agent = self._agent()
+            with self.subTest(flag=flag):
+                result = agent.run(
+                    self._state(risk_level="medium", risk_flags=[flag])
+                )
+                self.assertEqual(result["outcome"], "draft")
+                self.assertEqual(len(agent.plan_runner.calls), 1)
+                self.assertEqual(len(agent.answer_runner.calls), 1)
 
     def test_missing_fields_produce_evidence_backed_guidance_before_waiting(self):
         answer = self._answer(

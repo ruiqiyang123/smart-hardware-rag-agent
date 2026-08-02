@@ -160,6 +160,7 @@ class FaultInjector:
         allowed = {
             None,
             "triage_timeout",
+            "triage_validation_error",
             "rag_empty",
             "warranty_tool_exception",
             "reviewer_validation_error",
@@ -182,6 +183,8 @@ class FaultInjector:
         self._after_counts[boundary] = self._after_counts.get(boundary, 0) + 1
         if self.kind == "rag_empty" and boundary == "knowledge_search":
             return []
+        if self.kind == "triage_validation_error" and boundary == "triage":
+            return {"injected_invalid_result": True}
         if self.kind == "reviewer_validation_error" and boundary == "reviewer":
             return {"injected_invalid_result": True}
         return value
@@ -197,6 +200,7 @@ class FaultInjector:
             return None
         targets = {
             "triage_timeout": ("before", "triage"),
+            "triage_validation_error": ("after", "triage"),
             "rag_empty": ("after", "knowledge_search"),
             "warranty_tool_exception": ("before", "warranty"),
             "reviewer_validation_error": ("after", "reviewer"),

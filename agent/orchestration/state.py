@@ -204,11 +204,8 @@ class TriageResult(StrictModel):
                 raise ValueError("critical 风险 flag 必须是 critical/P0/escalate")
 
         high_risk_flags = {
-            RiskFlag.UNOFFICIAL_FIRMWARE,
             RiskFlag.ADDRESS_MISMATCH,
             RiskFlag.SUSPICIOUS_SIGNATURE,
-            RiskFlag.DEVICE_AUTH_FAILURE,
-            RiskFlag.REMOTE_CONTROL,
         }
         if flags & high_risk_flags and self.risk_level not in {
             RiskLevel.HIGH,

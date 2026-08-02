@@ -1,0 +1,47 @@
+policy_version: 2026-08-02.v1
+automatic_escalation:
+  critical_flags:
+    - secret_exposure
+    - phishing
+    - asset_loss
+  high_flags:
+    - address_mismatch
+    - suspicious_signature
+advisory_flags:
+  - unofficial_firmware
+  - device_auth_failure
+  - remote_control
+definitions:
+  device_loss_damage: 物理设备丢失、损坏或无法使用，但没有证据表明资产已经被未经授权地转出。
+  asset_loss: 已经观察到或明确怀疑本人未授权的资产移动、陌生转账或资产失窃，不代表物理设备丢失。
+  ordinary_transaction_issue: 交易待确认、失败、Gas 过低、网络拥堵或余额显示延迟，默认先由 AI 排查。
+  confirmed_secret_exposure: 用户明确表示已经把助记词、私钥或其他秘密提交给第三方、钓鱼页面或远程控制人员。
+clarification:
+  question: 请确认您遇到的是哪一种情况？
+  options:
+    - App 暂时没有显示余额
+    - 恢复钱包后余额为零
+    - 交易长时间未确认或失败
+    - 发现本人没有发起的转账
+    - 助记词或私钥可能已经泄露
+contrastive_examples:
+  - input: 设备丢了或坏了，资产还能恢复吗？
+    category: device_loss_damage
+    risk_level: medium
+    route: diagnose
+    forbidden_flags: [asset_loss]
+  - input: 设备丢了，而且发现一笔不是我发起的转账。
+    category: security_incident
+    risk_level: critical
+    route: escalate
+    required_flags: [asset_loss]
+  - input: 交易失败了，钱还在账户里。
+    category: transaction_boundary
+    risk_level: low
+    route: diagnose
+    forbidden_flags: [asset_loss]
+  - input: 我已经把助记词发给陌生人。
+    category: security_incident
+    risk_level: critical
+    route: escalate
+    required_flags: [secret_exposure]

@@ -76,10 +76,8 @@ _RISK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
 _CRITICAL_FLAGS = frozenset({"secret_exposure", "phishing", "asset_loss"})
 _HIGH_FLAGS = frozenset(
     {
-        "unofficial_firmware",
         "address_mismatch",
         "suspicious_signature",
-        "remote_control",
     }
 )
 
@@ -115,6 +113,12 @@ _UNSAFE_ACTION_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(
         r"第三方(?:恢复工具|资产恢复服务)|非官方固件|"
         r"third[- ]party\s+(?:recovery|firmware)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:已|已经)(?:为你|替你|帮你)?(?:重置设备|恢复设备|进入\s*bootloader|"
+        r"批准保修|通过保修|完成换新)|"
+        r"(?:保修|换新)(?:申请)?(?:已经|已)?(?:批准|通过)",
         re.IGNORECASE,
     ),
 )

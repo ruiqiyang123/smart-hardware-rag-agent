@@ -76,13 +76,11 @@ class TicketStateContractTest(unittest.TestCase):
 
     def test_triage_high_risk_flags_cannot_be_downgraded(self):
         for flag in [
+            "secret_exposure",
             "phishing",
             "asset_loss",
-            "unofficial_firmware",
             "address_mismatch",
             "suspicious_signature",
-            "device_auth_failure",
-            "remote_control",
         ]:
             with self.subTest(flag=flag), self.assertRaises(ValidationError):
                 self._triage(
@@ -91,6 +89,34 @@ class TicketStateContractTest(unittest.TestCase):
                     risk_flags=[flag],
                     suggested_route="escalate",
                 )
+
+    def test_advisory_flags_do_not_force_automatic_escalation(self):
+        for flag in [
+            "unofficial_firmware",
+            "device_auth_failure",
+            "remote_control",
+        ]:
+            with self.subTest(flag=flag):
+                result = self._triage(
+                    priority="P2",
+                    risk_level="medium",
+                    risk_flags=[flag],
+                    suggested_route="diagnose",
+                )
+                self.assertEqual(result.suggested_route, "diagnose")
+
+    def test_physical_device_loss_is_not_asset_loss(self):
+        result = self._triage(
+            intent="recovery",
+            category="device_loss_damage",
+            priority="P2",
+            risk_level="medium",
+            risk_flags=[],
+            suggested_route="diagnose",
+            summary="物理设备丢失，但没有发现未经授权的资产移动",
+        )
+        self.assertEqual(result.category, "device_loss_damage")
+        self.assertNotIn("asset_loss", result.risk_flags)
 
     def test_phishing_and_asset_loss_require_critical_contract(self):
         for flag in ["phishing", "asset_loss"]:

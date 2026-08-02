@@ -110,15 +110,10 @@ def _runtime_secret(name: str) -> Optional[str]:
 
 AGENT_VERSION = (_runtime_secret("KEYGUARD_AGENT_VERSION") or "v2").strip().lower()
 USE_V1_AGENT = AGENT_VERSION == "v1"
-ORCHESTRATOR_CONTRACT_VERSION = "2026-08-02-session-ticket-lifecycle-v8"
+ORCHESTRATOR_CONTRACT_VERSION = "2026-08-02-customer-directed-handoff-v9"
 SAFE_FAILURE_NOTICE = "⚠️ 当前请求未能安全完成，请稍后重试或联系人工客服。"
 PENDING_USER_NOTICE = "为了继续处理，请补充工单中标记的必要信息。"
 ESCALATED_NOTICE = "工单已进入人工审核，自动流程不会关闭该问题。"
-HANDOFF_THRESHOLD_NOTICE = (
-    "为了优先帮你快速解决问题，请先完成 {threshold} 次 AI 自助问答。"
-    "目前已完成 {attempts}/{threshold}；你可以继续描述问题。"
-    "涉及敏感信息、资产风险或异常签名时，系统仍会立即转人工。"
-)
 RECOVERING_REQUEST_NOTICE = (
     "正在恢复上次请求；本次输入不会作为一个新问题处理。"
 )
@@ -480,9 +475,6 @@ def get_or_build_orchestrator(
             inactivity_timeout_seconds=orchestration["customer_session"][
                 "inactivity_timeout_seconds"
             ],
-            customer_handoff_threshold=orchestration["customer_handoff"][
-                "ai_attempt_threshold"
-            ],
             trusted_source_policy=trusted_sources,
             final_policy_guard=policy_guard,
         )
@@ -711,6 +703,13 @@ WORKBENCH_CATEGORY_LABELS = {
     "security_report": "安全报告",
 }
 WORKBENCH_GATE_REASON_LABELS = {
+    "secret_exposure": "检测到钱包秘密已经泄露",
+    "phishing": "检测到钓鱼或诱导输入风险",
+    "asset_loss": "检测到未经授权的资产转移",
+    "address_mismatch": "设备与客户端地址不一致",
+    "suspicious_signature": "检测到可疑签名请求",
+    "risk_gate": "资金安全风险门禁",
+    "model_escalated": "AI 判断需要人工安全处理",
     "unsafe_action": "安全策略未通过",
     "official_source_violation": "来源需要人工核验",
     "policy_guard_failure": "安全策略执行失败",
@@ -782,6 +781,12 @@ def _answer_with_citations(result) -> str:
         events = []
 
     answer = user_notice or final_answer
+    if status == "escalated" and any(
+        isinstance(event, dict)
+        and event.get("node_name") == "customer_handoff"
+        for event in events[-3:]
+    ):
+        return "✅ 已按你的要求转交人工客服，工单会保留在工作台等待处理。"
     if status == "resolved" and any(
         isinstance(event, dict)
         and event.get("event_type") == "user_confirmed_resolution"
@@ -947,21 +952,6 @@ def _run_v2_prompt(
                 elif route_kind == "request_human":
                     if route_ticket_id != active_ticket_id:
                         raise ValueError("冻结人工请求工单不一致")
-                    allowed, attempts = orchestrator.can_request_human(
-                        route_ticket_id
-                    )
-                    if not allowed:
-                        message = HANDOFF_THRESHOLD_NOTICE.format(
-                            threshold=orchestrator.customer_handoff_threshold,
-                            attempts=attempts,
-                        )
-                        processing_status.update(
-                            label="AI 自助流程仍可继续", state="complete"
-                        )
-                        _finish_ui_message(message)
-                        clear_frozen_request(st.session_state)
-                        st.session_state.pop(PENDING_UI_REQUEST_SESSION_KEY, None)
-                        st.rerun()
                     result = orchestrator.request_human_prepared(
                         route_ticket_id,
                         prepared,
@@ -1293,16 +1283,9 @@ def _render_active_ticket(
                     st.session_state[f"followup_hint_{ticket_id}"] = True
             if st.session_state.get(f"followup_hint_{ticket_id}"):
                 st.info("请直接在下方输入框补充现象，我会在同一张工单里继续处理。")
-        try:
-            handoff_allowed, ai_answers = orchestrator.can_request_human(ticket_id)
-        except Exception:
-            handoff_allowed, ai_answers = False, 0
-        st.caption(
-            f"人工客服入口 · AI 自助进度 {ai_answers}/"
-            f"{orchestrator.customer_handoff_threshold}"
-        )
+        st.caption("对 AI 回答不满意？你可以随时申请人工客服。")
         if st.button(
-            "🧑 联系人工客服" if handoff_allowed else "🧑 申请人工客服",
+            "🧑 联系人工客服",
             key=f"customer_handoff_{ticket_id}",
             use_container_width=True,
         ):

@@ -53,7 +53,7 @@ class OrchestrationDatasetTest(unittest.TestCase):
 
         self.assertEqual(
             [by_id[f"KG-EVAL-{index:03d}"]["group"] for index in range(31, 37)],
-            ["high_risk"] * 6,
+            ["high_risk", "high_risk", "high_risk", "device", "high_risk", "high_risk"],
         )
         self.assertEqual(by_id["KG-EVAL-031"]["expected_risk_level"], "critical")
         self.assertTrue(by_id["KG-EVAL-031"]["contains_secret"])
@@ -68,18 +68,18 @@ class OrchestrationDatasetTest(unittest.TestCase):
         )
         self.assertEqual(
             [turn["expected_status"] for turn in by_id["KG-EVAL-040"]["turns"]],
-            ["pending_user", "escalated"],
+            ["pending_user", "pending_user"],
         )
         self.assertEqual(
             [by_id[f"KG-EVAL-{index:03d}"]["fault"] for index in range(45, 49)],
             [
-                "triage_timeout",
+                "triage_validation_error",
                 "rag_empty",
                 "warranty_tool_exception",
                 "reviewer_validation_error",
             ],
         )
-        self.assertEqual(by_id["KG-EVAL-045"]["expected_retry_count"], 1)
+        self.assertEqual(by_id["KG-EVAL-045"]["expected_retry_count"], 0)
         self.assertEqual(by_id["KG-EVAL-047"]["expected_retry_count"], 1)
         self.assertEqual(by_id["KG-EVAL-048"]["expected_retry_count"], 0)
 
@@ -234,7 +234,7 @@ class OrchestrationScorerTest(unittest.TestCase):
         expected = self._expected(
             turns=[
                 {"turn_index": 1, "input": "固件升级中断", "expected_status": "pending_user"},
-                {"turn_index": 2, "input": "设备型号与状态", "expected_status": "escalated"},
+                {"turn_index": 2, "input": "设备型号与状态", "expected_status": "pending_user"},
             ]
         )
 
@@ -257,8 +257,10 @@ class OrchestrationScorerTest(unittest.TestCase):
             case_id="KG-EVAL-040",
             turns=[
                 {"turn_index": 1, "input": "固件升级中断", "expected_status": "pending_user"},
-                {"turn_index": 2, "input": "设备型号与状态", "expected_status": "escalated"},
+                {"turn_index": 2, "input": "设备型号与状态", "expected_status": "pending_user"},
             ],
+            expected_route="pending_user",
+            expected_final_status="pending_user",
         )
         shortcut = score_case(
             expected,
@@ -266,8 +268,9 @@ class OrchestrationScorerTest(unittest.TestCase):
                 status_trace=["new", "triaged", "pending_user", "escalated"],
                 turn_results=[
                     {"turn_index": 1, "status": "pending_user", "trace_index": 2},
-                    {"turn_index": 2, "status": "escalated", "trace_index": 3},
+                    {"turn_index": 2, "status": "pending_user", "trace_index": 3},
                 ],
+                status="pending_user",
             ),
         )
         complete = score_case(
@@ -279,12 +282,14 @@ class OrchestrationScorerTest(unittest.TestCase):
                     "pending_user",
                     "triaged",
                     "diagnosing",
-                    "escalated",
+                    "reviewing",
+                    "pending_user",
                 ],
                 turn_results=[
                     {"turn_index": 1, "status": "pending_user", "trace_index": 2},
-                    {"turn_index": 2, "status": "escalated", "trace_index": 5},
+                    {"turn_index": 2, "status": "pending_user", "trace_index": 6},
                 ],
+                status="pending_user",
             ),
         )
         trailing_completion = score_case(
@@ -298,12 +303,14 @@ class OrchestrationScorerTest(unittest.TestCase):
                     "pending_user",
                     "triaged",
                     "diagnosing",
-                    "escalated",
+                    "reviewing",
+                    "pending_user",
                 ],
                 turn_results=[
                     {"turn_index": 1, "status": "pending_user", "trace_index": 2},
-                    {"turn_index": 2, "status": "escalated", "trace_index": 3},
+                    {"turn_index": 2, "status": "pending_user", "trace_index": 3},
                 ],
+                status="pending_user",
             ),
         )
 
@@ -388,6 +395,8 @@ class FakeEvaluationRunner:
                     fault_injector.before_call("triage")
                 except TimeoutError:
                     pass
+        elif fault_injector.kind == "triage_validation_error":
+            fault_injector.after_call("triage", {"intent": "troubleshoot"})
         elif fault_injector.kind == "rag_empty":
             fault_injector.after_call("knowledge_search", ["evidence"])
         elif fault_injector.kind == "warranty_tool_exception":
@@ -408,7 +417,8 @@ class FakeEvaluationRunner:
                 "pending_user",
                 "triaged",
                 "diagnosing",
-                "escalated",
+                "reviewing",
+                "pending_user",
             ]
         if expected["expected_final_status"] == "pending_user" and not expected[
             "expected_missing_fields"
@@ -505,7 +515,7 @@ class OrchestrationEvalRunnerTest(unittest.TestCase):
         self.assertEqual(report["v1_compatibility_runs"], 1)
         self.assertEqual(runner.v1_calls, 1)
         self.assertEqual(runner.faults[-4:], [
-            "triage_timeout",
+            "triage_validation_error",
             "rag_empty",
             "warranty_tool_exception",
             "reviewer_validation_error",
@@ -606,7 +616,7 @@ class OrchestrationEvalRunnerTest(unittest.TestCase):
         class WrongRetryRunner(FakeEvaluationRunner):
             def run_v2_case(self, case, *, fault_injector):
                 actual = super().run_v2_case(case, fault_injector=fault_injector)
-                actual["retry_count"] = 0
+                actual["retry_count"] = 1
                 return actual
 
         with self.assertRaisesRegex(RunnerOutputError, "retry_count"):
@@ -656,15 +666,14 @@ class OrchestrationEvalRunnerTest(unittest.TestCase):
                     "new",
                     "triaged",
                     "pending_user",
-                    "escalated",
-                    "pending_user",
                     "triaged",
                     "diagnosing",
-                    "escalated",
+                    "reviewing",
+                    "pending_user",
                 ]
                 actual["turn_results"] = [
                     {"turn_index": 1, "status": "pending_user", "trace_index": 2},
-                    {"turn_index": 2, "status": "escalated", "trace_index": 3},
+                    {"turn_index": 2, "status": "reviewing", "trace_index": 5},
                 ]
                 return actual
 
