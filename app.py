@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import os
 import re
 import uuid
@@ -108,7 +109,7 @@ def _runtime_secret(name: str) -> Optional[str]:
 
 AGENT_VERSION = (_runtime_secret("KEYGUARD_AGENT_VERSION") or "v2").strip().lower()
 USE_V1_AGENT = AGENT_VERSION == "v1"
-ORCHESTRATOR_CONTRACT_VERSION = "2026-07-31-user-confirmed-closure-v4"
+ORCHESTRATOR_CONTRACT_VERSION = "2026-08-02-deepseek-structured-output-v7"
 SAFE_FAILURE_NOTICE = "⚠️ 当前请求未能安全完成，请稍后重试或联系人工客服。"
 PENDING_USER_NOTICE = "为了继续处理，请补充工单中标记的必要信息。"
 ESCALATED_NOTICE = "工单已进入人工审核，自动流程不会关闭该问题。"

@@ -9,6 +9,12 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from agent.orchestration.invoke import invoke_with_policy
+from agent.orchestration.structured_output import (
+    invoke_structured_runner,
+    log_normalization,
+    log_structured_failure,
+    unwrap_structured_output,
+)
 from agent.nodes.prompt_loader import load_safe_prompt
 from agent.orchestration.state import (
     MissingField,
@@ -193,7 +199,11 @@ def _validate_runner_result(
         candidate = raw_result
     else:
         raise TypeError("分诊输出类型非法")
-    result = TriageResult.model_validate(candidate)
+    try:
+        result = TriageResult.model_validate(candidate)
+    except Exception as error:
+        log_structured_failure("triage", "final_validate", error)
+        raise
 
     if _contains_forbidden_control(result.summary):
         raise ValueError("分诊摘要包含非法控制字符")
@@ -227,6 +237,40 @@ def _validate_runner_result(
     return result
 
 
+def _normalize_triage_candidate(raw_result: object) -> object:
+    if isinstance(raw_result, TriageResult):
+        return raw_result
+    if not isinstance(raw_result, dict):
+        return raw_result
+
+    candidate = copy.deepcopy(raw_result)
+    clarity = candidate.get("clarity")
+    missing_fields = candidate.get("missing_fields")
+    route = candidate.get("suggested_route")
+    question = candidate.get("clarification_question")
+    options = candidate.get("clarification_options")
+    if (
+        clarity == "partial"
+        and missing_fields == []
+        and route == "diagnose"
+        and question == ""
+        and options == []
+    ):
+        candidate["clarity"] = "clear"
+        log_normalization("triage", "T1_PARTIAL_EMPTY_TO_CLEAR")
+    elif (
+        clarity == "clear"
+        and isinstance(missing_fields, list)
+        and bool(missing_fields)
+        and route == "diagnose"
+        and question == ""
+        and options == []
+    ):
+        candidate["clarity"] = "partial"
+        log_normalization("triage", "T2_CLEAR_MISSING_TO_PARTIAL")
+    return candidate
+
+
 class TriageAgent:
     """Run structured triage with deterministic safety policy.
 
@@ -250,7 +294,11 @@ class TriageAgent:
             factory = getattr(model, "with_structured_output", None)
             if not callable(factory):
                 raise TypeError("model 不支持结构化输出")
-            runner = factory(TriageResult, method="function_calling")
+            runner = factory(
+                TriageResult,
+                method="function_calling",
+                include_raw=True,
+            )
         if not callable(getattr(runner, "invoke", None)):
             raise TypeError("runner 必须提供 invoke")
 
@@ -311,7 +359,18 @@ class TriageAgent:
 
         result = invoke_with_policy(
             lambda: _validate_runner_result(
-                self.runner.invoke(messages), self.required_fields
+                _normalize_triage_candidate(
+                    unwrap_structured_output(
+                        invoke_structured_runner(
+                            self.runner,
+                            messages,
+                            agent_name="triage",
+                        ),
+                        "TriageResult",
+                        agent_name="triage",
+                    )
+                ),
+                self.required_fields,
             ),
             timeout_seconds=self.timeout_seconds,
             retries=self.retries,

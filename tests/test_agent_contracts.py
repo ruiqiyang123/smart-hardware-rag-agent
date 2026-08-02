@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 import agent.nodes.triage as triage_module
 from agent.nodes.triage import TriageAgent
@@ -56,6 +56,24 @@ class FakeModel:
         return self.runner
 
 
+def wrapped_structured_output(schema_name, args, *, parsed=None):
+    return {
+        "raw": AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": schema_name,
+                    "args": args,
+                    "id": "call-1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        "parsed": parsed,
+        "parsing_error": ValueError("structured validation failed"),
+    }
+
+
 class AgentContractTest(unittest.TestCase):
     def test_diagnosis_filters_tool_plan_by_category(self):
         from agent.nodes.diagnosis import allowed_tools
@@ -77,8 +95,72 @@ class AgentContractTest(unittest.TestCase):
         self.assertIs(agent.runner, runner)
         self.assertEqual(
             model.calls,
-            [(TriageResult, {"method": "function_calling"})],
+            [
+                (
+                    TriageResult,
+                    {"method": "function_calling", "include_raw": True},
+                )
+            ],
         )
+
+    def test_deepseek_partial_without_missing_fields_is_normalized_to_clear(self):
+        raw = triage_result().model_dump(mode="json")
+        raw.update(
+            category="bluetooth_connection",
+            clarity="partial",
+            missing_fields=[],
+            suggested_route="diagnose",
+            summary="用户蓝牙无法连接，意图明确，进入诊断流程",
+        )
+        runner = FakeStructuredRunner(
+            wrapped_structured_output("TriageResult", raw)
+        )
+
+        result = TriageAgent(model=FakeModel(runner), retries=0).run(
+            self._state(sanitized_input="蓝牙没法连接手机怎么办？")
+        )
+
+        self.assertEqual(result["clarity"], "clear")
+        self.assertEqual(result["missing_fields"], [])
+        self.assertEqual(result["suggested_route"], "diagnose")
+        self.assertEqual(result["risk_level"], "low")
+
+    def test_clear_with_authorized_missing_fields_is_normalized_to_partial(self):
+        raw = triage_result().model_dump(mode="json")
+        raw.update(
+            category="firmware_repair",
+            clarity="clear",
+            missing_fields=["device_model"],
+            suggested_route="diagnose",
+        )
+        runner = FakeStructuredRunner(
+            wrapped_structured_output("TriageResult", raw)
+        )
+
+        result = TriageAgent(
+            model=FakeModel(runner),
+            retries=0,
+            required_fields={"firmware_repair": ["device_model"]},
+        ).run(self._state())
+
+        self.assertEqual(result["clarity"], "partial")
+        self.assertEqual(result["missing_fields"], ["device_model"])
+
+    def test_normalization_never_repairs_inconsistent_high_risk_route(self):
+        raw = triage_result().model_dump(mode="json")
+        raw.update(
+            risk_level="high",
+            priority="P2",
+            clarity="partial",
+            missing_fields=[],
+            suggested_route="diagnose",
+        )
+        runner = FakeStructuredRunner(
+            wrapped_structured_output("TriageResult", raw)
+        )
+
+        with self.assertRaises(ValueError):
+            TriageAgent(model=FakeModel(runner), retries=0).run(self._state())
 
     def test_required_fields_are_deep_copied_and_strictly_validated(self):
         source = {"firmware_repair": ["device_model", "error_state"]}
@@ -657,8 +739,14 @@ class DiagnosisContractTest(unittest.TestCase):
         self.assertEqual(
             model.calls,
             [
-                (DiagnosisPlan, {"method": "function_calling"}),
-                (DiagnosisResult, {"method": "function_calling"}),
+                (
+                    DiagnosisPlan,
+                    {"method": "function_calling", "include_raw": True},
+                ),
+                (
+                    DiagnosisResult,
+                    {"method": "function_calling", "include_raw": True},
+                ),
             ],
         )
         invalid = (
@@ -721,6 +809,34 @@ class DiagnosisContractTest(unittest.TestCase):
         self.assertEqual(result["remaining_unknowns"], ["device_model"])
         plan_payload = json.loads(agent.plan_runner.calls[0][1].content)
         self.assertEqual(plan_payload["missing_fields"], ["device_model"])
+
+    def test_complete_draft_with_known_missing_fields_is_normalized_to_need_user(self):
+        answer = self._answer(outcome="draft", remaining_unknowns=[])
+        agent = self._agent(
+            answer=wrapped_structured_output("DiagnosisResult", answer)
+        )
+
+        result = agent.run(
+            self._state(
+                category="firmware_repair",
+                missing_fields=["device_model"],
+            )
+        )
+
+        self.assertEqual(result["outcome"], "need_user")
+        self.assertEqual(result["remaining_unknowns"], ["device_model"])
+        self.assertTrue(result["draft_answer"])
+
+    def test_need_user_without_known_missing_fields_is_normalized_to_draft(self):
+        answer = self._answer(outcome="need_user", remaining_unknowns=[])
+        agent = self._agent(
+            answer=wrapped_structured_output("DiagnosisResult", answer)
+        )
+
+        result = agent.run(self._state(missing_fields=[]))
+
+        self.assertEqual(result["outcome"], "draft")
+        self.assertEqual(result["remaining_unknowns"], [])
 
     def test_plan_and_answer_messages_are_json_without_reasoning(self):
         agent = self._agent()
@@ -969,7 +1085,7 @@ class DiagnosisContractTest(unittest.TestCase):
                 self.assertEqual(agent.answer_runner.calls, [])
                 self.assertNotIn(source_url, json.dumps(output))
 
-    def test_unknown_refs_citation_mismatch_missing_citation_and_none_url_rejected(self):
+    def test_unknown_refs_citation_mismatch_and_none_url_are_rejected(self):
         evidence = self._evidence(source_url="https://support.ledger.com/help")
         base_tools = {"knowledge_search": lambda *_: [evidence]}
         cases = (
@@ -992,7 +1108,6 @@ class DiagnosisContractTest(unittest.TestCase):
                     }
                 ]
             ),
-            self._answer(citations=[]),
         )
         for answer in cases:
             with self.subTest(answer=answer), self.assertRaises(ValueError):
@@ -1008,6 +1123,28 @@ class DiagnosisContractTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             self._agent(answer=none_url_answer, retries=0).run(self._state())
+
+    def test_missing_citation_is_completed_from_validated_trusted_evidence(self):
+        source_url = "https://support.ledger.com/help"
+        evidence = self._evidence(source_url=source_url)
+        tools = {"knowledge_search": lambda *_: [evidence]}
+
+        output = self._agent(
+            answer=self._answer(citations=[]),
+            tools=tools,
+            retries=0,
+        ).run(self._state())
+
+        self.assertEqual(
+            output["citations"],
+            [
+                {
+                    "source_id": "kb:usb:1",
+                    "source_title": "连接帮助",
+                    "source_url": source_url,
+                }
+            ],
+        )
 
     def test_runner_dict_extra_prompt_cwd_input_safety_and_tool_state_copy(self):
         extra_plan = {"requests": [], "reasoning": "hidden"}

@@ -259,6 +259,17 @@ class WalletSafetyGuardTest(unittest.TestCase):
         self.assertTrue(result.passed)
         self.assertEqual(result.reason_codes, [])
 
+    def test_policy_allows_multiple_evidence_items_from_same_trusted_url(self):
+        citation = "https://support.ledger.com/article/360019138694-zd"
+
+        result = self.output.evaluate(
+            "请按已验证的官方排查步骤操作。",
+            citation_urls=[citation, citation],
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.reason_codes, [])
+
     def test_policy_rejects_suffix_attack_userinfo_http_and_unknown_query_url(self):
         unsafe_urls = (
             "https://ledger.com.evil.example/update",

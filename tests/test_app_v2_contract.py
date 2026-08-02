@@ -26,6 +26,9 @@ class AppV2ContractTest(unittest.TestCase):
         self.assertIn('"客户对话"', self.source)
         self.assertIn('"工单工作台"', self.source)
 
+    def test_app_imports_json_for_persisted_ticket_fields(self):
+        self.assertIn("import json", self.source)
+
     def test_explicit_empty_environment_secret_does_not_probe_streamlit_secrets(self):
         runtime_secret = self.function_source("_runtime_secret")
 
@@ -157,7 +160,7 @@ class AppV2ContractTest(unittest.TestCase):
         source = self.function_source("get_or_build_orchestrator")
 
         self.assertIn(
-            'ORCHESTRATOR_CONTRACT_VERSION = "2026-07-31-user-confirmed-closure-v4"',
+            'ORCHESTRATOR_CONTRACT_VERSION = "2026-08-02-deepseek-structured-output-v7"',
             self.source,
         )
         self.assertIn("contract_version: str", source)

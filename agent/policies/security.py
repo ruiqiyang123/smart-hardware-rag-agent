@@ -252,7 +252,9 @@ class PolicyGuard:
         safe_citations = {
             url for url in citation_urls if self.trusted_sources.is_trusted(url)
         }
-        if len(safe_citations) != len(citation_urls):
+        if any(
+            not self.trusted_sources.is_trusted(url) for url in citation_urls
+        ):
             reasons.append("official_source_violation")
         for match in _URL_PATTERN.finditer(text):
             url = self._clean_url(match.group(0))

@@ -12,8 +12,15 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import Field, field_validator, model_validator
 
 from agent.orchestration.invoke import invoke_with_policy
+from agent.orchestration.structured_output import (
+    invoke_structured_runner,
+    log_normalization,
+    log_structured_failure,
+    unwrap_structured_output,
+)
 from agent.nodes.prompt_loader import load_safe_prompt
 from agent.orchestration.state import (
+    Citation,
     DiagnosisResult,
     EvidenceItem,
     MissingField,
@@ -277,11 +284,20 @@ def _normalize_query(request: ToolRequest) -> ToolRequest:
 
 
 def _validate_plan(raw: object) -> DiagnosisPlan:
+    raw = unwrap_structured_output(
+        raw,
+        "DiagnosisPlan",
+        agent_name="diagnosis_plan",
+    )
     if isinstance(raw, DiagnosisPlan):
         raw = raw.model_dump(mode="python")
     if not isinstance(raw, dict):
         raise TypeError("Diagnosis plan 类型非法")
-    return DiagnosisPlan.model_validate(raw)
+    try:
+        return DiagnosisPlan.model_validate(raw)
+    except Exception as error:
+        log_structured_failure("diagnosis_plan", "final_validate", error)
+        raise
 
 
 def _terminal_result(
@@ -356,12 +372,67 @@ def _safe_tool_context(state: dict, sanitized_input: str) -> dict[str, str]:
     return context
 
 
-def _validate_answer(raw: object, evidence_by_id: Dict[str, EvidenceItem]) -> DiagnosisResult:
+def _has_evidence_backed_draft_shape(candidate: dict) -> bool:
+    return bool(
+        candidate.get("draft_answer")
+        and candidate.get("recommended_actions")
+        and candidate.get("evidence_refs")
+    )
+
+
+def _normalize_answer_candidate(
+    raw: object,
+    expected_unknowns: List[str],
+) -> object:
+    if isinstance(raw, DiagnosisResult):
+        candidate = raw.model_dump(mode="python")
+    elif isinstance(raw, dict):
+        candidate = copy.deepcopy(raw)
+    else:
+        return raw
+
+    outcome = candidate.get("outcome")
+    remaining = candidate.get("remaining_unknowns")
+    if (
+        expected_unknowns
+        and outcome == "draft"
+        and remaining == []
+        and _has_evidence_backed_draft_shape(candidate)
+    ):
+        candidate["outcome"] = "need_user"
+        candidate["remaining_unknowns"] = list(expected_unknowns)
+        log_normalization("diagnosis", "D1_DRAFT_WITH_KNOWN_MISSING")
+    elif (
+        not expected_unknowns
+        and outcome == "need_user"
+        and remaining == []
+        and _has_evidence_backed_draft_shape(candidate)
+    ):
+        candidate["outcome"] = "draft"
+        log_normalization("diagnosis", "D2_EMPTY_NEED_USER_TO_DRAFT")
+    return candidate
+
+
+def _validate_answer(
+    raw: object,
+    evidence_by_id: Dict[str, EvidenceItem],
+    expected_unknowns: List[str],
+) -> DiagnosisResult:
+    raw = unwrap_structured_output(
+        raw,
+        "DiagnosisResult",
+        agent_name="diagnosis_answer",
+    )
+    raw = _normalize_answer_candidate(raw, expected_unknowns)
     if isinstance(raw, DiagnosisResult):
         raw = raw.model_dump(mode="python")
     if not isinstance(raw, dict):
         raise TypeError("Diagnosis 输出类型非法")
-    result = DiagnosisResult.model_validate(raw)
+    try:
+        result = DiagnosisResult.model_validate(raw)
+    except Exception as error:
+        log_structured_failure("diagnosis_answer", "final_validate", error)
+        raise
     summary = _safe_text(result.diagnosis_summary, "diagnosis_summary", max_length=500)
     draft = result.draft_answer
     if draft:
@@ -378,7 +449,28 @@ def _validate_answer(raw: object, evidence_by_id: Dict[str, EvidenceItem]) -> Di
     actual_ids = set(evidence_by_id)
     if not set(result.evidence_refs).issubset(actual_ids):
         raise ValueError("Diagnosis 引用了未知证据")
-    citation_by_id = {citation.source_id: citation for citation in result.citations}
+    citations = list(result.citations)
+    citation_by_id = {citation.source_id: citation for citation in citations}
+    completed_citation = False
+    for evidence_id in result.evidence_refs:
+        source = evidence_by_id.get(evidence_id)
+        if (
+            source is not None
+            and source.kind == "knowledge"
+            and source.source_url is not None
+            and evidence_id not in citation_by_id
+        ):
+            citation = Citation(
+                source_id=evidence_id,
+                source_title=source.source_title,
+                source_url=source.source_url,
+            )
+            citations.append(citation)
+            citation_by_id[evidence_id] = citation
+            completed_citation = True
+    if completed_citation:
+        result = result.model_copy(update={"citations": citations})
+        log_normalization("diagnosis", "D3_COMPLETE_TRUSTED_CITATION")
     for citation in result.citations:
         source = evidence_by_id.get(citation.source_id)
         if (
@@ -388,11 +480,6 @@ def _validate_answer(raw: object, evidence_by_id: Dict[str, EvidenceItem]) -> Di
             or citation.source_url != source.source_url
         ):
             raise ValueError("Citation metadata 不匹配")
-    for evidence_id in result.evidence_refs:
-        source = evidence_by_id[evidence_id]
-        if source.kind == "knowledge" and source.source_url is not None:
-            if evidence_id not in citation_by_id:
-                raise ValueError("知识证据缺少 citation")
     return result.model_copy(
         update={
             "diagnosis_summary": summary,
@@ -434,8 +521,16 @@ class DiagnosisAgent:
             factory = getattr(model, "with_structured_output", None)
             if not callable(factory):
                 raise TypeError("model 不支持结构化输出")
-            plan_runner = factory(DiagnosisPlan, method="function_calling")
-            answer_runner = factory(DiagnosisResult, method="function_calling")
+            plan_runner = factory(
+                DiagnosisPlan,
+                method="function_calling",
+                include_raw=True,
+            )
+            answer_runner = factory(
+                DiagnosisResult,
+                method="function_calling",
+                include_raw=True,
+            )
         if not callable(getattr(plan_runner, "invoke", None)) or not callable(
             getattr(answer_runner, "invoke", None)
         ):
@@ -548,7 +643,13 @@ class DiagnosisAgent:
             ),
         ]
         plan = invoke_with_policy(
-            lambda: _validate_plan(self.plan_runner.invoke(plan_messages)),
+            lambda: _validate_plan(
+                invoke_structured_runner(
+                    self.plan_runner,
+                    plan_messages,
+                    agent_name="diagnosis_plan",
+                )
+            ),
             self.timeout_seconds,
             self.retries,
         )
@@ -632,7 +733,13 @@ class DiagnosisAgent:
         ]
         result = invoke_with_policy(
             lambda: _validate_answer(
-                self.answer_runner.invoke(answer_messages), evidence_by_id
+                invoke_structured_runner(
+                    self.answer_runner,
+                    answer_messages,
+                    agent_name="diagnosis_answer",
+                ),
+                evidence_by_id,
+                [field.value for field in missing_fields],
             ),
             self.timeout_seconds,
             self.retries,
