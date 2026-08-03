@@ -120,13 +120,25 @@ def validate_triage_policy(data: object) -> dict:
         _require_non_empty_string(value, f"definitions.{key}")
 
     clarification = _require_dict(data["clarification"], "clarification")
-    _require_exact_keys(clarification, {"question", "options"}, "clarification")
-    _require_non_empty_string(clarification["question"], "clarification.question")
-    options = _require_unique_string_list(
-        clarification["options"], "clarification.options"
+    _require_exact_keys(
+        clarification,
+        {"mode", "min_options", "max_options", "requirements"},
+        "clarification",
     )
-    if len(options) != 5:
-        raise ValueError("clarification.options 必须包含 5 个固定选项")
+    if clarification["mode"] != "dynamic_contextual":
+        raise ValueError("clarification.mode 必须是 dynamic_contextual")
+    if (
+        type(clarification["min_options"]) is not int
+        or type(clarification["max_options"]) is not int
+        or clarification["min_options"] != 2
+        or clarification["max_options"] != 5
+    ):
+        raise ValueError("clarification 选项数量必须是 2-5")
+    requirements = _require_unique_string_list(
+        clarification["requirements"], "clarification.requirements"
+    )
+    if len(requirements) < 3:
+        raise ValueError("clarification.requirements 至少包含 3 条规则")
 
     examples = data["contrastive_examples"]
     if not isinstance(examples, list):

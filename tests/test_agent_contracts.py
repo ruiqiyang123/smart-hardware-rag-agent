@@ -387,6 +387,44 @@ class AgentContractTest(unittest.TestCase):
                     retries=0,
                 ).run(self._state())
 
+    def test_dynamic_candidates_are_normalized_and_not_fixed_to_known_labels(self):
+        model_result = triage_result(
+            intent="other",
+            category="other",
+            clarity="ambiguous",
+            clarification_question="  蓝牙连接具体卡在哪一步？  ",
+            clarification_options=[
+                {
+                    "label": "  手机能搜到设备但确认配对后立即断开  ",
+                    "intent": "troubleshoot",
+                    "category": "bluetooth_connection",
+                    "risk_level": "low",
+                    "risk_flags": [],
+                    "missing_fields": [],
+                    "suggested_route": "diagnose",
+                },
+                {
+                    "label": "多台手机都完全搜索不到设备",
+                    "intent": "troubleshoot",
+                    "category": "bluetooth_connection",
+                    "risk_level": "low",
+                    "risk_flags": [],
+                    "missing_fields": [],
+                    "suggested_route": "diagnose",
+                },
+            ],
+            suggested_route="clarify",
+        )
+        output = TriageAgent(
+            runner=FakeStructuredRunner(model_result), retries=0
+        ).run(self._state(sanitized_input="蓝牙好像有问题"))
+
+        self.assertEqual(output["clarification_question"], "蓝牙连接具体卡在哪一步？")
+        self.assertEqual(
+            output["clarification_options"][0]["label"],
+            "手机能搜到设备但确认配对后立即断开",
+        )
+
     def test_high_risk_and_security_incident_never_wait_for_missing_fields(self):
         cases = (
             triage_result(

@@ -21,6 +21,10 @@ from langgraph.graph import END, StateGraph
 from langgraph.types import interrupt
 
 from agent.orchestration.events import make_event
+from agent.orchestration.clarification import (
+    build_clarification_choices,
+    validate_clarification_choices,
+)
 from agent.orchestration.routes import (
     assert_transition,
     route_after_diagnosis,
@@ -30,6 +34,7 @@ from agent.orchestration.routes import (
     route_after_triage,
 )
 from agent.orchestration.state import (
+    ClarificationChoice,
     DiagnosisResult,
     EvidenceItem,
     MissingField,
@@ -151,11 +156,51 @@ _TRIAGE_FALLBACK_QUESTION = (
     "系统暂时无法准确判断问题类型。请选择最接近的一项，我会继续为你处理："
 )
 _TRIAGE_FALLBACK_OPTIONS = [
-    "设备故障（开机、屏幕或按键）",
-    "连接问题（USB、蓝牙或手机）",
-    "钱包恢复或账户显示问题",
-    "交易未确认、失败或余额显示异常",
-    "发现未经本人授权的资产转移",
+    {
+        "label": "设备故障（开机、屏幕或按键）",
+        "intent": "troubleshoot",
+        "category": "power",
+        "risk_level": "low",
+        "risk_flags": [],
+        "missing_fields": [],
+        "suggested_route": "diagnose",
+    },
+    {
+        "label": "连接问题（USB、蓝牙或手机）",
+        "intent": "troubleshoot",
+        "category": "mobile_connection",
+        "risk_level": "low",
+        "risk_flags": [],
+        "missing_fields": [],
+        "suggested_route": "diagnose",
+    },
+    {
+        "label": "钱包恢复或账户显示问题",
+        "intent": "recovery",
+        "category": "backup_recovery",
+        "risk_level": "medium",
+        "risk_flags": [],
+        "missing_fields": [],
+        "suggested_route": "diagnose",
+    },
+    {
+        "label": "交易未确认、失败或余额显示异常",
+        "intent": "transaction_boundary",
+        "category": "transaction_boundary",
+        "risk_level": "medium",
+        "risk_flags": [],
+        "missing_fields": [],
+        "suggested_route": "diagnose",
+    },
+    {
+        "label": "发现未经本人授权的资产转移",
+        "intent": "security_incident",
+        "category": "security_incident",
+        "risk_level": "critical",
+        "risk_flags": ["asset_loss"],
+        "missing_fields": [],
+        "suggested_route": "escalate",
+    },
 ]
 _AUTOMATION_FALLBACK_QUESTION = (
     "这次自动处理暂时没有完成。工单仍保持开启，请选择一种方式继续："
@@ -352,6 +397,10 @@ def _validated_triage_update(raw: object) -> dict:
     candidate = _dependency_update(raw, _TRIAGE_FIELDS)
     result = TriageResult.model_validate(candidate).model_dump(mode="json")
     result["summary"] = _safe_text(result["summary"], "summary", 300)
+    if result["clarity"] == "ambiguous":
+        result["clarification_options"] = build_clarification_choices(
+            result["clarification_options"]
+        )
     return result
 
 
@@ -514,7 +563,9 @@ def _triage_clarification_fallback(state: Mapping[str, object]) -> dict:
         "risk_flags": [],
         "clarity": "ambiguous",
         "clarification_question": _TRIAGE_FALLBACK_QUESTION,
-        "clarification_options": list(_TRIAGE_FALLBACK_OPTIONS),
+        "clarification_options": build_clarification_choices(
+            _TRIAGE_FALLBACK_OPTIONS
+        ),
         "missing_fields": [],
         "suggested_route": "clarify",
         "summary": "等待用户选择问题类型",
@@ -554,12 +605,40 @@ def _automation_clarification_fallback(
 ) -> dict:
     current = _status(state.get("status"))
     assert_transition(current.value, Status.PENDING_USER.value)
+    category = state.get("category")
+    intent = state.get("intent")
+    if category not in {
+        "power", "usb_connection", "mobile_connection", "bluetooth_connection",
+        "screen_buttons", "pin_lock", "firmware_repair", "backup_recovery",
+        "device_loss_damage", "warranty_service", "transaction_boundary",
+        "security_incident", "security_report", "other",
+    }:
+        category = "other"
+    if intent not in {
+        "troubleshoot", "recovery", "warranty", "transaction_boundary",
+        "security_incident", "security_report", "other",
+    }:
+        intent = "other"
+    fallback_candidates = [
+        {
+            "label": label,
+            "intent": intent,
+            "category": category,
+            "risk_level": "low",
+            "risk_flags": [],
+            "missing_fields": [],
+            "suggested_route": "diagnose",
+        }
+        for label in _AUTOMATION_FALLBACK_OPTIONS
+    ]
     update = {
         "status": Status.PENDING_USER.value,
         "waiting_reason": WaitingReason.CLARIFICATION.value,
         "clarity": "ambiguous",
         "clarification_question": _AUTOMATION_FALLBACK_QUESTION,
-        "clarification_options": list(_AUTOMATION_FALLBACK_OPTIONS),
+        "clarification_options": build_clarification_choices(
+            fallback_candidates
+        ),
         "missing_fields": [],
         "suggested_route": "clarify",
         "summary": "自动处理暂时未完成，等待客户补充后重试",
@@ -660,13 +739,84 @@ def _entry(state: TicketState) -> dict:
     )
 
 
+def _selected_choice_triage(state: Mapping[str, object]) -> dict | None:
+    raw_choice = state.get("selected_clarification_choice")
+    if raw_choice is None:
+        return None
+    choice = ClarificationChoice.model_validate(raw_choice)
+    if choice.legacy:
+        return None
+
+    ingress_risk = state.get("risk_level")
+    ingress_flags = state.get("risk_flags", [])
+    if (
+        ingress_risk not in _RISK_LEVELS
+        or not isinstance(ingress_flags, list)
+        or any(flag not in _RISK_FLAGS for flag in ingress_flags)
+    ):
+        raise ValueError("choice 恢复入口风险非法")
+    combined_flags = list(
+        dict.fromkeys([*ingress_flags, *(flag.value for flag in choice.risk_flags)])
+    )
+    if set(combined_flags) & _CRITICAL_FLAGS:
+        flag_floor = RiskLevel.CRITICAL.value
+    elif set(combined_flags) & _HIGH_FLAGS:
+        flag_floor = RiskLevel.HIGH.value
+    else:
+        flag_floor = RiskLevel.LOW.value
+    effective_risk = max(
+        (ingress_risk, choice.risk_level.value, flag_floor),
+        key=_RISK_ORDER.__getitem__,
+    )
+    if effective_risk == RiskLevel.CRITICAL.value:
+        priority = "P0"
+        suggested_route = "escalate"
+        missing_fields: list[str] = []
+        clarity = "clear"
+    elif effective_risk == RiskLevel.HIGH.value:
+        priority = "P1"
+        suggested_route = "escalate"
+        missing_fields = []
+        clarity = "clear"
+    else:
+        priority = "P2"
+        suggested_route = choice.suggested_route
+        missing_fields = [field.value for field in choice.missing_fields]
+        clarity = "partial" if missing_fields else "clear"
+    result = TriageResult(
+        intent=choice.intent,
+        category=choice.category,
+        priority=priority,
+        risk_level=effective_risk,
+        risk_flags=combined_flags,
+        clarity=clarity,
+        clarification_question="",
+        clarification_options=[],
+        missing_fields=missing_fields,
+        suggested_route=suggested_route,
+        summary=f"用户已确认具体情况：{choice.label}",
+    ).model_dump(mode="json")
+    result["selected_clarification_choice"] = None
+    return result
+
+
 def _triage_node(dependency: Callable[[dict], object]) -> Callable[[TicketState], dict]:
     def run(state: TicketState) -> dict:
         try:
             current = _status(state.get("status"))
-            raw = _validated_triage_update(
-                dependency(copy.deepcopy(dict(state)))
-            )
+            raw = _selected_choice_triage(state)
+            if raw is None:
+                dependency_state = copy.deepcopy(dict(state))
+                selected = state.get("selected_clarification_choice")
+                if selected is not None:
+                    legacy_choice = ClarificationChoice.model_validate(selected)
+                    if not legacy_choice.legacy:
+                        raise ValueError("动态 choice 恢复状态非法")
+                    dependency_state["sanitized_input"] = (
+                        "用户从上一轮澄清选项中选择：" + legacy_choice.label
+                    )
+                raw = _validated_triage_update(dependency(dependency_state))
+                raw["selected_clarification_choice"] = None
             ingress_risk = state.get("risk_level")
             ingress_flags = state.get("risk_flags", [])
             if (
@@ -690,8 +840,16 @@ def _triage_node(dependency: Callable[[dict], object]) -> Callable[[TicketState]
                 state,
                 raw,
                 node_name="triage",
-                event_type="triage_completed",
-                summary="分诊已完成",
+                event_type=(
+                    "clarification_choice_resolved"
+                    if state.get("selected_clarification_choice") is not None
+                    else "triage_completed"
+                ),
+                summary=(
+                    "已根据客户选择确定后续路由"
+                    if state.get("selected_clarification_choice") is not None
+                    else "分诊已完成"
+                ),
             )
         except Exception as error:
             if _can_use_automation_fallback(state):
@@ -1176,11 +1334,35 @@ def _await_user(state: TicketState) -> dict:
             "risk_flags",
             "risk_level",
         }
-        if not isinstance(resumed, dict) or set(resumed) != required:
+        choice_required = required | {"selected_clarification_choice"}
+        if not isinstance(resumed, dict) or frozenset(resumed) not in {
+            frozenset(required),
+            frozenset(choice_required),
+        }:
             raise ValueError("恢复载荷字段非法")
         command_id = _identifier(resumed["command_id"], "command_id")
         request_id = _identifier(resumed["request_id"], "request_id")
         sanitized_input = _safe_text(resumed["sanitized_input"], "sanitized_input", 10_000)
+        selected_choice: dict | None = None
+        if "selected_clarification_choice" in resumed:
+            if state.get("waiting_reason") != WaitingReason.CLARIFICATION.value:
+                raise ValueError("当前工单不接受澄清选择")
+            choice = ClarificationChoice.model_validate(
+                resumed["selected_clarification_choice"]
+            )
+            current_choices = validate_clarification_choices(
+                state.get("clarification_options", [])
+            )
+            matching = [
+                current
+                for current in current_choices
+                if current["choice_id"] == choice.choice_id
+            ]
+            if len(matching) != 1 or matching[0] != choice.model_dump(mode="json"):
+                raise ValueError("澄清选择已过期或不属于当前工单")
+            if sanitized_input != choice.label:
+                raise ValueError("澄清选择展示文本与服务端记录不一致")
+            selected_choice = choice.model_dump(mode="json")
         old_sensitive_flags = state.get("sensitive_flags", [])
         old_risk_flags = state.get("risk_flags", [])
         new_sensitive_flags = resumed["sensitive_flags"]
@@ -1233,6 +1415,7 @@ def _await_user(state: TicketState) -> dict:
                 "clarity": "clear",
                 "clarification_question": "",
                 "clarification_options": [],
+                "selected_clarification_choice": selected_choice,
                 "missing_fields": [],
                 "waiting_reason": None,
                 "resolution_confirmed": False,
@@ -1242,8 +1425,16 @@ def _await_user(state: TicketState) -> dict:
                 "last_error": "",
             },
             node_name="await_user",
-            event_type="user_information_received",
-            summary="已收到用户补充的脱敏信息",
+            event_type=(
+                "clarification_choice_received"
+                if selected_choice is not None
+                else "user_information_received"
+            ),
+            summary=(
+                "已收到客户选择的澄清项"
+                if selected_choice is not None
+                else "已收到用户补充的脱敏信息"
+            ),
             command_id=command_id,
             step_index=1,
         )

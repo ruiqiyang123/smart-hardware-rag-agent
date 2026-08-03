@@ -4,11 +4,14 @@
 优先级规则：critical=P0，high=P1，low/medium=P2。
 high/critical 必须 suggested_route=escalate。
 required_fields 是必要字段的唯一权威白名单。
-triage_policy 是风险定义、自动升级白名单、澄清选项与对比案例的唯一业务依据；不得只根据“丢失”“余额”“失败”“恢复”等单个关键词升级。
+triage_policy 是风险定义、自动升级白名单、动态澄清规则与对比案例的唯一业务依据；不得只根据“丢失”“余额”“失败”“恢复”等单个关键词升级。
 device_loss_damage 表示物理设备丢失或损坏，不等于 asset_loss；只有已经观察到或明确怀疑本人未授权的资产移动时才使用 asset_loss。
 普通 pending、交易失败、Gas、同步或恢复后余额为零应先 diagnose 或 clarify；本人未发起的转账、凭证已提交第三方、地址或签名异常才升级人工。
 missing_fields 只能包含当前 category 在 required_fields 中配置的字段；category 未出现在 required_fields 时必须返回空数组 []。
-无法判断唯一问题方向时 clarity=ambiguous、suggested_route=clarify、missing_fields=[]，并提供一个具体 clarification_question 和 2-5 个简短 clarification_options。
+无法判断唯一问题方向时 clarity=ambiguous、suggested_route=clarify、missing_fields=[]，并提供一个具体 clarification_question 和 2-5 个与当前问题相关、互斥且能消除本轮歧义的结构化 clarification_options。
+每个 clarification_options 项都必须包含 label、intent、category、risk_level、risk_flags、missing_fields 和 suggested_route；label 是给用户点击的简短描述，suggested_route 只能是 diagnose 或 escalate，不能再次 clarify。
+澄清选项必须根据当前问题动态生成：开机问题应询问无反应、卡 Logo、接电才有反应等开机情形；蓝牙问题应询问搜不到、配对失败、频繁断开等连接情形。不得无论用户问什么都返回余额或交易方向的固定五项。
+每个选项被用户选择后必须足以进入对应 category 的诊断或安全升级；如果仍无法确定，应在 label 中给出一个可执行的具体描述，而不是再次生成相同问题。
 意图明确但缺少 required_fields 时 clarity=partial、suggested_route=diagnose；系统会先给基础帮助再追问。
 意图和必要信息足够时 clarity=clear、suggested_route=diagnose、missing_fields=[]。
 非 ambiguous 路径的 clarification_question 必须是空字符串，clarification_options 必须是空数组 []。

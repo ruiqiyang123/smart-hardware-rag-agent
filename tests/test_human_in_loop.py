@@ -45,6 +45,18 @@ def _triage(_state):
     }
 
 
+def _candidate(label, category, *, intent="troubleshoot"):
+    return {
+        "label": label,
+        "intent": intent,
+        "category": category,
+        "risk_level": "low",
+        "risk_flags": [],
+        "missing_fields": [],
+        "suggested_route": "diagnose",
+    }
+
+
 def _diagnosis(_state):
     return {
         "outcome": "draft",
@@ -165,7 +177,10 @@ class HumanInLoopTest(unittest.TestCase):
                 "category": "other",
                 "clarity": "ambiguous",
                 "clarification_question": "你遇到的是哪一类问题？",
-                "clarification_options": ["设备无法开机", "设备无法连接"],
+                "clarification_options": [
+                    _candidate("设备完全无法开机", "power"),
+                    _candidate("USB 连接后无反应", "usb_connection"),
+                ],
                 "suggested_route": "clarify",
             }
 
@@ -189,10 +204,61 @@ class HumanInLoopTest(unittest.TestCase):
         self.assertEqual(result["status"], "pending_user")
         self.assertEqual(result["clarity"], "ambiguous")
         self.assertEqual(
-            result["clarification_options"], ["设备无法开机", "设备无法连接"]
+            [choice["label"] for choice in result["clarification_options"]],
+            ["设备完全无法开机", "USB 连接后无反应"],
+        )
+        self.assertTrue(
+            all(
+                choice["choice_id"].startswith("choice_")
+                for choice in result["clarification_options"]
+            )
         )
         self.assertEqual(diagnosis_calls, [])
         self.assertIn("__interrupt__", result)
+
+    def test_selected_dynamic_choice_skips_second_triage_and_is_consumed(self):
+        triage_calls = []
+
+        def triage(state):
+            triage_calls.append(state["sanitized_input"])
+            return {
+                **_triage(state),
+                "category": "other",
+                "clarity": "ambiguous",
+                "clarification_question": "开机时具体是什么表现？",
+                "clarification_options": [
+                    _candidate("按电源键完全没有反应", "power"),
+                    _candidate("一直卡在 KeyGuard Logo", "firmware_repair"),
+                ],
+                "suggested_route": "clarify",
+            }
+
+        graph = self._graph(triage=triage)
+        config = {"configurable": {"thread_id": "dynamic-choice"}}
+        first = graph.invoke(
+            _initial_state(sanitized_input="设备开不了机"), config
+        )
+        choice = first["clarification_options"][1]
+        resumed = graph.invoke(
+            Command(
+                resume={
+                    "command_id": "command-2",
+                    "request_id": "request-2",
+                    "sanitized_input": choice["label"],
+                    "sensitive_flags": [],
+                    "risk_flags": [],
+                    "risk_level": "low",
+                    "selected_clarification_choice": choice,
+                }
+            ),
+            config,
+        )
+
+        self.assertEqual(triage_calls, ["设备开不了机"])
+        self.assertEqual(resumed["category"], "firmware_repair")
+        self.assertEqual(resumed["clarification_question"], "")
+        self.assertEqual(resumed["clarification_options"], [])
+        self.assertIsNone(resumed["selected_clarification_choice"])
 
     def test_partial_ticket_sends_reviewed_guidance_before_asking_for_details(self):
         def triage(state):

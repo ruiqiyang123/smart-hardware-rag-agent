@@ -25,6 +25,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command, Interrupt
 
 from agent.orchestration.events import make_event, to_repository_event
+from agent.orchestration.clarification import validate_clarification_choices
 from agent.orchestration.invoke import invoke_with_policy
 from agent.orchestration.resolution_intent import is_resolution_confirmation
 from agent.orchestration.routes import assert_transition
@@ -148,7 +149,7 @@ class OrchestrationResult:
     final_answer: str
     clarity: str
     clarification_question: str
-    clarification_options: List[str]
+    clarification_options: List[dict]
     missing_fields: List[str]
     citations: List[dict]
     events: List[dict]
@@ -1151,10 +1152,8 @@ class SupportOrchestrator:
                 "clarification_question",
                 300,
             ),
-            "clarification_options_json": _string_list(
-                state.get("clarification_options", []),
-                "clarification_options",
-                5,
+            "clarification_options_json": validate_clarification_choices(
+                state.get("clarification_options", [])
             ),
             "summary": _optional_output_text(state.get("summary"), "summary", 300),
             "risk_flags_json": _string_list(
@@ -1688,10 +1687,8 @@ class SupportOrchestrator:
                 clarification_question, "clarification_question", 300
             )
         try:
-            clarification_options = _string_list(
-                json.loads(ticket.get("clarification_options_json") or "[]"),
-                "clarification_options",
-                5,
+            clarification_options = validate_clarification_choices(
+                json.loads(ticket.get("clarification_options_json") or "[]")
             )
             missing_fields = _string_list(
                 json.loads(ticket.get("missing_fields_json") or "[]"),
@@ -2044,6 +2041,76 @@ class SupportOrchestrator:
             sanitized_input,
             sanitized.critical_notice,
         )
+
+    def resume_clarification_choice(
+        self,
+        ticket_id: str,
+        choice_id: str,
+        request_id: Optional[str] = None,
+    ) -> OrchestrationResult:
+        """Resume from a current server-owned choice without re-parsing its label."""
+
+        ticket_id = _identifier(ticket_id, "ticket_id")
+        choice_id = _identifier(choice_id, "choice_id")
+        request_id = uuid.uuid4().hex if request_id is None else request_id
+        request_id = _identifier(request_id, "request_id", 120)
+        try:
+            choice = self.repository.get_current_clarification_choice(
+                ticket_id, choice_id
+            )
+        except Exception as error:
+            self._log_failure(
+                ticket_id, "runtime", "INVALID_CLARIFICATION_CHOICE", error
+            )
+            raise ValueError("澄清选项不存在、已过期或不属于当前工单") from None
+
+        label = _safe_text(choice["label"], "clarification label", 160)
+        risk_level = choice["risk_level"]
+        risk_flags = list(choice["risk_flags"])
+        fingerprint = _payload_fingerprint(
+            {
+                "kind": "resume_clarification_choice",
+                "ticket_id": ticket_id,
+                "choice_id": choice_id,
+            }
+        )
+        command_id = _identifier(f"request:{request_id}", "command_id")
+        decision = self.repository.begin_command(
+            ticket_id,
+            command_id,
+            CommandType.USER_INPUT.value,
+            self.lease_seconds,
+            payload_fingerprint=fingerprint,
+            required_status=Status.PENDING_USER.value,
+        )
+        duplicate = self._existing_decision_result(
+            decision,
+            ticket_id=ticket_id,
+            sanitized_input=label,
+            user_notice="",
+        )
+        if duplicate is not None:
+            return duplicate
+
+        self.sessions.clear(ticket_id)
+        resume_payload = {
+            "command_id": command_id,
+            "request_id": request_id,
+            "sanitized_input": label,
+            "sensitive_flags": risk_flags,
+            "risk_flags": risk_flags,
+            "risk_level": risk_level,
+            "selected_clarification_choice": choice,
+        }
+        self._execute(
+            ticket_id=ticket_id,
+            command_id=command_id,
+            decision=decision,
+            graph_input=Command(resume=resume_payload),
+            command_type=CommandType.USER_INPUT.value,
+        )
+        self._refresh_idle_deadline(ticket_id)
+        return self._result(ticket_id, label, "")
 
     def confirm_resolution(
         self,

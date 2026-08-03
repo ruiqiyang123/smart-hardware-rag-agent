@@ -11,6 +11,7 @@ from agent.security.secrets import (
     TransactionHash,
     contains_unredacted_secret,
 )
+from agent.orchestration.clarification import build_clarification_choices
 from database.ticket_db import (
     CommandDisposition,
     CommandType,
@@ -76,6 +77,89 @@ class TicketRepositoryTest(unittest.TestCase):
         second = self.repo.create_ticket("req-1", "1001", "蓝牙连接失败", [])
         self.assertEqual(first["ticket_id"], second["ticket_id"])
         self.assertEqual(len(self.repo.list_tickets()), 1)
+
+    def test_v8_string_options_migrate_to_identifiable_legacy_choices(self):
+        ticket = self.repo.create_ticket("legacy-choice", "1001", "钱包有问题", [])
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                UPDATE tickets
+                SET status = 'pending_user', waiting_reason = 'clarification',
+                    clarity = 'ambiguous', clarification_question = ?,
+                    clarification_options_json = ?
+                WHERE ticket_id = ?
+                """,
+                (
+                    "具体是什么问题？",
+                    json.dumps(["无法开机", "无法连接"], ensure_ascii=False),
+                    ticket["ticket_id"],
+                ),
+            )
+            connection.execute("PRAGMA user_version = 8")
+
+        migrated = TicketRepository(str(self.db_path))
+        with sqlite3.connect(self.db_path) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        choices = json.loads(
+            migrated.get_ticket(ticket["ticket_id"])["clarification_options_json"]
+        )
+
+        self.assertEqual(version, 9)
+        self.assertEqual([choice["label"] for choice in choices], ["无法开机", "无法连接"])
+        self.assertTrue(all(choice["legacy"] for choice in choices))
+        self.assertTrue(all(choice["choice_id"].startswith("choice_") for choice in choices))
+
+    def test_current_choice_lookup_rejects_unknown_and_non_waiting_ticket(self):
+        ticket = self.repo.create_ticket("choice-lookup", "1001", "设备有问题", [])
+        choices = build_clarification_choices(
+            [
+                {
+                    "label": "按电源键完全没有反应",
+                    "intent": "troubleshoot",
+                    "category": "power",
+                    "risk_level": "low",
+                    "risk_flags": [],
+                    "missing_fields": [],
+                    "suggested_route": "diagnose",
+                },
+                {
+                    "label": "一直卡在 KeyGuard Logo",
+                    "intent": "troubleshoot",
+                    "category": "firmware_repair",
+                    "risk_level": "low",
+                    "risk_flags": [],
+                    "missing_fields": [],
+                    "suggested_route": "diagnose",
+                },
+            ]
+        )
+        with self.assertRaises(ValueError):
+            self.repo.get_current_clarification_choice(
+                ticket["ticket_id"], choices[0]["choice_id"]
+            )
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                UPDATE tickets
+                SET status = 'pending_user', waiting_reason = 'clarification',
+                    clarity = 'ambiguous', clarification_question = ?,
+                    clarification_options_json = ?
+                WHERE ticket_id = ?
+                """,
+                (
+                    "开机时具体是什么表现？",
+                    json.dumps(choices, ensure_ascii=False),
+                    ticket["ticket_id"],
+                ),
+            )
+        selected = self.repo.get_current_clarification_choice(
+            ticket["ticket_id"], choices[1]["choice_id"]
+        )
+        self.assertEqual(selected, choices[1])
+        with self.assertRaises(ValueError):
+            self.repo.get_current_clarification_choice(
+                ticket["ticket_id"], "choice_0000000000000000"
+            )
 
     def test_create_ticket_rejects_request_id_payload_conflicts(self):
         self._ticket()

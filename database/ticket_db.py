@@ -15,6 +15,10 @@ from agent.security.secrets import (
     is_fully_redacted,
 )
 from agent.orchestration.routes import assert_transition
+from agent.orchestration.clarification import (
+    build_legacy_choice,
+    validate_clarification_choices,
+)
 
 
 class CommandDisposition(str, Enum):
@@ -76,7 +80,7 @@ CATEGORY_VALUES = {
     "security_report",
     "other",
 }
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 CLARITY_VALUES = {"ambiguous", "partial", "clear"}
 WAITING_REASON_VALUES = {
     "clarification",
@@ -243,7 +247,7 @@ CREATE TABLE IF NOT EXISTS ticket_events (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_ticket_commands_one_in_progress
     ON ticket_commands(ticket_id)
     WHERE status = 'in_progress';
-PRAGMA user_version = 8;
+PRAGMA user_version = 9;
 """
 _SENSITIVE_METADATA_KEYS = {
     "pin",
@@ -334,7 +338,7 @@ class TicketRepository:
                 """
             ).fetchall()
             schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if existing_tables and schema_version not in {6, 7, SCHEMA_VERSION}:
+            if existing_tables and schema_version not in {6, 7, 8, SCHEMA_VERSION}:
                 raise RuntimeError(
                     "schema 版本不兼容；请备份后重建 KeyGuard V2 数据库"
                 )
@@ -343,6 +347,9 @@ class TicketRepository:
                 schema_version = 7
             if existing_tables and schema_version == 7:
                 self._migrate_v7_to_v8(connection)
+                schema_version = 8
+            if existing_tables and schema_version == 8:
+                self._migrate_v8_to_v9(connection)
             connection.executescript(SCHEMA)
 
     @staticmethod
@@ -434,6 +441,47 @@ class TicketRepository:
             raise
         finally:
             connection.execute("PRAGMA foreign_keys = ON")
+
+    @staticmethod
+    def _migrate_v8_to_v9(connection: sqlite3.Connection) -> None:
+        """Convert v8 string clarification options into identifiable legacy choices."""
+
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = connection.execute(
+                "SELECT ticket_id, clarification_options_json FROM tickets"
+            ).fetchall()
+            for row in rows:
+                raw = json.loads(row["clarification_options_json"] or "[]")
+                if not isinstance(raw, list):
+                    raise ValueError("v8 clarification_options_json 非法")
+                if not raw:
+                    structured: list[dict[str, object]] = []
+                elif all(isinstance(item, str) for item in raw):
+                    structured = [
+                        build_legacy_choice(label, index)
+                        for index, label in enumerate(raw)
+                    ]
+                    structured = validate_clarification_choices(structured)
+                else:
+                    structured = validate_clarification_choices(raw)
+                connection.execute(
+                    "UPDATE tickets SET clarification_options_json = ? WHERE ticket_id = ?",
+                    (
+                        json.dumps(
+                            structured,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        row["ticket_id"],
+                    ),
+                )
+            connection.execute("PRAGMA user_version = 9")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -563,12 +611,14 @@ class TicketRepository:
             raise ValueError("clarification_options_json 不可安全展示") from None
         if not isinstance(options, list) or len(options) > 5:
             raise ValueError("clarification_options_json 不可安全展示")
-        safe_options = [
+        try:
+            safe_options = validate_clarification_choices(options)
+        except (TypeError, ValueError):
+            raise ValueError("clarification_options_json 不可安全展示") from None
+        for option in safe_options:
             cls._project_workbench_text(
-                option, "clarification_option", 300
+                option["label"], "clarification_option", 160
             )
-            for option in options
-        ]
         raw_missing = row.get("missing_fields_json", "[]")
         if not isinstance(raw_missing, str):
             raise ValueError("missing_fields_json 不可安全展示")
@@ -730,6 +780,10 @@ class TicketRepository:
             elif field == "review_decision":
                 prepared[field] = cls._enum_value(
                     value, field, REVIEW_DECISION_VALUES
+                )
+            elif field == "clarification_options_json":
+                prepared[field] = cls._json(
+                    validate_clarification_choices(value)
                 )
             elif field in cls._JSON_LIST_FIELDS:
                 prepared[field] = cls._json(
@@ -923,6 +977,54 @@ class TicketRepository:
                 "SELECT * FROM tickets WHERE ticket_id = ?", (ticket_id,)
             ).fetchone()
         return dict(row) if row else None
+
+    def get_current_clarification_choice(
+        self, ticket_id: str, choice_id: str
+    ) -> Dict[str, object]:
+        """Return one server-owned current choice after ticket-state validation."""
+
+        ticket_id = self._project_workbench_identifier(ticket_id, "ticket_id")
+        choice_id = self._project_workbench_identifier(choice_id, "choice_id")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT status, waiting_reason, clarification_options_json
+                FROM tickets WHERE ticket_id = ?
+                """,
+                (ticket_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"工单不存在: {ticket_id}")
+        if (
+            row["status"] != "pending_user"
+            or row["waiting_reason"] != "clarification"
+        ):
+            raise ValueError("当前工单不接受澄清选择")
+        try:
+            choices = validate_clarification_choices(
+                json.loads(row["clarification_options_json"] or "[]")
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("当前工单的澄清选项非法") from None
+        matches = [choice for choice in choices if choice["choice_id"] == choice_id]
+        if len(matches) != 1:
+            raise ValueError("澄清选择不存在或已过期")
+        return matches[0]
+
+    def get_command_status(self, command_id: str) -> Optional[Dict[str, object]]:
+        """Read the minimum safe command state needed by a UI poller."""
+
+        command_id = self._project_workbench_identifier(command_id, "command_id")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT command_id, ticket_id, status, lease_expires_at,
+                       result_status, error_code
+                FROM ticket_commands WHERE command_id = ?
+                """,
+                (command_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def list_tickets(self) -> List[Dict[str, object]]:
         with self._connect() as connection:

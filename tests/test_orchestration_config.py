@@ -243,6 +243,10 @@ class TriagePolicyConfigTest(ConfigTestCase):
         self.assertEqual(device_loss["category"], "device_loss_damage")
         self.assertEqual(device_loss["route"], "diagnose")
         self.assertIn("asset_loss", device_loss["forbidden_flags"])
+        self.assertEqual(policy["clarification"]["mode"], "dynamic_contextual")
+        self.assertEqual(policy["clarification"]["min_options"], 2)
+        self.assertEqual(policy["clarification"]["max_options"], 5)
+        self.assertNotIn("options", policy["clarification"])
 
     def test_rejects_missing_extra_and_wrong_escalation_flags(self):
         mutations = (
@@ -262,8 +266,9 @@ class TriagePolicyConfigTest(ConfigTestCase):
 
     def test_rejects_invalid_clarification_and_examples(self):
         mutations = (
-            lambda data: data["clarification"].__setitem__("options", []),
-            lambda data: data["clarification"]["options"].pop(),
+            lambda data: data["clarification"].__setitem__("mode", "fixed"),
+            lambda data: data["clarification"].__setitem__("min_options", 1),
+            lambda data: data["clarification"]["requirements"].clear(),
             lambda data: data.__setitem__("contrastive_examples", []),
             lambda data: data["contrastive_examples"][0].pop("route"),
             lambda data: data["contrastive_examples"][0].pop("forbidden_flags"),

@@ -209,9 +209,13 @@ def _validate_runner_result(
         raise ValueError("分诊摘要包含未脱敏内容")
     clarification_question = " ".join(result.clarification_question.split())
     clarification_options = [
-        " ".join(option.split()) for option in result.clarification_options
+        option.model_copy(update={"label": " ".join(option.label.split())})
+        for option in result.clarification_options
     ]
-    clarification_texts = [clarification_question, *clarification_options]
+    clarification_texts = [
+        clarification_question,
+        *(option.label for option in clarification_options),
+    ]
     if any(
         not text
         or len(text) > 300
@@ -231,6 +235,10 @@ def _validate_runner_result(
     allowed_missing = set(required_fields.get(result.category, []))
     if not set(result.missing_fields).issubset(allowed_missing):
         raise ValueError("分诊输出包含该 category 不需要的字段")
+    for option in result.clarification_options:
+        option_allowed_missing = set(required_fields.get(option.category, []))
+        if not set(option.missing_fields).issubset(option_allowed_missing):
+            raise ValueError("澄清候选项包含该 category 不需要的字段")
     return result
 
 

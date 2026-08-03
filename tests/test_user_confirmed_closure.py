@@ -79,11 +79,11 @@ def review(_state):
 
 class UserConfirmedClosureTest(unittest.TestCase):
     @staticmethod
-    def _runtime(directory: str) -> SupportOrchestrator:
+    def _runtime(directory: str, triage_node=triage) -> SupportOrchestrator:
         trusted = TrustedSourcePolicy(["support.example.test"], [])
         guard = PolicyGuard(POLICY, trusted_source_policy=trusted)
         graph = build_support_graph(
-            triage_node=triage,
+            triage_node=triage_node,
             diagnosis_node=diagnosis,
             review_node=review,
             policy_guard=guard,
@@ -163,6 +163,70 @@ class UserConfirmedClosureTest(unittest.TestCase):
             ticket = runtime.repository.get_ticket(result.ticket_id)
             self.assertEqual(ticket["manual_gate_reason"], "customer_requested_human")
             self.assertIsNone(ticket["idle_expires_at"])
+
+    def test_dynamic_choice_resume_uses_server_semantics_and_cannot_repeat(self):
+        triage_calls = []
+
+        def ambiguous_triage(state):
+            triage_calls.append(state["sanitized_input"])
+            return {
+                **triage(state),
+                "intent": "other",
+                "category": "other",
+                "clarity": "ambiguous",
+                "clarification_question": "开机时具体是什么表现？",
+                "clarification_options": [
+                    {
+                        "label": "按电源键完全没有反应",
+                        "intent": "troubleshoot",
+                        "category": "power",
+                        "risk_level": "low",
+                        "risk_flags": [],
+                        "missing_fields": [],
+                        "suggested_route": "diagnose",
+                    },
+                    {
+                        "label": "一直卡在 KeyGuard Logo",
+                        "intent": "troubleshoot",
+                        "category": "firmware_repair",
+                        "risk_level": "low",
+                        "risk_flags": [],
+                        "missing_fields": [],
+                        "suggested_route": "diagnose",
+                    },
+                ],
+                "suggested_route": "clarify",
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self._runtime(directory, triage_node=ambiguous_triage)
+            first = runtime.submit(
+                "设备好像开不了机",
+                "1001",
+                request_id="dynamic-choice-first",
+            )
+            self.assertEqual(first.waiting_reason, "clarification")
+            choice = first.clarification_options[1]
+
+            resumed = runtime.resume_clarification_choice(
+                first.ticket_id,
+                choice["choice_id"],
+                request_id="dynamic-choice-selected",
+            )
+
+            self.assertEqual(triage_calls, ["设备好像开不了机"])
+            self.assertEqual(resumed.sanitized_input, choice["label"])
+            self.assertEqual(resumed.waiting_reason, "resolution_confirmation")
+            self.assertEqual(
+                runtime.repository.get_ticket(first.ticket_id)["category"],
+                "firmware_repair",
+            )
+            with self.assertRaises(ValueError):
+                runtime.resume_clarification_choice(
+                    first.ticket_id,
+                    choice["choice_id"],
+                    request_id="dynamic-choice-stale",
+                )
 
 
 if __name__ == "__main__":

@@ -145,6 +145,45 @@ class TicketStateContractTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self._triage(missing_fields=["device_model", "device_model"])
 
+    def test_ambiguous_triage_requires_structured_dynamic_candidates(self):
+        result = self._triage(
+            intent="other",
+            category="other",
+            clarity="ambiguous",
+            clarification_question="开机时具体是什么表现？",
+            clarification_options=[
+                {
+                    "label": "按电源键完全没有反应",
+                    "intent": "troubleshoot",
+                    "category": "power",
+                    "risk_level": "low",
+                    "risk_flags": [],
+                    "missing_fields": [],
+                    "suggested_route": "diagnose",
+                },
+                {
+                    "label": "一直卡在 KeyGuard Logo",
+                    "intent": "troubleshoot",
+                    "category": "firmware_repair",
+                    "risk_level": "low",
+                    "risk_flags": [],
+                    "missing_fields": [],
+                    "suggested_route": "diagnose",
+                },
+            ],
+            suggested_route="clarify",
+        )
+        self.assertEqual(result.clarification_options[1].category, "firmware_repair")
+        with self.assertRaises(ValidationError):
+            self._triage(
+                intent="other",
+                category="other",
+                clarity="ambiguous",
+                clarification_question="开机时具体是什么表现？",
+                clarification_options=["完全没反应", "卡在 Logo"],
+                suggested_route="clarify",
+            )
+
     def test_draft_requires_bound_evidence(self):
         with self.assertRaises(ValidationError):
             self._diagnosis(

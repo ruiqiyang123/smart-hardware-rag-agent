@@ -4,6 +4,7 @@ from types import MappingProxyType
 from typing import FrozenSet, Mapping
 
 from agent.orchestration.state import MissingField, RiskLevel, Status
+from agent.orchestration.clarification import validate_clarification_choices
 
 
 class IllegalTransition(ValueError):
@@ -187,10 +188,9 @@ def route_after_triage(state: object) -> str:
         clarification_options, list
     ):
         raise IllegalRoute("澄清内容非法")
-    if any(
-        not isinstance(option, str) or not option
-        for option in clarification_options
-    ) or len(clarification_options) != len(set(clarification_options)):
+    try:
+        validated_options = validate_clarification_choices(clarification_options)
+    except (TypeError, ValueError):
         raise IllegalRoute("澄清选项非法")
 
     if status != Status.TRIAGED:
@@ -207,7 +207,7 @@ def route_after_triage(state: object) -> str:
             clarity != "ambiguous"
             or missing_fields
             or not clarification_question
-            or not 2 <= len(clarification_options) <= 5
+            or not 2 <= len(validated_options) <= 5
         ):
             raise IllegalRoute("分诊结果互相矛盾")
         return "pending_user"

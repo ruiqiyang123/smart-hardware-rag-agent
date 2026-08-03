@@ -1,4 +1,4 @@
-policy_version: 2026-08-02.v1
+policy_version: 2026-08-03.v2
 automatic_escalation:
   critical_flags:
     - secret_exposure
@@ -17,13 +17,14 @@ definitions:
   ordinary_transaction_issue: 交易待确认、失败、Gas 过低、网络拥堵或余额显示延迟，默认先由 AI 排查。
   confirmed_secret_exposure: 用户明确表示已经把助记词、私钥或其他秘密提交给第三方、钓鱼页面或远程控制人员。
 clarification:
-  question: 请确认您遇到的是哪一种情况？
-  options:
-    - App 暂时没有显示余额
-    - 恢复钱包后余额为零
-    - 交易长时间未确认或失败
-    - 发现本人没有发起的转账
-    - 助记词或私钥可能已经泄露
+  mode: dynamic_contextual
+  min_options: 2
+  max_options: 5
+  requirements:
+    - 选项必须根据当前已脱敏问题动态生成，不使用全局固定答案列表。
+    - 同一轮选项必须互斥、文字简短，并能消除当前问题的歧义。
+    - 每个选项必须携带足以直接进入诊断或安全升级的结构化语义。
+    - 普通设备与连接问题不得因为选项较短而自动升级人工。
 contrastive_examples:
   - input: 设备丢了或坏了，资产还能恢复吗？
     category: device_loss_damage

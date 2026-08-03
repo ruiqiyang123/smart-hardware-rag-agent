@@ -20,6 +20,31 @@ JSONValue: TypeAlias = Union[
     List["JSONValue"],
     Dict[str, "JSONValue"],
 ]
+Intent: TypeAlias = Literal[
+    "troubleshoot",
+    "recovery",
+    "warranty",
+    "transaction_boundary",
+    "security_incident",
+    "security_report",
+    "other",
+]
+Category: TypeAlias = Literal[
+    "power",
+    "usb_connection",
+    "mobile_connection",
+    "bluetooth_connection",
+    "screen_buttons",
+    "pin_lock",
+    "firmware_repair",
+    "backup_recovery",
+    "device_loss_damage",
+    "warranty_service",
+    "transaction_boundary",
+    "security_incident",
+    "security_report",
+    "other",
+]
 
 
 def _reject_duplicates(values: list, field_name: str) -> None:
@@ -92,32 +117,56 @@ class Citation(StrictModel):
     source_url: str = Field(min_length=1)
 
 
+class ClarificationCandidate(StrictModel):
+    """Context-specific option proposed by the untrusted Triage model."""
+
+    label: str = Field(min_length=1, max_length=160)
+    intent: Intent
+    category: Category
+    risk_level: RiskLevel
+    risk_flags: List[RiskFlag] = Field(max_length=8)
+    missing_fields: List[MissingField] = Field(max_length=9)
+    suggested_route: Literal["diagnose", "escalate"]
+
+    @model_validator(mode="after")
+    def validate_resolution(self):
+        _reject_duplicates(self.risk_flags, "risk_flags")
+        _reject_duplicates(self.missing_fields, "missing_fields")
+        flags = set(self.risk_flags)
+        critical_flags = {
+            RiskFlag.SECRET_EXPOSURE,
+            RiskFlag.PHISHING,
+            RiskFlag.ASSET_LOSS,
+        }
+        high_flags = {
+            RiskFlag.ADDRESS_MISMATCH,
+            RiskFlag.SUSPICIOUS_SIGNATURE,
+        }
+        if flags & critical_flags and self.risk_level != RiskLevel.CRITICAL:
+            raise ValueError("critical choice flag 必须使用 critical 风险")
+        if flags & high_flags and self.risk_level not in {
+            RiskLevel.HIGH,
+            RiskLevel.CRITICAL,
+        }:
+            raise ValueError("high choice flag 的风险不得低于 high")
+        if self.risk_level in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
+            if self.suggested_route != "escalate":
+                raise ValueError("high/critical choice 必须升级人工处理")
+        elif self.suggested_route != "diagnose":
+            raise ValueError("low/medium choice 必须继续 AI 诊断")
+        return self
+
+
+class ClarificationChoice(ClarificationCandidate):
+    """Server-owned option persisted in graph and ticket state."""
+
+    choice_id: str = Field(pattern=r"^choice_[0-9a-f]{16}$")
+    legacy: bool = False
+
+
 class TriageResult(StrictModel):
-    intent: Literal[
-        "troubleshoot",
-        "recovery",
-        "warranty",
-        "transaction_boundary",
-        "security_incident",
-        "security_report",
-        "other",
-    ]
-    category: Literal[
-        "power",
-        "usb_connection",
-        "mobile_connection",
-        "bluetooth_connection",
-        "screen_buttons",
-        "pin_lock",
-        "firmware_repair",
-        "backup_recovery",
-        "device_loss_damage",
-        "warranty_service",
-        "transaction_boundary",
-        "security_incident",
-        "security_report",
-        "other",
-    ]
+    intent: Intent
+    category: Category
     priority: Literal["P0", "P1", "P2"]
     risk_level: RiskLevel
     risk_flags: List[RiskFlag]
@@ -128,7 +177,7 @@ class TriageResult(StrictModel):
         )
     )
     clarification_question: str = Field(max_length=300)
-    clarification_options: List[str] = Field(max_length=5)
+    clarification_options: List[ClarificationCandidate] = Field(max_length=5)
     missing_fields: List[MissingField] = Field(
         description=(
             "只能包含输入 required_fields 中当前 category 对应列表里的字段；"
@@ -147,7 +196,8 @@ class TriageResult(StrictModel):
     def validate_risk_consistency(self):
         _reject_duplicates(self.risk_flags, "risk_flags")
         _reject_duplicates(self.missing_fields, "missing_fields")
-        _reject_duplicates(self.clarification_options, "clarification_options")
+        labels = [option.label.casefold() for option in self.clarification_options]
+        _reject_duplicates(labels, "clarification_options labels")
 
         if self.risk_level in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
             if self.suggested_route != "escalate":
@@ -360,6 +410,18 @@ class StatusEventState(TypedDict):
     metadata: Dict[str, JSONValue]
 
 
+class ClarificationChoiceState(TypedDict):
+    choice_id: str
+    label: str
+    intent: str
+    category: str
+    risk_level: str
+    risk_flags: List[str]
+    missing_fields: List[str]
+    suggested_route: str
+    legacy: bool
+
+
 class TicketState(TypedDict, total=False):
     ticket_id: str
     request_id: str
@@ -376,7 +438,8 @@ class TicketState(TypedDict, total=False):
     risk_flags: List[str]
     clarity: str
     clarification_question: str
-    clarification_options: List[str]
+    clarification_options: List[ClarificationChoiceState]
+    selected_clarification_choice: Optional[ClarificationChoiceState]
     missing_fields: List[str]
     suggested_route: str
     summary: str
