@@ -32,6 +32,8 @@ _POLICY = {
 @dataclass(frozen=True)
 class FaultCaseResult:
     status: str
+    waiting_reason: str
+    requires_human: bool
     final_answer: str
     event_types: list[str]
     graph_start_count: int
@@ -407,13 +409,18 @@ def run_fault_case(name: str) -> FaultCaseResult:
             stored = repository.get_ticket(ticket_id)
             if stored is None:  # pragma: no cover - repository invariant
                 raise AssertionError("ticket disappeared")
-            status = stored["status"]
-            final_answer = stored.get("final_answer") or ""
             graph_start_count = graph.start_count
             graph_resume_count = graph.resume_count
 
+        stored = repository.get_ticket(ticket_id)
+        if stored is None:  # pragma: no cover - repository invariant
+            raise AssertionError("ticket disappeared")
+        status = stored["status"]
+        final_answer = stored.get("final_answer") or ""
         return FaultCaseResult(
             status=status,
+            waiting_reason=stored.get("waiting_reason") or "",
+            requires_human=bool(stored.get("requires_human")),
             final_answer=final_answer,
             event_types=[
                 event["event_type"]

@@ -5,7 +5,11 @@ from pathlib import Path
 
 import yaml
 
-from utils.config_handler import load_orchestration_config, load_security_policy
+from utils.config_handler import (
+    load_orchestration_config,
+    load_security_policy,
+    load_triage_policy,
+)
 
 
 VALID_ORCHESTRATION = {
@@ -21,17 +25,11 @@ VALID_ORCHESTRATION = {
         "inactivity_timeout_seconds": 1800,
         "expiry_poll_seconds": 30,
     },
-    "customer_handoff": {"ai_attempt_threshold": 3},
     "required_fields": {
         "firmware_repair": ["device_model", "error_state"],
         "warranty_service": ["serial_last4"],
         "transaction_boundary": ["transaction_hash", "chain_name"],
     },
-    "manual_gate_actions": [
-        "device_reset",
-        "bootloader_recovery",
-        "warranty_decision",
-    ],
 }
 
 VALID_SECURITY_POLICY = {
@@ -74,7 +72,8 @@ class OrchestrationConfigTest(ConfigTestCase):
             config["customer_session"]["inactivity_timeout_seconds"], 1800
         )
         self.assertEqual(config["customer_session"]["expiry_poll_seconds"], 30)
-        self.assertEqual(config["customer_handoff"]["ai_attempt_threshold"], 3)
+        self.assertNotIn("customer_handoff", config)
+        self.assertNotIn("manual_gate_actions", config)
         self.assertEqual(config["retries"]["review"], 0)
 
     def test_rejects_missing_file_and_malformed_yaml(self):
@@ -97,9 +96,7 @@ class OrchestrationConfigTest(ConfigTestCase):
             "recursion_limit",
             "command_lease_seconds",
             "customer_session",
-            "customer_handoff",
             "required_fields",
-            "manual_gate_actions",
         )
         for key in top_level:
             with self.subTest(key=key), self.assertRaises(ValueError):
@@ -114,7 +111,6 @@ class OrchestrationConfigTest(ConfigTestCase):
             ("retries", "review"),
             ("customer_session", "inactivity_timeout_seconds"),
             ("customer_session", "expiry_poll_seconds"),
-            ("customer_handoff", "ai_attempt_threshold"),
         ):
             with self.subTest(section=section, key=key), self.assertRaises(ValueError):
                 self.load_changed(lambda data, s=section, k=key: data[s].pop(k))
@@ -128,7 +124,6 @@ class OrchestrationConfigTest(ConfigTestCase):
             lambda data: data.__setitem__("recursion_limit", True),
             lambda data: data.__setitem__("command_lease_seconds", "130"),
             lambda data: data["customer_session"].__setitem__("inactivity_timeout_seconds", True),
-            lambda data: data["customer_handoff"].__setitem__("ai_attempt_threshold", "3"),
         )
         for index, mutation in enumerate(mutations):
             with self.subTest(index=index), self.assertRaises(TypeError):
@@ -143,7 +138,6 @@ class OrchestrationConfigTest(ConfigTestCase):
             lambda data: data.__setitem__("recursion_limit", 0),
             lambda data: data.__setitem__("command_lease_seconds", -1),
             lambda data: data["customer_session"].__setitem__("expiry_poll_seconds", 0),
-            lambda data: data["customer_handoff"].__setitem__("ai_attempt_threshold", 0),
         )
         for index, mutation in enumerate(mutations):
             with self.subTest(index=index), self.assertRaises(ValueError):
@@ -170,7 +164,6 @@ class OrchestrationConfigTest(ConfigTestCase):
             lambda data: data.__setitem__("command_lease_seconds", 131),
             lambda data: data["customer_session"].__setitem__("inactivity_timeout_seconds", 1799),
             lambda data: data["customer_session"].__setitem__("expiry_poll_seconds", 31),
-            lambda data: data["customer_handoff"].__setitem__("ai_attempt_threshold", 4),
         )
         for index, mutation in enumerate(mutations):
             with self.subTest(index=index), self.assertRaises(ValueError):
@@ -214,21 +207,75 @@ class OrchestrationConfigTest(ConfigTestCase):
             with self.subTest(index=index), self.assertRaises(ValueError):
                 self.load_changed(mutation)
 
-    def test_manual_gate_actions_must_be_non_empty_strings(self):
-        bad_values = ("device_reset", [], [1], [""], [" "])
-        for value in bad_values:
-            expected = TypeError if isinstance(value, str) or value == [1] else ValueError
-            with self.subTest(value=value), self.assertRaises(expected):
-                self.load_changed(lambda data, v=value: data.__setitem__("manual_gate_actions", v))
+    def test_rejects_removed_handoff_and_manual_gate_sections(self):
+        for key, value in (
+            ("customer_handoff", {"ai_attempt_threshold": 3}),
+            (
+                "manual_gate_actions",
+                ["device_reset", "bootloader_recovery", "warranty_decision"],
+            ),
+        ):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.load_changed(lambda data, k=key, v=value: data.__setitem__(k, v))
 
-    def test_manual_gate_actions_rejects_each_missing_extra_and_duplicate(self):
-        for action in VALID_ORCHESTRATION["manual_gate_actions"]:
-            with self.subTest(action=action), self.assertRaises(ValueError):
-                self.load_changed(lambda data, value=action: data["manual_gate_actions"].remove(value))
 
-        for value in ("factory_reset", "device_reset"):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                self.load_changed(lambda data, action=value: data["manual_gate_actions"].append(action))
+class TriagePolicyConfigTest(ConfigTestCase):
+    def load_changed(self, mutator):
+        data = copy.deepcopy(load_triage_policy())
+        mutator(data)
+        return load_triage_policy(self.write_yaml(data))
+
+    def test_loads_narrow_escalation_and_device_loss_contrast(self):
+        policy = load_triage_policy()
+        self.assertEqual(
+            set(policy["automatic_escalation"]["critical_flags"]),
+            {"secret_exposure", "phishing", "asset_loss"},
+        )
+        self.assertEqual(
+            set(policy["automatic_escalation"]["high_flags"]),
+            {"address_mismatch", "suspicious_signature"},
+        )
+        self.assertEqual(
+            set(policy["advisory_flags"]),
+            {"unofficial_firmware", "device_auth_failure", "remote_control"},
+        )
+        device_loss = policy["contrastive_examples"][0]
+        self.assertEqual(device_loss["category"], "device_loss_damage")
+        self.assertEqual(device_loss["route"], "diagnose")
+        self.assertIn("asset_loss", device_loss["forbidden_flags"])
+        self.assertEqual(policy["clarification"]["mode"], "dynamic_contextual")
+        self.assertEqual(policy["clarification"]["min_options"], 2)
+        self.assertEqual(policy["clarification"]["max_options"], 5)
+        self.assertNotIn("options", policy["clarification"])
+
+    def test_rejects_missing_extra_and_wrong_escalation_flags(self):
+        mutations = (
+            lambda data: data.pop("definitions"),
+            lambda data: data.__setitem__("unknown", {}),
+            lambda data: data["automatic_escalation"]["critical_flags"].remove(
+                "asset_loss"
+            ),
+            lambda data: data["automatic_escalation"]["high_flags"].append(
+                "remote_control"
+            ),
+            lambda data: data["advisory_flags"].append("asset_loss"),
+        )
+        for index, mutation in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                self.load_changed(mutation)
+
+    def test_rejects_invalid_clarification_and_examples(self):
+        mutations = (
+            lambda data: data["clarification"].__setitem__("mode", "fixed"),
+            lambda data: data["clarification"].__setitem__("min_options", 1),
+            lambda data: data["clarification"]["requirements"].clear(),
+            lambda data: data.__setitem__("contrastive_examples", []),
+            lambda data: data["contrastive_examples"][0].pop("route"),
+            lambda data: data["contrastive_examples"][0].pop("forbidden_flags"),
+        )
+        for index, mutation in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                self.load_changed(mutation)
 
 
 class SecurityPolicyTest(ConfigTestCase):

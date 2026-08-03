@@ -9,6 +9,7 @@ from pathlib import Path
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from agent.orchestration.events import make_event, to_repository_event
+from agent.orchestration.clarification import build_clarification_choices
 from agent.orchestration.invoke import (
     _EXECUTION_CAPACITY,
     _active_execution_count,
@@ -142,7 +143,28 @@ class OrchestrationRoutesTest(unittest.TestCase):
                     clarity="ambiguous",
                     suggested_route="clarify",
                     clarification_question="你遇到的是哪一类问题？",
-                    clarification_options=["无法开机", "无法连接"],
+                    clarification_options=build_clarification_choices(
+                        [
+                            {
+                                "label": "完全无法开机",
+                                "intent": "troubleshoot",
+                                "category": "power",
+                                "risk_level": "low",
+                                "risk_flags": [],
+                                "missing_fields": [],
+                                "suggested_route": "diagnose",
+                            },
+                            {
+                                "label": "USB 连接后无反应",
+                                "intent": "troubleshoot",
+                                "category": "usb_connection",
+                                "risk_level": "low",
+                                "risk_flags": [],
+                                "missing_fields": [],
+                                "suggested_route": "diagnose",
+                            },
+                        ]
+                    ),
                 )
             ),
             "pending_user",
@@ -261,6 +283,34 @@ class OrchestrationRoutesTest(unittest.TestCase):
             ),
             "escalate",
         )
+
+    def test_review_low_risk_fallback_routes_back_to_customer(self):
+        self.assertEqual(
+            route_after_review(
+                {
+                    "status": "pending_user",
+                    "waiting_reason": "clarification",
+                    "requires_human": False,
+                    "final_answer": "",
+                }
+            ),
+            "await_user",
+        )
+        for changes in (
+            {"waiting_reason": "resolution_confirmation"},
+            {"requires_human": True},
+            {"final_answer": "未审核答复"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(IllegalRoute):
+                route_after_review(
+                    {
+                        "status": "pending_user",
+                        "waiting_reason": "clarification",
+                        "requires_human": False,
+                        "final_answer": "",
+                        **changes,
+                    }
+                )
         self.assertEqual(
             route_after_review(
                 {

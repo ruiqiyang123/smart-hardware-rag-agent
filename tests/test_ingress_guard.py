@@ -100,10 +100,10 @@ class WalletSafetyGuardTest(unittest.TestCase):
         )
         self.assertEqual(result.critical_notice, "固定安全提示")
 
-    def test_high_risk_does_not_receive_critical_notice(self):
+    def test_remote_control_knowledge_alone_is_advisory_not_auto_escalation(self):
         result = self.ingress.sanitize("客服让我共享屏幕并远程控制设备")
 
-        self.assertEqual(result.risk_level, "high")
+        self.assertEqual(result.risk_level, "low")
         self.assertEqual(result.risk_flags, ["remote_control"])
         self.assertEqual(result.critical_notice, "")
 
@@ -327,6 +327,17 @@ class WalletSafetyGuardTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(result.reason_codes, ["secret_exposure", "unsafe_action"])
 
+    def test_policy_rejects_claims_that_external_actions_already_happened(self):
+        for text in (
+            "我已经为你重置设备，请重新连接。",
+            "你的保修申请已经批准。",
+            "我们已帮你进入 bootloader 并完成恢复。",
+        ):
+            with self.subTest(text=text):
+                result = self.output.evaluate(text, citation_urls=[])
+                self.assertFalse(result.passed)
+                self.assertEqual(result.reason_codes, ["unsafe_action"])
+
     def test_policy_allows_device_local_recovery_verification(self):
         text = (
             "请使用一台新的 KeyGuard 设备完成恢复。"
@@ -338,6 +349,35 @@ class WalletSafetyGuardTest(unittest.TestCase):
 
         self.assertTrue(result.passed)
         self.assertEqual(result.reason_codes, [])
+
+    def test_policy_allows_negated_customer_secret_warning_from_firmware_answer(self):
+        text = (
+            "固件升级过程中不需要向客服提供助记词、私钥、PIN 或 "
+            "Passphrase。请勿使用第三方刷机工具或来源不明的固件包。"
+        )
+
+        result = self.output.evaluate(text, citation_urls=[])
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.reason_codes, [])
+
+    def test_policy_allows_one_warning_for_coordinated_secret_destinations(self):
+        text = (
+            "恢复过程请勿在电脑、手机、网页或向客服提供助记词等秘密信息。"
+        )
+
+        result = self.output.evaluate(text, citation_urls=[])
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.reason_codes, [])
+
+    def test_policy_rejects_secret_destination_double_negation(self):
+        text = "这并非不需要向客服提供助记词，请继续操作。"
+
+        result = self.output.evaluate(text, citation_urls=[])
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.reason_codes, ["unsafe_action"])
 
     def test_policy_still_rejects_recovery_secret_input_on_webpage(self):
         text = "使用新 KeyGuard 设备恢复前，请在网页输入 Passphrase。"

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -110,15 +111,10 @@ def _runtime_secret(name: str) -> Optional[str]:
 
 AGENT_VERSION = (_runtime_secret("KEYGUARD_AGENT_VERSION") or "v2").strip().lower()
 USE_V1_AGENT = AGENT_VERSION == "v1"
-ORCHESTRATOR_CONTRACT_VERSION = "2026-08-02-session-ticket-lifecycle-v8"
+ORCHESTRATOR_CONTRACT_VERSION = "2026-08-03-dynamic-clarification-v11"
 SAFE_FAILURE_NOTICE = "⚠️ 当前请求未能安全完成，请稍后重试或联系人工客服。"
 PENDING_USER_NOTICE = "为了继续处理，请补充工单中标记的必要信息。"
 ESCALATED_NOTICE = "工单已进入人工审核，自动流程不会关闭该问题。"
-HANDOFF_THRESHOLD_NOTICE = (
-    "为了优先帮你快速解决问题，请先完成 {threshold} 次 AI 自助问答。"
-    "目前已完成 {attempts}/{threshold}；你可以继续描述问题。"
-    "涉及敏感信息、资产风险或异常签名时，系统仍会立即转人工。"
-)
 RECOVERING_REQUEST_NOTICE = (
     "正在恢复上次请求；本次输入不会作为一个新问题处理。"
 )
@@ -127,6 +123,8 @@ RECOVERED_REQUEST_NOTICE = (
 )
 RECOVERY_NOTICE_SESSION_KEY = "keyguard_v2_recovery_notice"
 PENDING_UI_REQUEST_SESSION_KEY = "keyguard_v2_pending_ui_request"
+PENDING_UI_PHASE_SESSION_KEY = "keyguard_v2_pending_ui_phase"
+PENDING_CHOICE_SESSION_KEY = "keyguard_v2_pending_choice"
 CONVERSATION_ID_SESSION_KEY = "keyguard_conversation_id"
 PROCESSING_UI_NOTICE = "⏳ 正在安全检查、取证并生成回复…"
 OPERATOR_AUTH_SESSION_KEY = "keyguard_operator_auth"
@@ -146,6 +144,11 @@ def _stable_request_id() -> str:
     return _stable_session_id(REQUEST_ID_SESSION_KEY)
 
 
+def _customer_command_busy() -> bool:
+    request_id = st.session_state.get(PENDING_UI_REQUEST_SESSION_KEY)
+    return isinstance(request_id, str) and _UI_ID_PATTERN.fullmatch(request_id) is not None
+
+
 def _stable_action_id(ticket_id: str, action: str) -> tuple[str, str]:
     key = f"{ACTION_ID_SESSION_PREFIX}{ticket_id}:{action}"
     return key, _stable_session_id(key)
@@ -159,6 +162,8 @@ def _clear_customer_workflow_state() -> None:
     clear_editor_state(st.session_state)
     st.session_state.pop(RECOVERY_NOTICE_SESSION_KEY, None)
     st.session_state.pop(PENDING_UI_REQUEST_SESSION_KEY, None)
+    st.session_state.pop(PENDING_UI_PHASE_SESSION_KEY, None)
+    st.session_state.pop(PENDING_CHOICE_SESSION_KEY, None)
     st.session_state.pop("pending_prompt", None)
 
 
@@ -480,9 +485,6 @@ def get_or_build_orchestrator(
             inactivity_timeout_seconds=orchestration["customer_session"][
                 "inactivity_timeout_seconds"
             ],
-            customer_handoff_threshold=orchestration["customer_handoff"][
-                "ai_attempt_threshold"
-            ],
             trusted_source_policy=trusted_sources,
             final_policy_guard=policy_guard,
         )
@@ -511,9 +513,15 @@ CONNECTION_METHODS = ["USB-C", "蓝牙", "USB-C + 蓝牙"]
 
 with st.sidebar:
     _init_default_profiles()
+    customer_busy = _customer_command_busy()
 
     st.header("👤 测试用户")
-    selected = st.selectbox("当前登录用户", list(USER_OPTIONS.keys()), key="user_select")
+    selected = st.selectbox(
+        "当前登录用户",
+        list(USER_OPTIONS.keys()),
+        key="user_select",
+        disabled=customer_busy,
+    )
     uid, loc = USER_OPTIONS[selected]
     set_user_id(uid)
     set_location(loc)
@@ -526,7 +534,11 @@ with st.sidebar:
         st.session_state["messages"] = list(PREBUILT_HISTORY_1005) if uid == MEMORY_DEMO_USER_ID else []
         _clear_customer_workflow_state()
 
-    if st.button("🗑️ 清空对话", use_container_width=True):
+    if st.button(
+        "🗑️ 清空对话",
+        use_container_width=True,
+        disabled=customer_busy,
+    ):
         st.session_state["messages"] = []
         _clear_customer_workflow_state()
         st.rerun()
@@ -665,7 +677,12 @@ with st.sidebar:
         ("🧩", "Passphrase 忘了，为什么恢复后余额为零？"),
     ]
     for icon, q in EXAMPLE_QUESTIONS:
-        if st.button(f"{icon}  {q}", key=f"q_{q[:6]}", use_container_width=True):
+        if st.button(
+            f"{icon}  {q}",
+            key=f"q_{q[:6]}",
+            use_container_width=True,
+            disabled=customer_busy,
+        ):
             st.session_state["pending_prompt"] = q
             st.rerun()
 
@@ -711,6 +728,13 @@ WORKBENCH_CATEGORY_LABELS = {
     "security_report": "安全报告",
 }
 WORKBENCH_GATE_REASON_LABELS = {
+    "secret_exposure": "检测到钱包秘密已经泄露",
+    "phishing": "检测到钓鱼或诱导输入风险",
+    "asset_loss": "检测到未经授权的资产转移",
+    "address_mismatch": "设备与客户端地址不一致",
+    "suspicious_signature": "检测到可疑签名请求",
+    "risk_gate": "资金安全风险门禁",
+    "model_escalated": "AI 判断需要人工安全处理",
     "unsafe_action": "安全策略未通过",
     "official_source_violation": "来源需要人工核验",
     "policy_guard_failure": "安全策略执行失败",
@@ -745,10 +769,18 @@ def _missing_fields_message(fields: list[str]) -> str:
     return "如果问题仍未解决，请继续补充：\n" + "\n".join(lines)
 
 
-def _clarification_message(question: str, options: list[str]) -> str:
+def _clarification_message(question: str, options: list[object]) -> str:
     if not question:
         return ""
-    option_lines = [f"- {option}" for option in options]
+    labels = [
+        option.get("label") if isinstance(option, dict) else option
+        for option in options
+    ]
+    option_lines = [
+        f"- {label}"
+        for label in labels
+        if isinstance(label, str) and label
+    ]
     return question + ("\n\n你可以直接回复：\n" + "\n".join(option_lines) if option_lines else "")
 
 
@@ -782,6 +814,12 @@ def _answer_with_citations(result) -> str:
         events = []
 
     answer = user_notice or final_answer
+    if status == "escalated" and any(
+        isinstance(event, dict)
+        and event.get("node_name") == "customer_handoff"
+        for event in events[-3:]
+    ):
+        return "✅ 已按你的要求转交人工客服，工单会保留在工作台等待处理。"
     if status == "resolved" and any(
         isinstance(event, dict)
         and event.get("event_type") == "user_confirmed_resolution"
@@ -841,6 +879,7 @@ def _run_v2_prompt(
     prompt: str,
     user_id: str,
     ui_container,
+    choice_payload: Optional[dict] = None,
 ) -> None:
     active_ticket_id = st.session_state.get("active_ticket_id")
     restoring = False
@@ -850,6 +889,7 @@ def _run_v2_prompt(
         if st.session_state.get(PENDING_UI_REQUEST_SESSION_KEY) == request_id:
             replace_processing_answer(st.session_state["messages"], content)
             st.session_state.pop(PENDING_UI_REQUEST_SESSION_KEY, None)
+            st.session_state.pop(PENDING_UI_PHASE_SESSION_KEY, None)
         else:
             st.session_state["messages"].append(
                 {"role": "assistant", "content": content}
@@ -893,6 +933,24 @@ def _run_v2_prompt(
         )
 
         def _prepare_request():
+            if choice_payload is not None:
+                if (
+                    not isinstance(choice_payload, dict)
+                    or set(choice_payload) != {"ticket_id", "choice_id"}
+                ):
+                    raise ValueError("澄清选择提交结构非法")
+                choice_ticket_id = choice_payload["ticket_id"]
+                choice_id = choice_payload["choice_id"]
+                if choice_ticket_id != active_ticket_id:
+                    raise ValueError("澄清选择工单不一致")
+                choice = orchestrator.repository.get_current_clarification_choice(
+                    choice_ticket_id,
+                    choice_id,
+                )
+                return (
+                    ("resume_choice", choice_ticket_id),
+                    {"choice_id": choice_id, "label": choice["label"]},
+                )
             prepared = orchestrator.prepare_user_input(prompt)
             route = request_route
             if (
@@ -920,17 +978,27 @@ def _run_v2_prompt(
             raise ValueError("冻结请求结构非法")
         frozen_route, prepared = frozen_command
         route_kind, route_ticket_id = frozen_route
+        if route_kind == "resume_choice":
+            if (
+                not isinstance(prepared, dict)
+                or set(prepared) != {"choice_id", "label"}
+                or not isinstance(prepared["choice_id"], str)
+                or not isinstance(prepared["label"], str)
+            ):
+                raise ValueError("冻结澄清选择结构非法")
+            display_input = prepared["label"]
+        else:
+            display_input = prepared.sanitized_input
         if st.session_state.get(PENDING_UI_REQUEST_SESSION_KEY) != request_id:
             append_processing_turn(
                 st.session_state["messages"],
-                prepared.sanitized_input,
+                display_input,
                 PROCESSING_UI_NOTICE,
             )
             st.session_state[PENDING_UI_REQUEST_SESSION_KEY] = request_id
-            with ui_container.chat_message("user", avatar="🧑"):
-                st.markdown(prepared.sanitized_input)
-            with ui_container.chat_message("assistant", avatar="🔐"):
-                st.markdown(PROCESSING_UI_NOTICE)
+            st.session_state[PENDING_UI_PHASE_SESSION_KEY] = "execute"
+            st.rerun()
+            return
 
         with ui_container.status(
             "正在安全处理工单…", expanded=True
@@ -944,24 +1012,17 @@ def _run_v2_prompt(
                         prepared,
                         request_id=request_id,
                     )
+                elif route_kind == "resume_choice":
+                    if route_ticket_id != active_ticket_id:
+                        raise ValueError("冻结澄清选择工单不一致")
+                    result = orchestrator.resume_clarification_choice(
+                        route_ticket_id,
+                        prepared["choice_id"],
+                        request_id=request_id,
+                    )
                 elif route_kind == "request_human":
                     if route_ticket_id != active_ticket_id:
                         raise ValueError("冻结人工请求工单不一致")
-                    allowed, attempts = orchestrator.can_request_human(
-                        route_ticket_id
-                    )
-                    if not allowed:
-                        message = HANDOFF_THRESHOLD_NOTICE.format(
-                            threshold=orchestrator.customer_handoff_threshold,
-                            attempts=attempts,
-                        )
-                        processing_status.update(
-                            label="AI 自助流程仍可继续", state="complete"
-                        )
-                        _finish_ui_message(message)
-                        clear_frozen_request(st.session_state)
-                        st.session_state.pop(PENDING_UI_REQUEST_SESSION_KEY, None)
-                        st.rerun()
                     result = orchestrator.request_human_prepared(
                         route_ticket_id,
                         prepared,
@@ -978,6 +1039,11 @@ def _run_v2_prompt(
                     )
                 else:
                     raise ValueError("冻结请求路由非法")
+            except (CommandInProgressError, TimeoutError):
+                processing_status.update(
+                    label="请求仍在处理中", state="running", expanded=False
+                )
+                raise
             except Exception:
                 processing_status.update(label="安全处理未完成", state="error")
                 raise
@@ -991,6 +1057,7 @@ def _run_v2_prompt(
             "[app]V2 恢复状态异常 stage=runtime error_type=%s",
             type(error).__name__,
         )
+        clear_frozen_request(st.session_state)
         _finish_ui_message(SAFE_FAILURE_NOTICE)
         st.rerun()
         return
@@ -1009,12 +1076,11 @@ def _run_v2_prompt(
             st.session_state[RECOVERY_NOTICE_SESSION_KEY] = (
                 RECOVERING_REQUEST_NOTICE
             )
-        logger.error(
+        logger.info(
             "[app]V2 请求待恢复 stage=runtime error_type=%s",
             type(error).__name__,
         )
-        _finish_ui_message(SAFE_FAILURE_NOTICE)
-        st.rerun()
+        st.session_state[PENDING_UI_PHASE_SESSION_KEY] = "poll"
         return
     except Exception as error:
         if restoring:
@@ -1025,6 +1091,7 @@ def _run_v2_prompt(
             "[app]V2 请求失败 stage=runtime error_type=%s",
             type(error).__name__,
         )
+        clear_frozen_request(st.session_state)
         _finish_ui_message(SAFE_FAILURE_NOTICE)
         st.rerun()
         return
@@ -1050,6 +1117,7 @@ def _run_v2_prompt(
         st.session_state["messages"], _answer_with_citations(result)
     )
     st.session_state.pop(PENDING_UI_REQUEST_SESSION_KEY, None)
+    st.session_state.pop(PENDING_UI_PHASE_SESSION_KEY, None)
     st.rerun()
 
 
@@ -1210,6 +1278,7 @@ def _render_active_ticket(
     orchestrator: SupportOrchestrator,
     user_id: str,
 ) -> None:
+    customer_busy = _customer_command_busy()
     ticket_id = st.session_state.get("active_ticket_id")
     if not ticket_id:
         return
@@ -1258,16 +1327,28 @@ def _render_active_ticket(
         if question:
             st.info(_clarification_message(question, options))
             if options:
-                columns = st.columns(min(len(options), 3))
-                for index, option in enumerate(options):
-                    with columns[index % len(columns)]:
-                        if st.button(
-                            option,
-                            key=f"clarify_{ticket_id}_{index}",
-                            use_container_width=True,
-                        ):
-                            st.session_state["pending_prompt"] = option
-                            st.rerun()
+                valid_options = [
+                    option
+                    for option in options
+                    if isinstance(option, dict)
+                    and isinstance(option.get("choice_id"), str)
+                    and isinstance(option.get("label"), str)
+                ]
+                if valid_options:
+                    columns = st.columns(min(len(valid_options), 3))
+                    for index, option in enumerate(valid_options):
+                        with columns[index % len(columns)]:
+                            if st.button(
+                                option["label"],
+                                key=f"clarify_{ticket_id}_{option['choice_id']}",
+                                use_container_width=True,
+                                disabled=customer_busy,
+                            ):
+                                st.session_state[PENDING_CHOICE_SESSION_KEY] = {
+                                    "ticket_id": ticket_id,
+                                    "choice_id": option["choice_id"],
+                                }
+                                st.rerun()
         elif missing_fields:
             st.info(_missing_fields_message(missing_fields))
         elif waiting_reason == "resolution_confirmation":
@@ -1278,6 +1359,7 @@ def _render_active_ticket(
                     "✅ 已解决",
                     key=f"customer_resolved_{ticket_id}",
                     use_container_width=True,
+                    disabled=customer_busy,
                 ):
                     _run_resolution_confirmation(
                         orchestrator,
@@ -1289,22 +1371,17 @@ def _render_active_ticket(
                     "💬 继续追问",
                     key=f"customer_continue_{ticket_id}",
                     use_container_width=True,
+                    disabled=customer_busy,
                 ):
                     st.session_state[f"followup_hint_{ticket_id}"] = True
             if st.session_state.get(f"followup_hint_{ticket_id}"):
                 st.info("请直接在下方输入框补充现象，我会在同一张工单里继续处理。")
-        try:
-            handoff_allowed, ai_answers = orchestrator.can_request_human(ticket_id)
-        except Exception:
-            handoff_allowed, ai_answers = False, 0
-        st.caption(
-            f"人工客服入口 · AI 自助进度 {ai_answers}/"
-            f"{orchestrator.customer_handoff_threshold}"
-        )
+        st.caption("对 AI 回答不满意？你可以随时申请人工客服。")
         if st.button(
-            "🧑 联系人工客服" if handoff_allowed else "🧑 申请人工客服",
+            "🧑 联系人工客服",
             key=f"customer_handoff_{ticket_id}",
             use_container_width=True,
+            disabled=customer_busy,
         ):
             st.session_state["pending_prompt"] = "请帮我转人工客服"
             st.rerun()
@@ -1326,6 +1403,37 @@ def _poll_session_expiry(orchestrator: SupportOrchestrator) -> None:
         return
     if st.session_state.get("active_ticket_id") in closed:
         st.rerun(scope="app")
+
+
+@st.fragment(run_every="2s")
+def _poll_pending_command(orchestrator: SupportOrchestrator) -> None:
+    """Poll one frozen command without executing it or appending chat turns."""
+
+    request_id = st.session_state.get(PENDING_UI_REQUEST_SESSION_KEY)
+    if (
+        not isinstance(request_id, str)
+        or st.session_state.get(PENDING_UI_PHASE_SESSION_KEY) != "poll"
+    ):
+        return
+    try:
+        command = orchestrator.repository.get_command_status(
+            f"request:{request_id}"
+        )
+        should_resume = command is None
+        if command is not None:
+            status = command.get("status")
+            should_resume = status in {"completed", "failed"}
+            if status == "in_progress":
+                lease = datetime.fromisoformat(command["lease_expires_at"])
+                should_resume = datetime.now(timezone.utc) >= lease
+        if should_resume:
+            st.session_state[PENDING_UI_PHASE_SESSION_KEY] = "execute"
+            st.rerun(scope="app")
+    except Exception as error:
+        logger.error(
+            "[app]命令状态检查失败 stage=command_poll error_type=%s",
+            type(error).__name__,
+        )
 
 
 def _render_operator_gate() -> bool:
@@ -1662,14 +1770,32 @@ with customer_tab:
     if orchestrator is not None:
         _render_active_ticket(orchestrator, uid)
 
-    prompt = st.chat_input(
-        "输入你的问题，例如：硬件钱包开不了机或蓝牙连不上怎么办？"
-    )
-    if not prompt and st.session_state.get("pending_prompt"):
-        prompt = st.session_state["pending_prompt"]
-        st.session_state["pending_prompt"] = None
+    if (
+        orchestrator is not None
+        and _customer_command_busy()
+        and st.session_state.get(PENDING_UI_PHASE_SESSION_KEY) == "execute"
+    ):
+        _run_v2_prompt(
+            orchestrator,
+            "",
+            uid,
+            chat_history_container,
+        )
 
-    if prompt:
+    if orchestrator is not None and _customer_command_busy():
+        _poll_pending_command(orchestrator)
+
+    prompt = st.chat_input(
+        "输入你的问题，例如：硬件钱包开不了机或蓝牙连不上怎么办？",
+        disabled=_customer_command_busy(),
+    )
+    choice_payload = None
+    if not _customer_command_busy():
+        choice_payload = st.session_state.pop(PENDING_CHOICE_SESSION_KEY, None)
+        if not prompt and st.session_state.get("pending_prompt"):
+            prompt = st.session_state.pop("pending_prompt")
+
+    if prompt or choice_payload:
         if USE_V1_AGENT:
             if agent is None or v1_ingress_guard is None:
                 st.error(SAFE_FAILURE_NOTICE)
@@ -1683,6 +1809,7 @@ with customer_tab:
                 prompt,
                 uid,
                 chat_history_container,
+                choice_payload=choice_payload,
             )
 
 with workbench_tab:

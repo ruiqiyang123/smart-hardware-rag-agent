@@ -14,13 +14,17 @@ import re
 import sqlite3
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Mapping
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 from langgraph.types import interrupt
 
 from agent.orchestration.events import make_event
+from agent.orchestration.clarification import (
+    build_clarification_choices,
+    validate_clarification_choices,
+)
 from agent.orchestration.routes import (
     assert_transition,
     route_after_diagnosis,
@@ -30,6 +34,7 @@ from agent.orchestration.routes import (
     route_after_triage,
 )
 from agent.orchestration.state import (
+    ClarificationChoice,
     DiagnosisResult,
     EvidenceItem,
     MissingField,
@@ -50,9 +55,6 @@ _EXCEPTION_TYPE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}", re.ASCII)
 _MISSING_FIELDS = frozenset(item.value for item in MissingField)
 _RISK_FLAGS = frozenset(item.value for item in RiskFlag)
 _RISK_LEVELS = frozenset(item.value for item in RiskLevel)
-_MANUAL_ACTIONS = frozenset(
-    {"device_reset", "bootloader_recovery", "wallet_recovery", "warranty_decision"}
-)
 _RESUME_ACTIONS = frozenset({"approve", "edit_send", "ask_user", "reject"})
 _CONNECTION_CATEGORIES = frozenset(
     {"usb_connection", "mobile_connection", "bluetooth_connection"}
@@ -122,11 +124,8 @@ _CRITICAL_FLAGS = frozenset(
 )
 _HIGH_FLAGS = frozenset(
     {
-        RiskFlag.UNOFFICIAL_FIRMWARE.value,
         RiskFlag.ADDRESS_MISMATCH.value,
         RiskFlag.SUSPICIOUS_SIGNATURE.value,
-        RiskFlag.DEVICE_AUTH_FAILURE.value,
-        RiskFlag.REMOTE_CONTROL.value,
     }
 )
 _REVIEW_REASON_PATTERN = re.compile(r"[a-z_]{1,64}", re.ASCII)
@@ -145,6 +144,72 @@ _RISK_ORDER = {
     RiskLevel.HIGH.value: 2,
     RiskLevel.CRITICAL.value: 3,
 }
+_AUTOMATIC_ESCALATION_REASON_ORDER = (
+    RiskFlag.SECRET_EXPOSURE.value,
+    RiskFlag.PHISHING.value,
+    RiskFlag.ASSET_LOSS.value,
+    RiskFlag.ADDRESS_MISMATCH.value,
+    RiskFlag.SUSPICIOUS_SIGNATURE.value,
+)
+_TRIAGE_FALLBACK_CODE = "TRIAGE_FALLBACK_CLARIFICATION"
+_TRIAGE_FALLBACK_QUESTION = (
+    "系统暂时无法准确判断问题类型。请选择最接近的一项，我会继续为你处理："
+)
+_TRIAGE_FALLBACK_OPTIONS = [
+    {
+        "label": "设备故障（开机、屏幕或按键）",
+        "intent": "troubleshoot",
+        "category": "power",
+        "risk_level": "low",
+        "risk_flags": [],
+        "missing_fields": [],
+        "suggested_route": "diagnose",
+    },
+    {
+        "label": "连接问题（USB、蓝牙或手机）",
+        "intent": "troubleshoot",
+        "category": "mobile_connection",
+        "risk_level": "low",
+        "risk_flags": [],
+        "missing_fields": [],
+        "suggested_route": "diagnose",
+    },
+    {
+        "label": "钱包恢复或账户显示问题",
+        "intent": "recovery",
+        "category": "backup_recovery",
+        "risk_level": "medium",
+        "risk_flags": [],
+        "missing_fields": [],
+        "suggested_route": "diagnose",
+    },
+    {
+        "label": "交易未确认、失败或余额显示异常",
+        "intent": "transaction_boundary",
+        "category": "transaction_boundary",
+        "risk_level": "medium",
+        "risk_flags": [],
+        "missing_fields": [],
+        "suggested_route": "diagnose",
+    },
+    {
+        "label": "发现未经本人授权的资产转移",
+        "intent": "security_incident",
+        "category": "security_incident",
+        "risk_level": "critical",
+        "risk_flags": ["asset_loss"],
+        "missing_fields": [],
+        "suggested_route": "escalate",
+    },
+]
+_AUTOMATION_FALLBACK_QUESTION = (
+    "这次自动处理暂时没有完成。工单仍保持开启，请选择一种方式继续："
+)
+_AUTOMATION_FALLBACK_OPTIONS = [
+    "补充设备或 App 当前显示的提示",
+    "补充已经尝试过的排查步骤",
+    "换一种方式重新描述问题",
+]
 
 
 def _forbidden_control(value: str) -> bool:
@@ -332,6 +397,10 @@ def _validated_triage_update(raw: object) -> dict:
     candidate = _dependency_update(raw, _TRIAGE_FIELDS)
     result = TriageResult.model_validate(candidate).model_dump(mode="json")
     result["summary"] = _safe_text(result["summary"], "summary", 300)
+    if result["clarity"] == "ambiguous":
+        result["clarification_options"] = build_clarification_choices(
+            result["clarification_options"]
+        )
     return result
 
 
@@ -453,6 +522,154 @@ def _fail_closed(state: Mapping[str, object], node_name: str, code: str) -> dict
     )
 
 
+def _can_use_automation_fallback(state: Mapping[str, object]) -> bool:
+    risk_level = state.get("risk_level")
+    risk_flags = state.get("risk_flags")
+    requires_human = state.get("requires_human", False)
+    valid_flags = isinstance(risk_flags, list) and all(
+        isinstance(flag, str) for flag in risk_flags
+    )
+    return (
+        risk_level in {RiskLevel.LOW.value, RiskLevel.MEDIUM.value}
+        and valid_flags
+        and not set(risk_flags).intersection(
+            set(_CRITICAL_FLAGS).union(_HIGH_FLAGS)
+        )
+        and requires_human is False
+    )
+
+
+def _automatic_escalation_reason(state: Mapping[str, object]) -> str:
+    flags = state.get("risk_flags", [])
+    if not isinstance(flags, list):
+        return ""
+    present = {item for item in flags if isinstance(item, str)}
+    return next(
+        (reason for reason in _AUTOMATIC_ESCALATION_REASON_ORDER if reason in present),
+        "",
+    )
+
+
+def _triage_clarification_fallback(state: Mapping[str, object]) -> dict:
+    current = _status(state.get("status"))
+    assert_transition(current.value, Status.TRIAGED.value)
+    update = {
+        "status": Status.TRIAGED.value,
+        "waiting_reason": None,
+        "intent": "other",
+        "category": "other",
+        "priority": "P2",
+        "risk_level": state["risk_level"],
+        "risk_flags": [],
+        "clarity": "ambiguous",
+        "clarification_question": _TRIAGE_FALLBACK_QUESTION,
+        "clarification_options": build_clarification_choices(
+            _TRIAGE_FALLBACK_OPTIONS
+        ),
+        "missing_fields": [],
+        "suggested_route": "clarify",
+        "summary": "等待用户选择问题类型",
+        "outcome": "",
+        "diagnosis_summary": "",
+        "recommended_actions": [],
+        "evidence_refs": [],
+        "citations": [],
+        "remaining_unknowns": [],
+        "evidence": [],
+        "tool_errors": [],
+        "draft_answer": "",
+        "final_answer": "",
+        "review_decision": "",
+        "review_reasons": [],
+        "review_issues": [],
+        "required_changes": [],
+        "requires_human": False,
+        "manual_gate_reason": "",
+        "last_error": _TRIAGE_FALLBACK_CODE,
+    }
+    route_after_triage({**dict(state), **update})
+    return with_event(
+        state,
+        update,
+        node_name="triage",
+        event_type="triage_fallback_clarification",
+        summary="分诊结构校验失败，已进入安全澄清",
+    )
+
+
+def _automation_clarification_fallback(
+    state: Mapping[str, object],
+    *,
+    node_name: str,
+    code: str,
+) -> dict:
+    current = _status(state.get("status"))
+    assert_transition(current.value, Status.PENDING_USER.value)
+    category = state.get("category")
+    intent = state.get("intent")
+    if category not in {
+        "power", "usb_connection", "mobile_connection", "bluetooth_connection",
+        "screen_buttons", "pin_lock", "firmware_repair", "backup_recovery",
+        "device_loss_damage", "warranty_service", "transaction_boundary",
+        "security_incident", "security_report", "other",
+    }:
+        category = "other"
+    if intent not in {
+        "troubleshoot", "recovery", "warranty", "transaction_boundary",
+        "security_incident", "security_report", "other",
+    }:
+        intent = "other"
+    fallback_candidates = [
+        {
+            "label": label,
+            "intent": intent,
+            "category": category,
+            "risk_level": "low",
+            "risk_flags": [],
+            "missing_fields": [],
+            "suggested_route": "diagnose",
+        }
+        for label in _AUTOMATION_FALLBACK_OPTIONS
+    ]
+    update = {
+        "status": Status.PENDING_USER.value,
+        "waiting_reason": WaitingReason.CLARIFICATION.value,
+        "clarity": "ambiguous",
+        "clarification_question": _AUTOMATION_FALLBACK_QUESTION,
+        "clarification_options": build_clarification_choices(
+            fallback_candidates
+        ),
+        "missing_fields": [],
+        "suggested_route": "clarify",
+        "summary": "自动处理暂时未完成，等待客户补充后重试",
+        "outcome": "",
+        "diagnosis_summary": "",
+        "recommended_actions": [],
+        "evidence_refs": [],
+        "citations": [],
+        "remaining_unknowns": [],
+        "evidence": [],
+        "tool_errors": [],
+        "draft_answer": "",
+        "final_answer": "",
+        "review_decision": "",
+        "review_reasons": [],
+        "review_issues": [],
+        "required_changes": [],
+        "resolution_confirmed": False,
+        "requires_human": False,
+        "manual_gate_reason": "",
+        "last_error": code,
+    }
+    return with_event(
+        state,
+        update,
+        node_name=node_name,
+        event_type=f"{node_name}_fallback_clarification",
+        summary="低风险自动处理未完成，已保留工单等待客户继续",
+    )
+
+
 def _log_node_failure(
     state: Mapping[str, object],
     node_name: str,
@@ -506,6 +723,8 @@ def _entry(state: TicketState) -> dict:
                 "status": Status.ESCALATED.value,
                 "waiting_reason": None,
                 "requires_human": True,
+                "manual_gate_reason": _automatic_escalation_reason(state)
+                or "risk_gate",
             },
             node_name="entry",
             event_type="risk_gate",
@@ -520,13 +739,84 @@ def _entry(state: TicketState) -> dict:
     )
 
 
+def _selected_choice_triage(state: Mapping[str, object]) -> dict | None:
+    raw_choice = state.get("selected_clarification_choice")
+    if raw_choice is None:
+        return None
+    choice = ClarificationChoice.model_validate(raw_choice)
+    if choice.legacy:
+        return None
+
+    ingress_risk = state.get("risk_level")
+    ingress_flags = state.get("risk_flags", [])
+    if (
+        ingress_risk not in _RISK_LEVELS
+        or not isinstance(ingress_flags, list)
+        or any(flag not in _RISK_FLAGS for flag in ingress_flags)
+    ):
+        raise ValueError("choice 恢复入口风险非法")
+    combined_flags = list(
+        dict.fromkeys([*ingress_flags, *(flag.value for flag in choice.risk_flags)])
+    )
+    if set(combined_flags) & _CRITICAL_FLAGS:
+        flag_floor = RiskLevel.CRITICAL.value
+    elif set(combined_flags) & _HIGH_FLAGS:
+        flag_floor = RiskLevel.HIGH.value
+    else:
+        flag_floor = RiskLevel.LOW.value
+    effective_risk = max(
+        (ingress_risk, choice.risk_level.value, flag_floor),
+        key=_RISK_ORDER.__getitem__,
+    )
+    if effective_risk == RiskLevel.CRITICAL.value:
+        priority = "P0"
+        suggested_route = "escalate"
+        missing_fields: list[str] = []
+        clarity = "clear"
+    elif effective_risk == RiskLevel.HIGH.value:
+        priority = "P1"
+        suggested_route = "escalate"
+        missing_fields = []
+        clarity = "clear"
+    else:
+        priority = "P2"
+        suggested_route = choice.suggested_route
+        missing_fields = [field.value for field in choice.missing_fields]
+        clarity = "partial" if missing_fields else "clear"
+    result = TriageResult(
+        intent=choice.intent,
+        category=choice.category,
+        priority=priority,
+        risk_level=effective_risk,
+        risk_flags=combined_flags,
+        clarity=clarity,
+        clarification_question="",
+        clarification_options=[],
+        missing_fields=missing_fields,
+        suggested_route=suggested_route,
+        summary=f"用户已确认具体情况：{choice.label}",
+    ).model_dump(mode="json")
+    result["selected_clarification_choice"] = None
+    return result
+
+
 def _triage_node(dependency: Callable[[dict], object]) -> Callable[[TicketState], dict]:
     def run(state: TicketState) -> dict:
         try:
             current = _status(state.get("status"))
-            raw = _validated_triage_update(
-                dependency(copy.deepcopy(dict(state)))
-            )
+            raw = _selected_choice_triage(state)
+            if raw is None:
+                dependency_state = copy.deepcopy(dict(state))
+                selected = state.get("selected_clarification_choice")
+                if selected is not None:
+                    legacy_choice = ClarificationChoice.model_validate(selected)
+                    if not legacy_choice.legacy:
+                        raise ValueError("动态 choice 恢复状态非法")
+                    dependency_state["sanitized_input"] = (
+                        "用户从上一轮澄清选项中选择：" + legacy_choice.label
+                    )
+                raw = _validated_triage_update(dependency(dependency_state))
+                raw["selected_clarification_choice"] = None
             ingress_risk = state.get("risk_level")
             ingress_flags = state.get("risk_flags", [])
             if (
@@ -550,10 +840,21 @@ def _triage_node(dependency: Callable[[dict], object]) -> Callable[[TicketState]
                 state,
                 raw,
                 node_name="triage",
-                event_type="triage_completed",
-                summary="分诊已完成",
+                event_type=(
+                    "clarification_choice_resolved"
+                    if state.get("selected_clarification_choice") is not None
+                    else "triage_completed"
+                ),
+                summary=(
+                    "已根据客户选择确定后续路由"
+                    if state.get("selected_clarification_choice") is not None
+                    else "分诊已完成"
+                ),
             )
         except Exception as error:
+            if _can_use_automation_fallback(state):
+                _log_node_failure(state, "triage", _TRIAGE_FALLBACK_CODE, error)
+                return _triage_clarification_fallback(state)
             error_code = (
                 "TRIAGE_TIMEOUT"
                 if isinstance(error, TimeoutError)
@@ -578,7 +879,6 @@ def _start_diagnosis(state: TicketState) -> dict:
 
 def _diagnosis_node(
     dependency: Callable[[dict], object],
-    manual_actions: frozenset[str],
     trusted_sources: object | None,
 ) -> Callable[[TicketState], dict]:
     def run(state: TicketState) -> dict:
@@ -600,6 +900,12 @@ def _diagnosis_node(
                 _log_node_failure(
                     state, "diagnosis", error_code, RuntimeError(error_code)
                 )
+                if _can_use_automation_fallback(state):
+                    return _automation_clarification_fallback(
+                        state,
+                        node_name="diagnosis",
+                        code="DIAGNOSIS_FALLBACK_CLARIFICATION",
+                    )
                 failed = _fail_closed(state, "diagnosis", error_code)
                 failed["tool_errors"] = list(tool_errors)
                 return failed
@@ -614,19 +920,12 @@ def _diagnosis_node(
             target = outcomes[outcome]
             if outcome == "need_user" and raw.get("draft_answer"):
                 target = Status.REVIEWING
-            actions = raw.get("recommended_actions", [])
-            if not isinstance(actions, list):
-                raise ValueError("recommended_actions 非法")
-            action_codes = {
-                item.get("action_code")
-                for item in actions
-                if isinstance(item, Mapping) and isinstance(item.get("action_code"), str)
-            }
-            gated = sorted(action_codes & manual_actions)
-            if gated:
-                target = Status.ESCALATED
-                raw["requires_human"] = True
-                raw["manual_gate_reason"] = ",".join(gated)
+            if target == Status.ESCALATED and _can_use_automation_fallback(state):
+                return _automation_clarification_fallback(
+                    state,
+                    node_name="diagnosis",
+                    code="DIAGNOSIS_FALLBACK_CLARIFICATION",
+                )
             raw["status"] = target.value
             raw["waiting_reason"] = (
                 WaitingReason.MISSING_INFORMATION.value
@@ -650,6 +949,12 @@ def _diagnosis_node(
             _log_node_failure(
                 state, "diagnosis", "DIAGNOSIS_FAILURE", error
             )
+            if _can_use_automation_fallback(state):
+                return _automation_clarification_fallback(
+                    state,
+                    node_name="diagnosis",
+                    code="DIAGNOSIS_FALLBACK_CLARIFICATION",
+                )
             return _fail_closed(state, "diagnosis", "DIAGNOSIS_FAILURE")
 
     return run
@@ -682,6 +987,16 @@ def _review_node(dependency: Callable[[dict], object]) -> Callable[[TicketState]
             decision = raw.get("review_decision")
             if decision not in {"approve", "revise", "escalate"}:
                 raise ValueError("审核决定非法")
+            revision_count = state.get("revision_count", 0)
+            if _can_use_automation_fallback(state) and (
+                decision == "escalate"
+                or (decision == "revise" and revision_count != 0)
+            ):
+                return _automation_clarification_fallback(
+                    state,
+                    node_name="review",
+                    code="REVIEW_FALLBACK_CLARIFICATION",
+                )
             if decision == "escalate":
                 raw["manual_gate_reason"] = ",".join(
                     raw.get("review_reasons") or ["review_escalated"]
@@ -696,6 +1011,12 @@ def _review_node(dependency: Callable[[dict], object]) -> Callable[[TicketState]
             )
         except Exception as error:
             _log_node_failure(state, "review", "REVIEW_FAILURE", error)
+            if _can_use_automation_fallback(state):
+                return _automation_clarification_fallback(
+                    state,
+                    node_name="review",
+                    code="REVIEW_FALLBACK_CLARIFICATION",
+                )
             failed = _fail_closed(state, "review", "REVIEW_FAILURE")
             failed.update(
                 {
@@ -735,6 +1056,9 @@ def _escalate(state: TicketState) -> dict:
             "waiting_reason": None,
             "requires_human": True,
             "final_answer": "",
+            "manual_gate_reason": state.get("manual_gate_reason")
+            or _automatic_escalation_reason(state)
+            or "model_escalated",
         },
         node_name="escalate",
         event_type="escalated",
@@ -747,6 +1071,12 @@ def _finalize_node(policy_guard: object) -> Callable[[TicketState], dict]:
         if _status(state.get("status")) != Status.REVIEWING or not _policy_passes(
             policy_guard, state.get("draft_answer"), state.get("citations", [])
         ):
+            if _can_use_automation_fallback(state):
+                return _automation_clarification_fallback(
+                    state,
+                    node_name="finalize",
+                    code="FINALIZE_FALLBACK_CLARIFICATION",
+                )
             return _fail_closed(state, "finalize", "FINAL_POLICY_FAILURE")
         waiting_for_information = (
             state.get("outcome") == "need_user"
@@ -756,6 +1086,12 @@ def _finalize_node(policy_guard: object) -> Callable[[TicketState], dict]:
         assert_transition(Status.REVIEWING.value, target.value)
         version = state.get("response_version", 0)
         if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            if _can_use_automation_fallback(state):
+                return _automation_clarification_fallback(
+                    state,
+                    node_name="finalize",
+                    code="FINALIZE_FALLBACK_CLARIFICATION",
+                )
             return _fail_closed(state, "finalize", "FINALIZE_FAILURE")
         return with_event(
             state,
@@ -998,11 +1334,35 @@ def _await_user(state: TicketState) -> dict:
             "risk_flags",
             "risk_level",
         }
-        if not isinstance(resumed, dict) or set(resumed) != required:
+        choice_required = required | {"selected_clarification_choice"}
+        if not isinstance(resumed, dict) or frozenset(resumed) not in {
+            frozenset(required),
+            frozenset(choice_required),
+        }:
             raise ValueError("恢复载荷字段非法")
         command_id = _identifier(resumed["command_id"], "command_id")
         request_id = _identifier(resumed["request_id"], "request_id")
         sanitized_input = _safe_text(resumed["sanitized_input"], "sanitized_input", 10_000)
+        selected_choice: dict | None = None
+        if "selected_clarification_choice" in resumed:
+            if state.get("waiting_reason") != WaitingReason.CLARIFICATION.value:
+                raise ValueError("当前工单不接受澄清选择")
+            choice = ClarificationChoice.model_validate(
+                resumed["selected_clarification_choice"]
+            )
+            current_choices = validate_clarification_choices(
+                state.get("clarification_options", [])
+            )
+            matching = [
+                current
+                for current in current_choices
+                if current["choice_id"] == choice.choice_id
+            ]
+            if len(matching) != 1 or matching[0] != choice.model_dump(mode="json"):
+                raise ValueError("澄清选择已过期或不属于当前工单")
+            if sanitized_input != choice.label:
+                raise ValueError("澄清选择展示文本与服务端记录不一致")
+            selected_choice = choice.model_dump(mode="json")
         old_sensitive_flags = state.get("sensitive_flags", [])
         old_risk_flags = state.get("risk_flags", [])
         new_sensitive_flags = resumed["sensitive_flags"]
@@ -1055,6 +1415,7 @@ def _await_user(state: TicketState) -> dict:
                 "clarity": "clear",
                 "clarification_question": "",
                 "clarification_options": [],
+                "selected_clarification_choice": selected_choice,
                 "missing_fields": [],
                 "waiting_reason": None,
                 "resolution_confirmed": False,
@@ -1064,8 +1425,16 @@ def _await_user(state: TicketState) -> dict:
                 "last_error": "",
             },
             node_name="await_user",
-            event_type="user_information_received",
-            summary="已收到用户补充的脱敏信息",
+            event_type=(
+                "clarification_choice_received"
+                if selected_choice is not None
+                else "user_information_received"
+            ),
+            summary=(
+                "已收到客户选择的澄清项"
+                if selected_choice is not None
+                else "已收到用户补充的脱敏信息"
+            ),
             command_id=command_id,
             step_index=1,
         )
@@ -1086,7 +1455,6 @@ def build_support_graph(
     review_node: object | None = None,
     policy_guard: object,
     checkpointer: object,
-    manual_gate_actions: Sequence[str] = tuple(_MANUAL_ACTIONS),
     triage: object | None = None,
     diagnosis: object | None = None,
     review: object | None = None,
@@ -1111,16 +1479,6 @@ def build_support_graph(
     ):
         raise TypeError("policy_guard.trusted_sources 接口非法")
     saver = _checkpointer(checkpointer)
-    if (
-        not isinstance(manual_gate_actions, Sequence)
-        or isinstance(manual_gate_actions, (str, bytes))
-        or not manual_gate_actions
-        or any(not isinstance(item, str) or item not in _MANUAL_ACTIONS for item in manual_gate_actions)
-        or len(manual_gate_actions) != len(set(manual_gate_actions))
-    ):
-        raise ValueError("manual_gate_actions 非法")
-    manual_actions = frozenset(manual_gate_actions)
-
     builder = StateGraph(TicketState)
     builder.add_node("entry", _entry)
     builder.add_node("triage", _triage_node(triage_call))
@@ -1128,7 +1486,7 @@ def build_support_graph(
     builder.add_node("start_diagnosis", _start_diagnosis)
     builder.add_node(
         "diagnosis",
-        _diagnosis_node(diagnosis_call, manual_actions, trusted_sources),
+        _diagnosis_node(diagnosis_call, trusted_sources),
     )
     builder.add_node("review", _review_node(review_call))
     builder.add_node("revision", _revision)
@@ -1161,7 +1519,12 @@ def build_support_graph(
     builder.add_conditional_edges(
         "review",
         route_after_review,
-        {"finalize": "finalize", "revision": "revision", "escalate": "escalate"},
+        {
+            "finalize": "finalize",
+            "revision": "revision",
+            "escalate": "escalate",
+            "await_user": "await_user",
+        },
     )
     builder.add_edge("revision", "diagnosis")
     builder.add_edge("escalate", "human_review")
@@ -1281,7 +1644,6 @@ def build_configured_graph(
     timeouts = _configured_mapping(config.get("timeouts"), "timeouts")
     retries = _configured_mapping(config.get("retries"), "retries")
     required_fields = config.get("required_fields")
-    manual_actions = config.get("manual_gate_actions")
     agent_timeout = _configured_positive_number(
         timeouts.get("agent_seconds"), "timeouts.agent_seconds"
     )
@@ -1436,5 +1798,4 @@ def build_configured_graph(
         review_node=reviewer,
         policy_guard=guard,
         checkpointer=checkpointer,
-        manual_gate_actions=manual_actions,
     )

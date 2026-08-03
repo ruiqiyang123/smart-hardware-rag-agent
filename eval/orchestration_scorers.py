@@ -82,6 +82,7 @@ MISSING_FIELDS = frozenset(
 FAULTS = frozenset(
     {
         "triage_timeout",
+        "triage_validation_error",
         "rag_empty",
         "warranty_tool_exception",
         "reviewer_validation_error",
@@ -89,13 +90,20 @@ FAULTS = frozenset(
 )
 _EXPECTED_FAULT_RETRIES = {
     "triage_timeout": 1,
+    "triage_validation_error": 0,
     "rag_empty": 0,
     "warranty_tool_exception": 1,
     "reviewer_validation_error": 0,
 }
 _CASE_ID = re.compile(r"KG-EVAL-\d{3}\Z", re.ASCII)
 _FIXED_TRACE_REQUIREMENTS = {
-    "KG-EVAL-040": ("pending_user", "triaged", "diagnosing", "escalated"),
+    "KG-EVAL-040": (
+        "pending_user",
+        "triaged",
+        "diagnosing",
+        "reviewing",
+        "pending_user",
+    ),
 }
 
 

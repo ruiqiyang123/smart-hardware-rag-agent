@@ -387,6 +387,44 @@ class AgentContractTest(unittest.TestCase):
                     retries=0,
                 ).run(self._state())
 
+    def test_dynamic_candidates_are_normalized_and_not_fixed_to_known_labels(self):
+        model_result = triage_result(
+            intent="other",
+            category="other",
+            clarity="ambiguous",
+            clarification_question="  蓝牙连接具体卡在哪一步？  ",
+            clarification_options=[
+                {
+                    "label": "  手机能搜到设备但确认配对后立即断开  ",
+                    "intent": "troubleshoot",
+                    "category": "bluetooth_connection",
+                    "risk_level": "low",
+                    "risk_flags": [],
+                    "missing_fields": [],
+                    "suggested_route": "diagnose",
+                },
+                {
+                    "label": "多台手机都完全搜索不到设备",
+                    "intent": "troubleshoot",
+                    "category": "bluetooth_connection",
+                    "risk_level": "low",
+                    "risk_flags": [],
+                    "missing_fields": [],
+                    "suggested_route": "diagnose",
+                },
+            ],
+            suggested_route="clarify",
+        )
+        output = TriageAgent(
+            runner=FakeStructuredRunner(model_result), retries=0
+        ).run(self._state(sanitized_input="蓝牙好像有问题"))
+
+        self.assertEqual(output["clarification_question"], "蓝牙连接具体卡在哪一步？")
+        self.assertEqual(
+            output["clarification_options"][0]["label"],
+            "手机能搜到设备但确认配对后立即断开",
+        )
+
     def test_high_risk_and_security_incident_never_wait_for_missing_fields(self):
         cases = (
             triage_result(
@@ -511,6 +549,19 @@ class AgentContractTest(unittest.TestCase):
         self.assertEqual(
             payload["required_fields"], {"firmware_repair": ["device_model"]}
         )
+        self.assertEqual(
+            payload["triage_policy"]["definitions"]["device_loss_damage"],
+            TriageAgent(
+                runner=FakeStructuredRunner(triage_result())
+            ).triage_policy["definitions"]["device_loss_damage"],
+        )
+        self.assertIn(
+            "设备丢了或坏了，资产还能恢复吗？",
+            [
+                item["input"]
+                for item in payload["triage_policy"]["contrastive_examples"]
+            ],
+        )
         self.assertNotIn("chain_of_thought", payload)
         self.assertNotIn("reasoning", payload)
 
@@ -537,6 +588,9 @@ class AgentContractTest(unittest.TestCase):
         self.assertIn("clarity=partial、suggested_route=diagnose", agent.prompt)
         self.assertIn("我还有其他问题", agent.prompt)
         self.assertIn("不得转人工或伪造故障", agent.prompt)
+        self.assertIn("triage_policy 是风险定义", agent.prompt)
+        self.assertIn("device_loss_damage 表示物理设备丢失", agent.prompt)
+        self.assertIn("不得只根据", agent.prompt)
 
     def test_prompt_load_is_independent_of_current_working_directory(self):
         runner = FakeStructuredRunner(triage_result())
@@ -768,7 +822,6 @@ class DiagnosisContractTest(unittest.TestCase):
     def test_high_risk_human_and_security_short_circuit(self):
         cases = (
             (self._state(risk_level="high"), "escalate"),
-            (self._state(risk_flags=["remote_control"]), "escalate"),
             (self._state(requires_human=True), "escalate"),
             (self._state(category="security_report"), "escalate"),
         )
@@ -790,6 +843,21 @@ class DiagnosisContractTest(unittest.TestCase):
                 self.assertEqual(plan.calls, [])
                 self.assertEqual(answer.calls, [])
                 self.assertEqual(tool_calls, [])
+
+    def test_advisory_flags_do_not_short_circuit_diagnosis(self):
+        for flag in (
+            "unofficial_firmware",
+            "device_auth_failure",
+            "remote_control",
+        ):
+            agent = self._agent()
+            with self.subTest(flag=flag):
+                result = agent.run(
+                    self._state(risk_level="medium", risk_flags=[flag])
+                )
+                self.assertEqual(result["outcome"], "draft")
+                self.assertEqual(len(agent.plan_runner.calls), 1)
+                self.assertEqual(len(agent.answer_runner.calls), 1)
 
     def test_missing_fields_produce_evidence_backed_guidance_before_waiting(self):
         answer = self._answer(
@@ -1547,8 +1615,8 @@ class ReviewAgentContractTest(unittest.TestCase):
     def test_review_policy_allows_negated_secret_safety_reminders(self):
         state = self._state(
             draft_answer=(
-                "蓝牙排查过程中不需要输入助记词、私钥、PIN 或 Passphrase，"
-                "也不要安装任何第三方修复工具。"
+                "固件升级过程中不需要向客服提供助记词、私钥、PIN 或 "
+                "Passphrase。请勿使用第三方刷机工具或来源不明的固件包。"
             ),
             recommended_actions=[
                 {

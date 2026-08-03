@@ -1,3 +1,4 @@
+import copy
 import re
 
 import yaml
@@ -30,6 +31,142 @@ def _load_required_yaml(config_path: str) -> dict:
     if not isinstance(data, dict):
         raise TypeError(f"配置文件不是对象: {config_path}")
     return data
+
+
+_TRIAGE_POLICY_FIELDS = {
+    "policy_version",
+    "automatic_escalation",
+    "advisory_flags",
+    "definitions",
+    "clarification",
+    "contrastive_examples",
+}
+_TRIAGE_CRITICAL_FLAGS = {"secret_exposure", "phishing", "asset_loss"}
+_TRIAGE_HIGH_FLAGS = {"address_mismatch", "suspicious_signature"}
+_TRIAGE_ADVISORY_FLAGS = {
+    "unofficial_firmware",
+    "device_auth_failure",
+    "remote_control",
+}
+_TRIAGE_DEFINITION_KEYS = {
+    "device_loss_damage",
+    "asset_loss",
+    "ordinary_transaction_issue",
+    "confirmed_secret_exposure",
+}
+_TRIAGE_EXAMPLE_FIELDS = {
+    "input",
+    "category",
+    "risk_level",
+    "route",
+}
+_TRIAGE_EXAMPLE_OPTIONAL_FIELDS = {"required_flags", "forbidden_flags"}
+
+
+def _require_exact_keys(data: dict, expected: set, source: str) -> None:
+    _require_keys(data, expected, source)
+    extras = sorted(set(data).difference(expected))
+    if extras:
+        raise ValueError(f"{source} 包含未知字段: {', '.join(extras)}")
+
+
+def _require_unique_string_list(value, field: str, *, expected: set | None = None) -> list:
+    if not isinstance(value, list):
+        raise TypeError(f"{field} 必须是字符串列表")
+    if not value:
+        raise ValueError(f"{field} 不能为空")
+    for item in value:
+        _require_non_empty_string(item, field)
+    if len(value) != len(set(value)):
+        raise ValueError(f"{field} 不得包含重复项")
+    if expected is not None and set(value) != expected:
+        raise ValueError(f"{field} 必须包含固定值")
+    return list(value)
+
+
+def validate_triage_policy(data: object) -> dict:
+    if not isinstance(data, dict):
+        raise TypeError("triage_policy 必须是对象")
+    _require_exact_keys(data, _TRIAGE_POLICY_FIELDS, "triage_policy.yml")
+    _require_non_empty_string(data["policy_version"], "policy_version")
+
+    escalation = _require_dict(
+        data["automatic_escalation"], "automatic_escalation"
+    )
+    _require_exact_keys(
+        escalation,
+        {"critical_flags", "high_flags"},
+        "automatic_escalation",
+    )
+    _require_unique_string_list(
+        escalation["critical_flags"],
+        "automatic_escalation.critical_flags",
+        expected=_TRIAGE_CRITICAL_FLAGS,
+    )
+    _require_unique_string_list(
+        escalation["high_flags"],
+        "automatic_escalation.high_flags",
+        expected=_TRIAGE_HIGH_FLAGS,
+    )
+    _require_unique_string_list(
+        data["advisory_flags"],
+        "advisory_flags",
+        expected=_TRIAGE_ADVISORY_FLAGS,
+    )
+
+    definitions = _require_dict(data["definitions"], "definitions")
+    _require_exact_keys(definitions, _TRIAGE_DEFINITION_KEYS, "definitions")
+    for key, value in definitions.items():
+        _require_non_empty_string(value, f"definitions.{key}")
+
+    clarification = _require_dict(data["clarification"], "clarification")
+    _require_exact_keys(
+        clarification,
+        {"mode", "min_options", "max_options", "requirements"},
+        "clarification",
+    )
+    if clarification["mode"] != "dynamic_contextual":
+        raise ValueError("clarification.mode 必须是 dynamic_contextual")
+    if (
+        type(clarification["min_options"]) is not int
+        or type(clarification["max_options"]) is not int
+        or clarification["min_options"] != 2
+        or clarification["max_options"] != 5
+    ):
+        raise ValueError("clarification 选项数量必须是 2-5")
+    requirements = _require_unique_string_list(
+        clarification["requirements"], "clarification.requirements"
+    )
+    if len(requirements) < 3:
+        raise ValueError("clarification.requirements 至少包含 3 条规则")
+
+    examples = data["contrastive_examples"]
+    if not isinstance(examples, list):
+        raise TypeError("contrastive_examples 必须是对象列表")
+    if len(examples) < 4:
+        raise ValueError("contrastive_examples 至少包含 4 个案例")
+    for index, example in enumerate(examples):
+        field = f"contrastive_examples[{index}]"
+        if not isinstance(example, dict):
+            raise TypeError(f"{field} 必须是对象")
+        keys = set(example)
+        if not _TRIAGE_EXAMPLE_FIELDS.issubset(keys) or not keys.issubset(
+            _TRIAGE_EXAMPLE_FIELDS | _TRIAGE_EXAMPLE_OPTIONAL_FIELDS
+        ):
+            raise ValueError(f"{field} 字段非法")
+        for key in _TRIAGE_EXAMPLE_FIELDS:
+            _require_non_empty_string(example[key], f"{field}.{key}")
+        for key in _TRIAGE_EXAMPLE_OPTIONAL_FIELDS.intersection(example):
+            _require_unique_string_list(example[key], f"{field}.{key}")
+        if not _TRIAGE_EXAMPLE_OPTIONAL_FIELDS.intersection(example):
+            raise ValueError(f"{field} 必须声明 required_flags 或 forbidden_flags")
+    return copy.deepcopy(data)
+
+
+def load_triage_policy(
+    config_path: str = get_abs_path("config/triage_policy.yml"),
+) -> dict:
+    return validate_triage_policy(_load_required_yaml(config_path))
 
 
 def _require_keys(data: dict, keys: set, source: str) -> None:
@@ -77,16 +214,14 @@ _FIXED_REQUIRED_FIELDS = {
     "warranty_service": ["serial_last4"],
     "transaction_boundary": ["transaction_hash", "chain_name"],
 }
-_FIXED_MANUAL_GATE_ACTIONS = {
-    "device_reset",
-    "bootloader_recovery",
-    "warranty_decision",
-}
 _FIXED_CUSTOMER_SESSION = {
     "inactivity_timeout_seconds": 1800,
     "expiry_poll_seconds": 30,
 }
-_FIXED_CUSTOMER_HANDOFF = {"ai_attempt_threshold": 3}
+_REMOVED_ORCHESTRATION_SECTIONS = {
+    "customer_handoff",
+    "manual_gate_actions",
+}
 
 
 def load_orchestration_config(
@@ -101,12 +236,15 @@ def load_orchestration_config(
             "recursion_limit",
             "command_lease_seconds",
             "customer_session",
-            "customer_handoff",
             "required_fields",
-            "manual_gate_actions",
         },
         "orchestration.yml",
     )
+    legacy_sections = sorted(_REMOVED_ORCHESTRATION_SECTIONS.intersection(data))
+    if legacy_sections:
+        raise ValueError(
+            "orchestration.yml 包含已移除字段: " + ", ".join(legacy_sections)
+        )
 
     timeouts = _require_dict(data["timeouts"], "timeouts")
     timeout_keys = set(_FIXED_TIMEOUTS)
@@ -150,17 +288,6 @@ def load_orchestration_config(
         if customer_session[key] != expected:
             raise ValueError(f"customer_session.{key} 必须为 {expected}")
 
-    customer_handoff = _require_dict(data["customer_handoff"], "customer_handoff")
-    _require_keys(
-        customer_handoff,
-        set(_FIXED_CUSTOMER_HANDOFF),
-        "customer_handoff",
-    )
-    for key, expected in _FIXED_CUSTOMER_HANDOFF.items():
-        _require_integer(customer_handoff[key], f"customer_handoff.{key}", minimum=1)
-        if customer_handoff[key] != expected:
-            raise ValueError(f"customer_handoff.{key} 必须为 {expected}")
-
     required_fields = _require_dict(data["required_fields"], "required_fields")
     if not required_fields:
         raise ValueError("required_fields 不能为空")
@@ -181,17 +308,6 @@ def load_orchestration_config(
         if set(fields) != set(expected_fields):
             raise ValueError(f"required_fields.{intent} 必须包含固定字段")
 
-    manual_actions = data["manual_gate_actions"]
-    if not isinstance(manual_actions, list):
-        raise TypeError("manual_gate_actions 必须是字符串列表")
-    if not manual_actions:
-        raise ValueError("manual_gate_actions 不能为空")
-    for action in manual_actions:
-        _require_non_empty_string(action, "manual_gate_actions 的动作")
-    if len(manual_actions) != len(set(manual_actions)):
-        raise ValueError("manual_gate_actions 不得包含重复动作")
-    if set(manual_actions) != _FIXED_MANUAL_GATE_ACTIONS:
-        raise ValueError("manual_gate_actions 必须包含且仅包含固定动作")
     return data
 
 

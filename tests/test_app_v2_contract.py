@@ -160,7 +160,7 @@ class AppV2ContractTest(unittest.TestCase):
         source = self.function_source("get_or_build_orchestrator")
 
         self.assertIn(
-            'ORCHESTRATOR_CONTRACT_VERSION = "2026-08-02-session-ticket-lifecycle-v8"',
+            'ORCHESTRATOR_CONTRACT_VERSION = "2026-08-03-dynamic-clarification-v11"',
             self.source,
         )
         self.assertIn("contract_version: str", source)
@@ -236,11 +236,12 @@ class AppV2ContractTest(unittest.TestCase):
         submit = self.function_source("_run_v2_prompt")
         action = self.function_source("_run_human_action")
         self.assertIn("_stable_request_id()", submit)
-        self.assertEqual(submit.count("request_id=request_id"), 3)
+        self.assertEqual(submit.count("request_id=request_id"), 4)
         self.assertIn("get_or_freeze_request_command(", submit)
         self.assertIn("orchestrator.prepare_user_input(prompt)", submit)
         self.assertIn("orchestrator.submit_prepared(", submit)
         self.assertIn("orchestrator.resume_user_prepared(", submit)
+        self.assertIn("orchestrator.resume_clarification_choice(", submit)
         self.assertIn("safe_history=safe_history", submit)
         self.assertIn("clear_frozen_request(st.session_state)", submit)
         self.assertIn("CommandInProgressError", submit)
@@ -259,7 +260,7 @@ class AppV2ContractTest(unittest.TestCase):
         action_conflict_handler = action.split(
             "except IdempotencyConflictError", 1
         )[1].split("except", 1)[0]
-        self.assertNotIn("clear_frozen_request", conflict_handler)
+        self.assertIn("clear_frozen_request", conflict_handler)
         self.assertNotIn("clear_frozen_action", action_conflict_handler)
         self.assertIn("RECOVERING_REQUEST_NOTICE", submit)
         self.assertIn("RECOVERED_REQUEST_NOTICE", submit)
@@ -358,11 +359,47 @@ class AppV2ContractTest(unittest.TestCase):
         self.assertIn("append_processing_turn", submit)
         self.assertIn("replace_processing_answer", submit)
         self.assertIn("PENDING_UI_REQUEST_SESSION_KEY", submit)
-        self.assertIn('ui_container.chat_message("user"', submit)
-        self.assertIn('ui_container.chat_message("assistant"', submit)
+        self.assertIn('PENDING_UI_PHASE_SESSION_KEY] = "execute"', submit)
+        enqueue = submit.split(
+            "if st.session_state.get(PENDING_UI_REQUEST_SESSION_KEY) != request_id:",
+            1,
+        )[1].split("with ui_container.status", 1)[0]
+        self.assertIn("st.rerun()", enqueue)
         self.assertIn("ui_container.status(", submit)
         self.assertIn("project_customer_phases", render)
         self.assertIn("project_workbench_events", self.function_source("_render_workbench"))
+
+    def test_in_progress_keeps_placeholder_and_uses_read_only_poller(self):
+        submit = self.function_source("_run_v2_prompt")
+        poller = self.function_source("_poll_pending_command")
+        handler = submit.split(
+            "except (CommandInProgressError, TimeoutError) as error:", 1
+        )[1].split("except", 1)[0]
+
+        self.assertIn('PENDING_UI_PHASE_SESSION_KEY] = "poll"', handler)
+        self.assertNotIn("_finish_ui_message", handler)
+        self.assertNotIn("SAFE_FAILURE_NOTICE", handler)
+        self.assertIn("get_command_status", poller)
+        self.assertIn('run_every="2s"', self.source)
+        self.assertNotIn("resume_user", poller)
+
+    def test_dynamic_choice_buttons_submit_only_ticket_and_choice_ids(self):
+        render = self.function_source("_render_active_ticket")
+        submit = self.function_source("_run_v2_prompt")
+
+        self.assertIn('option["choice_id"]', render)
+        self.assertIn('option["label"]', render)
+        self.assertIn('"ticket_id": ticket_id', render)
+        self.assertIn('"choice_id": option["choice_id"]', render)
+        self.assertIn("get_current_clarification_choice", submit)
+        self.assertIn("resume_clarification_choice", submit)
+        self.assertNotIn('st.session_state["pending_prompt"] = option', render)
+
+    def test_customer_command_controls_are_disabled_while_busy(self):
+        render = self.function_source("_render_active_ticket")
+        self.assertGreaterEqual(render.count("disabled=customer_busy"), 4)
+        self.assertIn("disabled=_customer_command_busy()", self.source)
+        self.assertIn("disabled=customer_busy", self.source)
 
     def test_configured_graph_rejects_mismatched_policy_identity(self):
         from agent.orchestration.graph import build_configured_graph
