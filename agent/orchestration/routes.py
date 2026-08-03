@@ -242,6 +242,16 @@ def route_after_diagnosis(state: object) -> str:
 def route_after_review(state: object) -> str:
     values = _state_mapping(state)
     status = _status(values["status"]) if "status" in values else None
+    if status == Status.PENDING_USER:
+        waiting_reason = values.get("waiting_reason")
+        requires_human = _required(values, "requires_human")
+        if (
+            waiting_reason != "clarification"
+            or requires_human is not False
+            or values.get("final_answer") not in {None, ""}
+        ):
+            raise IllegalRoute("审核降级状态非法")
+        return "await_user"
     if status not in {None, Status.REVIEWING, Status.ESCALATED}:
         raise IllegalRoute("审核后的状态非法")
     decision = _required(values, "review_decision")

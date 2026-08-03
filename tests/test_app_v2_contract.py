@@ -160,7 +160,7 @@ class AppV2ContractTest(unittest.TestCase):
         source = self.function_source("get_or_build_orchestrator")
 
         self.assertIn(
-            'ORCHESTRATOR_CONTRACT_VERSION = "2026-08-02-customer-directed-handoff-v9"',
+            'ORCHESTRATOR_CONTRACT_VERSION = "2026-08-03-low-risk-fallback-v10"',
             self.source,
         )
         self.assertIn("contract_version: str", source)

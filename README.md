@@ -49,7 +49,7 @@ KeyGuard 使用虚构硬件钱包品牌和模拟业务数据，演示蓝牙连�
 | 问题含糊或信息不完整 | 要么猜测，要么只让用户补充 | 含糊时给选项澄清；意图明确时先给基础建议，再精准追问 |
 | 敏感信息进入历史 | 只在最终回答中隐藏 | Ingress Guard 在持久化之前脱敏 |
 | 资金安全事件被当成普通故障 | 只按关键词自由回答 | 明确资产被盗、秘密泄露或可疑签名时进入 `escalated` |
-| Agent 反复返工 | 没有独立循环边界 | Review 最多退回一次，再失败转人工 |
+| Agent 反复返工 | 没有独立循环边界 | Review 最多退回一次；低风险失败保留工单并引导补充，高风险才转人工 |
 | 中断后重新开始 | 对话状态只在内存中 | 工单数据库与 checkpoint 分离持久化 |
 | 工具事实被自由改写 | 工具结果直接混进模型上下文 | Tool 返回事实，Review 检查证据和引用 |
 
@@ -80,15 +80,18 @@ flowchart LR
     D <--> TOOLS["只读 Tools<br/>RAG / 档案 / 保修 / 链状态"]
     D --> R2{"确定性 Diagnosis Router"}
     R2 -->|只能先澄清| PU
-    R2 -->|资金安全风险或诊断失败| ES
+    R2 -->|低风险诊断未完成| PU
+    R2 -->|明确资金安全风险| ES
     R2 -->|完整答复或基础建议| RV["Review Agent<br/>证据、安全、可执行性"]
     RV --> R3{"确定性 Review Router"}
     R3 -->|一次返工| D
-    R3 -->|升级人工| ES
+    R3 -->|低风险复核未完成| PU
+    R3 -->|明确资金安全风险| ES
     R3 -->|审查通过| PG["Policy Guard<br/>最终确定性校验"]
     PG -->|完整答复通过| PU
     PG -->|基础建议通过| PU
-    PG -->|阻断| ES
+    PG -->|低风险阻断，不发送草稿| PU
+    PG -->|高风险阻断| ES
     PU -->|补充非敏感信息| T
     PU -->|客户主动申请人工| ES
     PU -->|客户确认已解决| OK["resolved"]
@@ -112,11 +115,11 @@ stateDiagram-v2
     triaged --> escalated: 高风险
     diagnosing --> pending_user: 仍需补充
     diagnosing --> reviewing: 形成证据方案
-    diagnosing --> escalated: 资金安全风险或诊断失败
+    diagnosing --> escalated: 明确资金安全风险
     reviewing --> diagnosing: 返工（最多一次）
     reviewing --> pending_user: 建议已复核，等待用户补充
     reviewing --> resolved: 受控终态兼容路径
-    reviewing --> escalated: 复核或策略阻断
+    reviewing --> escalated: 明确资金安全风险
     pending_user --> triaged: 用户补充
     pending_user --> resolved: 客户明确确认已解决
     pending_user --> closed: 30 分钟没有继续提问
@@ -181,7 +184,7 @@ Agent 负责理解和生成，Tool 负责返回窄接口事实。可用工具包
 |---|---|---|
 | 诊断证据、草稿、策略上下文 | `approve`、`revise` 或 `escalate`，以及原因码 | 不直接修改工单状态，不无限返工 |
 
-Review 只能退回 Diagnosis 一次。第二次仍不满足要求时，确定性路由会把工单交给人工。
+Review 只能退回 Diagnosis 一次。第二次仍不满足要求时，确定性路由会根据风险分层处理：普通设备故障保留原工单并请用户补充或重新描述；只有命中明确资金安全风险时才自动进入人工队列。未通过审核的草稿不会发送给用户。
 
 ---
 
@@ -196,6 +199,8 @@ Router 不需要语言创造力。它只根据结构化字段和固定规则选�
 ```python
 def route_after_review(state: object) -> str:
     values = _state_mapping(state)
+    if values.get("status") == "pending_user":
+        return "await_user"  # 低风险自动流程未完成，保留工单等待补充
     decision = _required(values, "review_decision")
     revision_count = _required(values, "revision_count")
 
@@ -205,7 +210,7 @@ def route_after_review(state: object) -> str:
         return "finalize"
     if decision == "revise" and revision_count == 0:
         return "revision"
-    return "escalate"
+    return "escalate"  # 图节点只让明确高风险状态走到这里
 ```
 
 > 💡 **小白解读**：Agent 像负责判断和写方案的同事；Router 像只能按制度流转工单的流程引擎。这样模型负责它擅长的理解与生成，代码负责状态、安全和副作用。
@@ -248,7 +253,7 @@ class SanitizedText:
 - **有限重试与超时**：模型失败后执行受限重试，并返回清理过的错误；
 - **命令租约与幂等键**：减少重复恢复命令造成的双重执行；
 - **双数据库隔离**：工单和 checkpoint 必须使用不同 SQLite 文件；
-- **分层失败策略**：低风险 Triage 结构失败先进入固定澄清；Diagnosis、Tool、Review 与 Policy Guard 失败仍 fail closed；缺少所选模型 Key 时不会借用其他 Provider Key；求职 Demo 未配置操作员令牌时工作台默认开放，配置令牌后自动启用保护模式。
+- **分层失败策略**：低风险 Triage、Diagnosis、Tool、Review 或 Policy Guard 未完成时，不发送未经审核的草稿，也不占用人工队列；原工单保持开启并给出可执行的补充选项。明确资金安全风险仍 fail closed 到人工；缺少所选模型 Key 时不会借用其他 Provider Key；求职 Demo 未配置操作员令牌时工作台默认开放，配置令牌后自动启用保护模式。
 
 ### Human-in-the-loop 不是一句提示
 
@@ -362,10 +367,10 @@ streamlit run app.py
 pytest -q
 ```
 
-当前发布基线（2026-08-02）：
+当前发布基线（2026-08-03）：
 
-- **479 个测试通过**；
-- **653 个参数化子测试通过**；
+- **492 个测试通过**；
+- **658 个参数化子测试通过**；
 - 覆盖状态转移、路由、DeepSeek 结构化输出兼容、安全脱敏、证据、持久化、恢复、Human-in-the-loop 和故障注入。
 
 ### 48 条离线评测
@@ -446,7 +451,7 @@ ai-hardware-cs-agent/
 
 ### Q5：Review Agent 会不会造成无限循环？
 
-不会。`revision_count == 0` 时允许一次返工；之后仍是 `revise` 或出现高风险就进入 `escalated`。
+不会。`revision_count == 0` 时只允许一次返工；之后仍是 `revise` 时，低风险工单进入 `pending_user` 等待补充，明确高风险工单才进入 `escalated`。
 
 ### Q6：Human-in-the-loop 如何恢复？
 
@@ -489,6 +494,7 @@ KeyGuard 2.0｜多 Agent 硬件钱包售后工单系统｜个人项目
 - Streamlit Cloud 文件系统是易失环境，SQLite、checkpoint 和向量缓存可能在重启或重新部署后丢失；
 - `KEYGUARD_OPERATOR_TOKEN` 是可选的 Demo 级共享令牌，不具备企业级身份、权限分层和轮换；
 - 低风险问题会自动回复但保持开启；客户可在同一工单继续追问，只有点击“已解决”或明确表达问题已解决时才结案；
+- DeepSeek、工具或复核偶发失败时，低风险工单会提示补充信息或换一种描述后继续，不会因为模型输出波动自动挤入人工队列；
 - 外部保修和链状态工具均为模拟实现，没有连接厂商售后、真实 RPC 或资产操作接口；
 - V2 评测框架已经就绪，但仓库不预填未经真实 runner 执行的准确率、成本下降或 SLA。
 

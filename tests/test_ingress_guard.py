@@ -350,6 +350,35 @@ class WalletSafetyGuardTest(unittest.TestCase):
         self.assertTrue(result.passed)
         self.assertEqual(result.reason_codes, [])
 
+    def test_policy_allows_negated_customer_secret_warning_from_firmware_answer(self):
+        text = (
+            "固件升级过程中不需要向客服提供助记词、私钥、PIN 或 "
+            "Passphrase。请勿使用第三方刷机工具或来源不明的固件包。"
+        )
+
+        result = self.output.evaluate(text, citation_urls=[])
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.reason_codes, [])
+
+    def test_policy_allows_one_warning_for_coordinated_secret_destinations(self):
+        text = (
+            "恢复过程请勿在电脑、手机、网页或向客服提供助记词等秘密信息。"
+        )
+
+        result = self.output.evaluate(text, citation_urls=[])
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.reason_codes, [])
+
+    def test_policy_rejects_secret_destination_double_negation(self):
+        text = "这并非不需要向客服提供助记词，请继续操作。"
+
+        result = self.output.evaluate(text, citation_urls=[])
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.reason_codes, ["unsafe_action"])
+
     def test_policy_still_rejects_recovery_secret_input_on_webpage(self):
         text = "使用新 KeyGuard 设备恢复前，请在网页输入 Passphrase。"
 

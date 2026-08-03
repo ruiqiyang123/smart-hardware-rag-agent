@@ -249,11 +249,13 @@ class DemoReadinessTest(unittest.TestCase):
             'R2 -->|只能先澄清| PU',
             'RV --> R3{"确定性 Review Router"}',
             'R3 -->|一次返工| D',
-            'R3 -->|升级人工| ES',
+            'R3 -->|低风险复核未完成| PU',
+            'R3 -->|明确资金安全风险| ES',
             'R3 -->|审查通过| PG',
             'PG -->|完整答复通过| PU',
             'PG -->|基础建议通过| PU',
-            'PG -->|阻断| ES',
+            'PG -->|低风险阻断，不发送草稿| PU',
+            'PG -->|高风险阻断| ES',
             'PU -->|客户确认已解决| OK',
         ):
             self.assertIn(edge, readme)

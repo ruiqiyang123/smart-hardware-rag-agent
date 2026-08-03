@@ -1577,8 +1577,8 @@ class ReviewAgentContractTest(unittest.TestCase):
     def test_review_policy_allows_negated_secret_safety_reminders(self):
         state = self._state(
             draft_answer=(
-                "蓝牙排查过程中不需要输入助记词、私钥、PIN 或 Passphrase，"
-                "也不要安装任何第三方修复工具。"
+                "固件升级过程中不需要向客服提供助记词、私钥、PIN 或 "
+                "Passphrase。请勿使用第三方刷机工具或来源不明的固件包。"
             ),
             recommended_actions=[
                 {

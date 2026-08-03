@@ -82,10 +82,23 @@ _HIGH_FLAGS = frozenset(
 )
 
 _UNSAFE_SECRET_DESTINATION_PATTERN = re.compile(
-    r"(?<!不要)(?<!请勿)(?<!别)(?<!不)(?:在|向)"
-    r"(?:任何)?(?:电脑|手机|网页|网站|客服)"
+    r"(?:在|向)(?:任何)?(?:电脑|手机|网页|网站|客服)"
     r".{0,16}(?:输入|提供|发送|上传)"
     r".{0,12}(?:助记词|私钥|PIN|Passphrase|密码|seed\s+phrase|private\s+key)",
+    re.IGNORECASE,
+)
+_SAFE_SECRET_WARNING_TOKEN = re.compile(
+    r"(?:不要|请勿|切勿|严禁|不得|不能|无需|无须|不需要|不必|没必要|避免)",
+    re.IGNORECASE,
+)
+_DOUBLE_NEGATION_PREFIX = re.compile(
+    r"(?:不是|并非|不要以为|别以为)\s*"
+    r"(?:不要|请勿|切勿|严禁|不得|不能|无需|无须|不需要|不必|没必要|避免)",
+    re.IGNORECASE,
+)
+_SAFE_SECRET_DESTINATION_BRIDGE = re.compile(
+    r"(?:(?:在|向)?(?:任何)?(?:电脑|手机|网页|网站|客服)"
+    r"(?:[、,，]|或|以及|和|及|与|\s)*)*\Z",
     re.IGNORECASE,
 )
 
@@ -154,8 +167,25 @@ def _safe_device_recovery_secret_input(text: str, match: re.Match) -> bool:
     return True
 
 
+def _safe_secret_destination_warning(text: str, match: re.Match) -> bool:
+    """Allow explicit safety warnings while rejecting secret solicitation."""
+
+    prefix = text[max(0, match.start() - 64) : match.start()]
+    if _DOUBLE_NEGATION_PREFIX.search(prefix):
+        return False
+    warnings = list(_SAFE_SECRET_WARNING_TOKEN.finditer(prefix))
+    if not warnings:
+        return False
+    bridge = prefix[warnings[-1].end() :]
+    return _SAFE_SECRET_DESTINATION_BRIDGE.fullmatch(bridge) is not None
+
+
 def _contains_unsafe_action(text: str) -> bool:
-    if _UNSAFE_SECRET_DESTINATION_PATTERN.search(text):
+    destination_matches = _UNSAFE_SECRET_DESTINATION_PATTERN.finditer(text)
+    if any(
+        not _safe_secret_destination_warning(text, match)
+        for match in destination_matches
+    ):
         return True
     for index, pattern in enumerate(_UNSAFE_ACTION_PATTERNS):
         matches = list(pattern.finditer(text))

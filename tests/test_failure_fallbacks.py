@@ -176,12 +176,16 @@ class FailureFallbackTest(unittest.TestCase):
 
     def test_reviewer_failure_never_persists_final_answer(self):
         result = run_fault_case("reviewer_validation_error")
-        self.assertEqual(result.status, "escalated")
+        self.assertEqual(result.status, "pending_user")
+        self.assertEqual(result.waiting_reason, "clarification")
+        self.assertFalse(result.requires_human)
         self.assertEqual(result.final_answer, "")
 
-    def test_rag_no_evidence_escalates(self):
+    def test_rag_no_evidence_keeps_low_risk_ticket_open(self):
         result = run_fault_case("rag_empty")
-        self.assertEqual(result.status, "escalated")
+        self.assertEqual(result.status, "pending_user")
+        self.assertEqual(result.waiting_reason, "clarification")
+        self.assertFalse(result.requires_human)
 
     def test_reviewed_partial_guidance_is_persisted_and_returned_while_waiting(self):
         def partial_result(graph_input, _config):

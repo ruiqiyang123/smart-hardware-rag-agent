@@ -531,7 +531,7 @@ class HumanInLoopTest(unittest.TestCase):
         self.assertEqual(diagnosis_states[1]["review_reasons"], ["incomplete_steps"])
         self.assertEqual(diagnosis_states[1]["required_changes"], ["补充重连步骤"])
 
-    def test_review_exception_and_final_policy_veto_fail_closed(self):
+    def test_low_risk_review_exception_and_final_policy_veto_keep_ticket_open(self):
         def broken_review(_state):
             raise RuntimeError("provider leaked internal details")
 
@@ -547,8 +547,10 @@ class HumanInLoopTest(unittest.TestCase):
             _initial_state(),
             {"configurable": {"thread_id": "review-failure"}},
         )
-        self.assertEqual(broken["status"], "escalated")
-        self.assertEqual(broken["last_error"], "REVIEW_FAILURE")
+        self.assertEqual(broken["status"], "pending_user")
+        self.assertEqual(broken["waiting_reason"], "clarification")
+        self.assertEqual(broken["last_error"], "REVIEW_FALLBACK_CLARIFICATION")
+        self.assertFalse(broken["requires_human"])
         self.assertEqual(broken.get("final_answer", ""), "")
         self.assertNotIn("provider leaked", str(broken))
 
@@ -556,8 +558,10 @@ class HumanInLoopTest(unittest.TestCase):
             _initial_state(),
             {"configurable": {"thread_id": "policy-veto"}},
         )
-        self.assertEqual(vetoed["status"], "escalated")
-        self.assertEqual(vetoed["last_error"], "FINAL_POLICY_FAILURE")
+        self.assertEqual(vetoed["status"], "pending_user")
+        self.assertEqual(vetoed["waiting_reason"], "clarification")
+        self.assertEqual(vetoed["last_error"], "FINALIZE_FALLBACK_CLARIFICATION")
+        self.assertFalse(vetoed["requires_human"])
         self.assertEqual(vetoed.get("final_answer", ""), "")
         self.assertIn("__interrupt__", vetoed)
 
@@ -577,8 +581,11 @@ class HumanInLoopTest(unittest.TestCase):
             _initial_state(),
             {"configurable": {"thread_id": "triage-timeout"}},
         )
-        self.assertEqual(triage_timeout["status"], "escalated")
-        self.assertEqual(triage_timeout["last_error"], "TRIAGE_TIMEOUT")
+        self.assertEqual(triage_timeout["status"], "pending_user")
+        self.assertEqual(
+            triage_timeout["last_error"], "TRIAGE_FALLBACK_CLARIFICATION"
+        )
+        self.assertFalse(triage_timeout["requires_human"])
         self.assertEqual(triage_timeout.get("final_answer", ""), "")
         self.assertNotIn("private provider", str(triage_timeout))
 
@@ -608,8 +615,11 @@ class HumanInLoopTest(unittest.TestCase):
                     _initial_state(),
                     {"configurable": {"thread_id": name}},
                 )
-                self.assertEqual(failed["status"], "escalated")
-                self.assertEqual(failed["last_error"], error_code)
+                self.assertEqual(failed["status"], "pending_user")
+                self.assertEqual(
+                    failed["last_error"], "DIAGNOSIS_FALLBACK_CLARIFICATION"
+                )
+                self.assertFalse(failed["requires_human"])
                 self.assertEqual(failed.get("final_answer", ""), "")
 
     def test_sqlite_checkpoint_recovers_interrupt_after_rebuild(self):
@@ -895,7 +905,7 @@ class HumanInLoopTest(unittest.TestCase):
         self.assertEqual(len(fallback_events), 1)
         self.assertNotIn("provider raw output", str(result))
 
-    def test_triage_failure_with_sticky_flag_still_fails_closed(self):
+    def test_triage_failure_with_advisory_flag_keeps_ticket_open(self):
 
         dropped = self._graph().invoke(
             _initial_state(
@@ -903,8 +913,24 @@ class HumanInLoopTest(unittest.TestCase):
             ),
             {"configurable": {"thread_id": "flag-drop"}},
         )
-        self.assertEqual(dropped["status"], "escalated")
-        self.assertEqual(dropped["last_error"], "TRIAGE_FAILURE")
+        self.assertEqual(dropped["status"], "pending_user")
+        self.assertEqual(
+            dropped["last_error"], "TRIAGE_FALLBACK_CLARIFICATION"
+        )
+        self.assertFalse(dropped["requires_human"])
+
+    def test_triage_failure_with_automatic_risk_still_fails_closed(self):
+        escalated = self._graph().invoke(
+            _initial_state(
+                risk_level="critical",
+                risk_flags=["asset_loss"],
+                requires_human=True,
+            ),
+            {"configurable": {"thread_id": "critical-flag-fail-closed"}},
+        )
+
+        self.assertEqual(escalated["status"], "escalated")
+        self.assertTrue(escalated["requires_human"])
 
     def test_untrusted_unreferenced_evidence_is_not_checkpointed(self):
         malicious = _diagnosis(None)
@@ -930,8 +956,13 @@ class HumanInLoopTest(unittest.TestCase):
             {"configurable": {"thread_id": "untrusted-evidence"}},
         )
 
-        self.assertEqual(result["status"], "escalated")
-        self.assertEqual(result["last_error"], "DIAGNOSIS_FAILURE")
+        self.assertEqual(result["status"], "pending_user")
+        self.assertEqual(
+            result["last_error"], "DIAGNOSIS_FALLBACK_CLARIFICATION"
+        )
+        self.assertFalse(result["requires_human"])
+        self.assertEqual(result["evidence"], [])
+        self.assertEqual(result["citations"], [])
         self.assertNotIn("evil.example", str(result))
 
     def test_configured_timeout_rejects_nan_and_infinity(self):

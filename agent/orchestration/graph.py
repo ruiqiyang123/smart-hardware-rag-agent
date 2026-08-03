@@ -157,6 +157,14 @@ _TRIAGE_FALLBACK_OPTIONS = [
     "交易未确认、失败或余额显示异常",
     "发现未经本人授权的资产转移",
 ]
+_AUTOMATION_FALLBACK_QUESTION = (
+    "这次自动处理暂时没有完成。工单仍保持开启，请选择一种方式继续："
+)
+_AUTOMATION_FALLBACK_OPTIONS = [
+    "补充设备或 App 当前显示的提示",
+    "补充已经尝试过的排查步骤",
+    "换一种方式重新描述问题",
+]
 
 
 def _forbidden_control(value: str) -> bool:
@@ -465,14 +473,19 @@ def _fail_closed(state: Mapping[str, object], node_name: str, code: str) -> dict
     )
 
 
-def _can_use_triage_clarification_fallback(state: Mapping[str, object]) -> bool:
+def _can_use_automation_fallback(state: Mapping[str, object]) -> bool:
     risk_level = state.get("risk_level")
     risk_flags = state.get("risk_flags")
     requires_human = state.get("requires_human", False)
+    valid_flags = isinstance(risk_flags, list) and all(
+        isinstance(flag, str) for flag in risk_flags
+    )
     return (
         risk_level in {RiskLevel.LOW.value, RiskLevel.MEDIUM.value}
-        and isinstance(risk_flags, list)
-        and not risk_flags
+        and valid_flags
+        and not set(risk_flags).intersection(
+            set(_CRITICAL_FLAGS).union(_HIGH_FLAGS)
+        )
         and requires_human is False
     )
 
@@ -530,6 +543,51 @@ def _triage_clarification_fallback(state: Mapping[str, object]) -> dict:
         node_name="triage",
         event_type="triage_fallback_clarification",
         summary="分诊结构校验失败，已进入安全澄清",
+    )
+
+
+def _automation_clarification_fallback(
+    state: Mapping[str, object],
+    *,
+    node_name: str,
+    code: str,
+) -> dict:
+    current = _status(state.get("status"))
+    assert_transition(current.value, Status.PENDING_USER.value)
+    update = {
+        "status": Status.PENDING_USER.value,
+        "waiting_reason": WaitingReason.CLARIFICATION.value,
+        "clarity": "ambiguous",
+        "clarification_question": _AUTOMATION_FALLBACK_QUESTION,
+        "clarification_options": list(_AUTOMATION_FALLBACK_OPTIONS),
+        "missing_fields": [],
+        "suggested_route": "clarify",
+        "summary": "自动处理暂时未完成，等待客户补充后重试",
+        "outcome": "",
+        "diagnosis_summary": "",
+        "recommended_actions": [],
+        "evidence_refs": [],
+        "citations": [],
+        "remaining_unknowns": [],
+        "evidence": [],
+        "tool_errors": [],
+        "draft_answer": "",
+        "final_answer": "",
+        "review_decision": "",
+        "review_reasons": [],
+        "review_issues": [],
+        "required_changes": [],
+        "resolution_confirmed": False,
+        "requires_human": False,
+        "manual_gate_reason": "",
+        "last_error": code,
+    }
+    return with_event(
+        state,
+        update,
+        node_name=node_name,
+        event_type=f"{node_name}_fallback_clarification",
+        summary="低风险自动处理未完成，已保留工单等待客户继续",
     )
 
 
@@ -636,10 +694,7 @@ def _triage_node(dependency: Callable[[dict], object]) -> Callable[[TicketState]
                 summary="分诊已完成",
             )
         except Exception as error:
-            if (
-                isinstance(error, (TypeError, ValueError))
-                and _can_use_triage_clarification_fallback(state)
-            ):
+            if _can_use_automation_fallback(state):
                 _log_node_failure(state, "triage", _TRIAGE_FALLBACK_CODE, error)
                 return _triage_clarification_fallback(state)
             error_code = (
@@ -687,6 +742,12 @@ def _diagnosis_node(
                 _log_node_failure(
                     state, "diagnosis", error_code, RuntimeError(error_code)
                 )
+                if _can_use_automation_fallback(state):
+                    return _automation_clarification_fallback(
+                        state,
+                        node_name="diagnosis",
+                        code="DIAGNOSIS_FALLBACK_CLARIFICATION",
+                    )
                 failed = _fail_closed(state, "diagnosis", error_code)
                 failed["tool_errors"] = list(tool_errors)
                 return failed
@@ -701,6 +762,12 @@ def _diagnosis_node(
             target = outcomes[outcome]
             if outcome == "need_user" and raw.get("draft_answer"):
                 target = Status.REVIEWING
+            if target == Status.ESCALATED and _can_use_automation_fallback(state):
+                return _automation_clarification_fallback(
+                    state,
+                    node_name="diagnosis",
+                    code="DIAGNOSIS_FALLBACK_CLARIFICATION",
+                )
             raw["status"] = target.value
             raw["waiting_reason"] = (
                 WaitingReason.MISSING_INFORMATION.value
@@ -724,6 +791,12 @@ def _diagnosis_node(
             _log_node_failure(
                 state, "diagnosis", "DIAGNOSIS_FAILURE", error
             )
+            if _can_use_automation_fallback(state):
+                return _automation_clarification_fallback(
+                    state,
+                    node_name="diagnosis",
+                    code="DIAGNOSIS_FALLBACK_CLARIFICATION",
+                )
             return _fail_closed(state, "diagnosis", "DIAGNOSIS_FAILURE")
 
     return run
@@ -756,6 +829,16 @@ def _review_node(dependency: Callable[[dict], object]) -> Callable[[TicketState]
             decision = raw.get("review_decision")
             if decision not in {"approve", "revise", "escalate"}:
                 raise ValueError("审核决定非法")
+            revision_count = state.get("revision_count", 0)
+            if _can_use_automation_fallback(state) and (
+                decision == "escalate"
+                or (decision == "revise" and revision_count != 0)
+            ):
+                return _automation_clarification_fallback(
+                    state,
+                    node_name="review",
+                    code="REVIEW_FALLBACK_CLARIFICATION",
+                )
             if decision == "escalate":
                 raw["manual_gate_reason"] = ",".join(
                     raw.get("review_reasons") or ["review_escalated"]
@@ -770,6 +853,12 @@ def _review_node(dependency: Callable[[dict], object]) -> Callable[[TicketState]
             )
         except Exception as error:
             _log_node_failure(state, "review", "REVIEW_FAILURE", error)
+            if _can_use_automation_fallback(state):
+                return _automation_clarification_fallback(
+                    state,
+                    node_name="review",
+                    code="REVIEW_FALLBACK_CLARIFICATION",
+                )
             failed = _fail_closed(state, "review", "REVIEW_FAILURE")
             failed.update(
                 {
@@ -824,6 +913,12 @@ def _finalize_node(policy_guard: object) -> Callable[[TicketState], dict]:
         if _status(state.get("status")) != Status.REVIEWING or not _policy_passes(
             policy_guard, state.get("draft_answer"), state.get("citations", [])
         ):
+            if _can_use_automation_fallback(state):
+                return _automation_clarification_fallback(
+                    state,
+                    node_name="finalize",
+                    code="FINALIZE_FALLBACK_CLARIFICATION",
+                )
             return _fail_closed(state, "finalize", "FINAL_POLICY_FAILURE")
         waiting_for_information = (
             state.get("outcome") == "need_user"
@@ -833,6 +928,12 @@ def _finalize_node(policy_guard: object) -> Callable[[TicketState], dict]:
         assert_transition(Status.REVIEWING.value, target.value)
         version = state.get("response_version", 0)
         if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            if _can_use_automation_fallback(state):
+                return _automation_clarification_fallback(
+                    state,
+                    node_name="finalize",
+                    code="FINALIZE_FALLBACK_CLARIFICATION",
+                )
             return _fail_closed(state, "finalize", "FINALIZE_FAILURE")
         return with_event(
             state,
@@ -1227,7 +1328,12 @@ def build_support_graph(
     builder.add_conditional_edges(
         "review",
         route_after_review,
-        {"finalize": "finalize", "revision": "revision", "escalate": "escalate"},
+        {
+            "finalize": "finalize",
+            "revision": "revision",
+            "escalate": "escalate",
+            "await_user": "await_user",
+        },
     )
     builder.add_edge("revision", "diagnosis")
     builder.add_edge("escalate", "human_review")

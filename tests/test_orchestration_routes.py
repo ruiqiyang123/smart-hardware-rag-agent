@@ -261,6 +261,34 @@ class OrchestrationRoutesTest(unittest.TestCase):
             ),
             "escalate",
         )
+
+    def test_review_low_risk_fallback_routes_back_to_customer(self):
+        self.assertEqual(
+            route_after_review(
+                {
+                    "status": "pending_user",
+                    "waiting_reason": "clarification",
+                    "requires_human": False,
+                    "final_answer": "",
+                }
+            ),
+            "await_user",
+        )
+        for changes in (
+            {"waiting_reason": "resolution_confirmation"},
+            {"requires_human": True},
+            {"final_answer": "未审核答复"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(IllegalRoute):
+                route_after_review(
+                    {
+                        "status": "pending_user",
+                        "waiting_reason": "clarification",
+                        "requires_human": False,
+                        "final_answer": "",
+                        **changes,
+                    }
+                )
         self.assertEqual(
             route_after_review(
                 {
